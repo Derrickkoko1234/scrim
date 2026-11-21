@@ -17,9 +17,11 @@ pub struct GitSandbox {
 
 impl GitSandbox {
     pub fn new() -> Self {
-        Self {
-            home: TempDir::new().unwrap(),
-        }
+        let home = match TempDir::new() {
+            Ok(home) => home,
+            Err(error) => panic!("failed to create git sandbox home: {error}"),
+        };
+        Self { home }
     }
 
     /// Runs `git <args>` in `dir`, panicking with git's output on failure.
@@ -29,7 +31,11 @@ impl GitSandbox {
 
     /// Like [`GitSandbox::git`] with extra environment variables.
     pub fn git_with_env(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-        let output = Command::new("git")
+        let path = match std::env::var_os("PATH") {
+            Some(path) => path,
+            None => panic!("PATH is not set"),
+        };
+        let output = match Command::new("git")
             .args([
                 "-c",
                 "user.name=Scrim Test",
@@ -39,14 +45,17 @@ impl GitSandbox {
             .args(args)
             .current_dir(dir)
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("PATH", path)
             .env("HOME", self.home.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .envs(extra_env.iter().copied())
             .output()
-            .unwrap();
+        {
+            Ok(output) => output,
+            Err(error) => panic!("failed to run git {args:?}: {error}"),
+        };
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
@@ -57,33 +66,50 @@ impl GitSandbox {
 
     /// Creates an empty bare repository whose HEAD is `refs/heads/main`.
     pub fn init_bare(&self, path: &Path) {
-        std::fs::create_dir_all(path).unwrap();
+        if let Err(error) = std::fs::create_dir_all(path) {
+            panic!(
+                "failed to create repository directory {}: {error}",
+                path.display()
+            );
+        }
         self.git(path, &["init", "--bare", "--initial-branch=main"]);
     }
 
     /// Creates a bare repository at `path` with one commit on `refs/heads/main`.
     pub fn init_bare_with_commit(&self, path: &Path) {
         self.init_bare(path);
-        let work = TempDir::new().unwrap();
+        let work = match TempDir::new() {
+            Ok(work) => work,
+            Err(error) => panic!("failed to create work temp dir: {error}"),
+        };
         self.git(work.path(), &["init", "--initial-branch=main"]);
-        std::fs::write(work.path().join("hello.txt"), "hello\n").unwrap();
+        if let Err(error) = std::fs::write(work.path().join("hello.txt"), "hello\n") {
+            panic!("failed to write hello.txt: {error}");
+        }
         self.git(work.path(), &["add", "hello.txt"]);
         self.git(work.path(), &["commit", "-m", "first"]);
-        self.git(
-            work.path(),
-            &["push", path.to_str().unwrap(), "HEAD:refs/heads/main"],
-        );
+        let path = match path.to_str() {
+            Some(path) => path,
+            None => panic!("repository path is not valid UTF-8: {}", path.display()),
+        };
+        self.git(work.path(), &["push", path, "HEAD:refs/heads/main"]);
     }
 }
 
 /// Starts the server on an ephemeral loopback port and returns its base URL.
 pub async fn spawn_server(repo_root: PathBuf) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) => panic!("failed to bind server listener: {error}"),
+    };
+    let address = match listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => panic!("failed to read server address: {error}"),
+    };
     tokio::spawn(async move {
-        axum::serve(listener, scrim_server::router(repo_root))
-            .await
-            .unwrap();
+        if let Err(error) = axum::serve(listener, scrim_server::router(repo_root)).await {
+            panic!("server failed: {error}");
+        }
     });
     format!("http://{address}")
 }

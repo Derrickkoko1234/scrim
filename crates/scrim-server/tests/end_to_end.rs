@@ -15,10 +15,17 @@ fn run_scenario(sandbox: &GitSandbox, base_url: &str, protocol_version: &str, sc
     let protocol = format!("protocol.version={protocol_version}");
     let first = scratch.join("first");
     let second = scratch.join("second");
-    std::fs::create_dir_all(scratch).unwrap();
+    if let Err(error) = std::fs::create_dir_all(scratch) {
+        panic!(
+            "failed to create scratch directory {}: {error}",
+            scratch.display()
+        );
+    }
 
     sandbox.git(scratch, &["-c", &protocol, "clone", &url, "first"]);
-    std::fs::write(first.join("file.txt"), "one\n").unwrap();
+    if let Err(error) = std::fs::write(first.join("file.txt"), "one\n") {
+        panic!("failed to write first file.txt: {error}");
+    }
     sandbox.git(&first, &["add", "file.txt"]);
     sandbox.git(&first, &["commit", "-m", "one"]);
     sandbox.git(
@@ -27,12 +34,15 @@ fn run_scenario(sandbox: &GitSandbox, base_url: &str, protocol_version: &str, sc
     );
 
     sandbox.git(scratch, &["-c", &protocol, "clone", &url, "second"]);
-    assert_eq!(
-        std::fs::read_to_string(second.join("file.txt")).unwrap(),
-        "one\n"
-    );
+    let contents = match std::fs::read_to_string(second.join("file.txt")) {
+        Ok(contents) => contents,
+        Err(error) => panic!("failed to read second file.txt: {error}"),
+    };
+    assert_eq!(contents, "one\n");
 
-    std::fs::write(first.join("file.txt"), "two\n").unwrap();
+    if let Err(error) = std::fs::write(first.join("file.txt"), "two\n") {
+        panic!("failed to write first file.txt: {error}");
+    }
     sandbox.git(&first, &["commit", "-am", "two"]);
     sandbox.git(
         &first,
@@ -44,10 +54,11 @@ fn run_scenario(sandbox: &GitSandbox, base_url: &str, protocol_version: &str, sc
         &second,
         &["-c", &protocol, "pull", "--ff-only", "origin", "main"],
     );
-    assert_eq!(
-        std::fs::read_to_string(second.join("file.txt")).unwrap(),
-        "two\n"
-    );
+    let contents = match std::fs::read_to_string(second.join("file.txt")) {
+        Ok(contents) => contents,
+        Err(error) => panic!("failed to read second file.txt: {error}"),
+    };
+    assert_eq!(contents, "two\n");
 
     // Prove which protocol was really spoken on the wire.
     let trace = sandbox.git_with_env(
@@ -85,18 +96,26 @@ fn deterministic_incompressible_bytes(length: usize) -> Vec<u8> {
 }
 
 async fn clone_push_fetch(protocol_version: &'static str) {
-    let root = TempDir::new().unwrap();
-    let scratch = TempDir::new().unwrap();
+    let root = match TempDir::new() {
+        Ok(root) => root,
+        Err(error) => panic!("failed to create root temp dir: {error}"),
+    };
+    let scratch = match TempDir::new() {
+        Ok(scratch) => scratch,
+        Err(error) => panic!("failed to create scratch temp dir: {error}"),
+    };
     let sandbox = GitSandbox::new();
     sandbox.init_bare(&root.path().join("test.git"));
     let base_url = spawn_server(root.path().to_path_buf()).await;
 
-    tokio::task::spawn_blocking(move || {
+    let join_result = tokio::task::spawn_blocking(move || {
         run_scenario(&sandbox, &base_url, protocol_version, scratch.path());
         drop(scratch);
     })
-    .await
-    .unwrap();
+    .await;
+    if let Err(error) = join_result {
+        panic!("blocking task failed: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

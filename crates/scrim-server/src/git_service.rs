@@ -132,16 +132,23 @@ pub async fn advertise_refs(
     repo_dir: &Path,
     git_protocol: Option<&str>,
 ) -> io::Result<Body> {
-    let mut child = spawn_git(service, true, repo_dir, git_protocol, Stdio::null())?;
-    let mut stdout = child
-        .take_stdout()
-        .ok_or_else(|| io::Error::other("git stdout was not piped"))?;
+    let mut child = match spawn_git(service, true, repo_dir, git_protocol, Stdio::null()) {
+        Ok(child) => child,
+        Err(error) => return Err(error),
+    };
+    let mut stdout = match child.take_stdout() {
+        Some(stdout) => stdout,
+        None => return Err(io::Error::other("git stdout was not piped")),
+    };
 
     let mut peeked = Vec::with_capacity(PROTOCOL_V2_PREFACE.len());
     let mut scratch = [0_u8; 64];
     let mut reached_end_of_output = false;
     while peeked.len() < PROTOCOL_V2_PREFACE.len() {
-        let count = stdout.read(&mut scratch).await?;
+        let count = match stdout.read(&mut scratch).await {
+            Ok(count) => count,
+            Err(error) => return Err(error),
+        };
         if count == 0 {
             reached_end_of_output = true;
             break;
@@ -152,7 +159,10 @@ pub async fn advertise_refs(
     // If git already finished, its exit status is known before any response
     // is sent, so a failure can still become a clean HTTP 500.
     if reached_end_of_output {
-        let status = child.wait().await?;
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(error) => return Err(error),
+        };
         if peeked.is_empty() || !status.success() {
             return Err(io::Error::other(format!(
                 "git {} failed to advertise refs (exit status: {status}, {} bytes of output)",
@@ -187,13 +197,18 @@ pub fn serve_rpc(
     git_protocol: Option<&str>,
     request_body: Body,
 ) -> io::Result<Body> {
-    let mut child = spawn_git(service, false, repo_dir, git_protocol, Stdio::piped())?;
-    let mut stdin = child
-        .take_stdin()
-        .ok_or_else(|| io::Error::other("git stdin was not piped"))?;
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| io::Error::other("git stdout was not piped"))?;
+    let mut child = match spawn_git(service, false, repo_dir, git_protocol, Stdio::piped()) {
+        Ok(child) => child,
+        Err(error) => return Err(error),
+    };
+    let mut stdin = match child.take_stdin() {
+        Some(stdin) => stdin,
+        None => return Err(io::Error::other("git stdin was not piped")),
+    };
+    let stdout = match child.take_stdout() {
+        Some(stdout) => stdout,
+        None => return Err(io::Error::other("git stdout was not piped")),
+    };
 
     let (body_error_tx, body_error_rx) = oneshot::channel();
     let stdin_pump = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -283,7 +298,10 @@ fn spawn_git(
         // Fallback if the platform-specific process-group kill does not apply.
         .kill_on_drop(true);
 
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(error),
+    };
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(log_stderr(service, stderr));
     }

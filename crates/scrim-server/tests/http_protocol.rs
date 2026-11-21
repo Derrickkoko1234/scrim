@@ -18,7 +18,10 @@ use tower::ServiceExt;
 
 /// A temp root containing `test.git` with one commit on `main`.
 fn router_with_repo() -> (TempDir, Router) {
-    let root = TempDir::new().unwrap();
+    let root = match TempDir::new() {
+        Ok(root) => root,
+        Err(error) => panic!("failed to create repo root temp dir: {error}"),
+    };
     GitSandbox::new().init_bare_with_commit(&root.path().join("test.git"));
     let router = scrim_server::router(root.path().to_path_buf());
     (root, router)
@@ -29,20 +32,22 @@ async fn get(router: Router, uri: &str, git_protocol: Option<&str>) -> Response<
     if let Some(value) = git_protocol {
         request = request.header("Git-Protocol", value);
     }
-    router
-        .oneshot(request.body(Body::empty()).unwrap())
-        .await
-        .unwrap()
+    let request = match request.body(Body::empty()) {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build request for {uri}: {error}"),
+    };
+    match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("request to {uri} failed: {error}"),
+    }
 }
 
 async fn body_bytes(response: Response<Body>) -> Vec<u8> {
-    response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes()
-        .to_vec()
+    let collected = match response.into_body().collect().await {
+        Ok(collected) => collected,
+        Err(error) => panic!("failed to collect response body: {error}"),
+    };
+    collected.to_bytes().to_vec()
 }
 
 #[tokio::test]
@@ -118,11 +123,14 @@ async fn post_with_wrong_content_type_is_rejected() {
         if let Some(value) = content_type {
             request = request.header(header::CONTENT_TYPE, value);
         }
-        let response = router
-            .clone()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let request = match request.body(Body::empty()) {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build request for {content_type:?}: {error}"),
+        };
+        let response = match router.clone().oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => panic!("request failed for {content_type:?}: {error}"),
+        };
         assert_eq!(
             response.status(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -141,9 +149,14 @@ async fn wrong_method_is_rejected() {
 #[tokio::test]
 async fn missing_and_unsafe_repositories_are_not_found() {
     // A bare repo next to the served root, as a tempting traversal target.
-    let parent = TempDir::new().unwrap();
+    let parent = match TempDir::new() {
+        Ok(parent) => parent,
+        Err(error) => panic!("failed to create parent temp dir: {error}"),
+    };
     let root = parent.path().join("root");
-    std::fs::create_dir(&root).unwrap();
+    if let Err(error) = std::fs::create_dir(&root) {
+        panic!("failed to create served root {}: {error}", root.display());
+    }
     let sandbox = GitSandbox::new();
     sandbox.init_bare_with_commit(&root.join("test.git"));
     sandbox.init_bare(&parent.path().join("scrim-test-outside.git"));
@@ -170,7 +183,9 @@ async fn missing_and_unsafe_repositories_are_not_found() {
 #[tokio::test]
 async fn directory_without_bare_repo_layout_is_not_found() {
     let (root, router) = router_with_repo();
-    std::fs::create_dir(root.path().join("plain-dir")).unwrap();
+    if let Err(error) = std::fs::create_dir(root.path().join("plain-dir")) {
+        panic!("failed to create plain directory: {error}");
+    }
     let response = get(router, "/plain-dir/info/refs?service=git-upload-pack", None).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
@@ -178,14 +193,21 @@ async fn directory_without_bare_repo_layout_is_not_found() {
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_escaping_the_root_is_not_found() {
-    let outside = TempDir::new().unwrap();
+    let outside = match TempDir::new() {
+        Ok(outside) => outside,
+        Err(error) => panic!("failed to create outside temp dir: {error}"),
+    };
     GitSandbox::new().init_bare(&outside.path().join("secret.git"));
-    let root = TempDir::new().unwrap();
-    std::os::unix::fs::symlink(
+    let root = match TempDir::new() {
+        Ok(root) => root,
+        Err(error) => panic!("failed to create root temp dir: {error}"),
+    };
+    if let Err(error) = std::os::unix::fs::symlink(
         outside.path().join("secret.git"),
         root.path().join("link.git"),
-    )
-    .unwrap();
+    ) {
+        panic!("failed to create escaping symlink: {error}");
+    }
     let router = scrim_server::router(root.path().to_path_buf());
 
     let response = get(router, "/link.git/info/refs?service=git-upload-pack", None).await;
@@ -198,10 +220,15 @@ async fn gzip_encoded_protocol_v2_request_is_decompressed() {
     // command=ls-refs, delimiter, flush.
     let request_body = b"0014command=ls-refs\n00010000";
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(request_body).unwrap();
-    let compressed = encoder.finish().unwrap();
+    if let Err(error) = encoder.write_all(request_body) {
+        panic!("failed to write gzip request body: {error}");
+    }
+    let compressed = match encoder.finish() {
+        Ok(compressed) => compressed,
+        Err(error) => panic!("failed to finish gzip encoding: {error}"),
+    };
 
-    let request = Request::builder()
+    let request = match Request::builder()
         .method("POST")
         .uri("/test.git/git-upload-pack")
         .header(
@@ -211,15 +238,24 @@ async fn gzip_encoded_protocol_v2_request_is_decompressed() {
         .header(header::CONTENT_ENCODING, "gzip")
         .header("Git-Protocol", "version=2")
         .body(Body::from(compressed))
-        .unwrap();
-    let response = router.oneshot(request).await.unwrap();
+    {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build gzip request: {error}"),
+    };
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("router failed: {error}"),
+    };
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
         "application/x-git-upload-pack-result"
     );
-    let body = String::from_utf8(body_bytes(response).await).unwrap();
+    let body = match String::from_utf8(body_bytes(response).await) {
+        Ok(body) => body,
+        Err(error) => panic!("response body is not valid UTF-8: {error}"),
+    };
     assert!(
         body.contains(" refs/heads/main\n"),
         "unexpected ls-refs output: {body:?}"
@@ -364,17 +400,21 @@ async fn corrupt_gzip_upload_pack_body_aborts_response() {
 
 #[tokio::test]
 async fn repo_with_commondir_is_not_found() {
-    let outside = TempDir::new().unwrap();
+    let outside = match TempDir::new() {
+        Ok(outside) => outside,
+        Err(error) => panic!("failed to create outside temp dir: {error}"),
+    };
     let outside_repo = outside.path().join("secret.git");
     let sandbox = GitSandbox::new();
     sandbox.init_bare_with_commit(&outside_repo);
 
     let (root, router) = router_with_repo();
-    std::fs::write(
+    if let Err(error) = std::fs::write(
         root.path().join("test.git/commondir"),
         format!("{}\n", outside_repo.display()),
-    )
-    .unwrap();
+    ) {
+        panic!("failed to write commondir: {error}");
+    }
 
     for service in ["git-upload-pack", "git-receive-pack"] {
         let uri = format!("/test.git/info/refs?service={service}");
@@ -391,11 +431,17 @@ async fn repo_with_unsearchable_objects_or_refs_is_not_found() {
     for directory in ["objects", "refs"] {
         let (root, router) = router_with_repo();
         let path = root.path().join("test.git").join(directory);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            panic!("failed to make {directory} unsearchable: {error}");
+        }
 
         let response = get(router, "/test.git/info/refs?service=git-receive-pack", None).await;
         // Restore permissions so the temp dir can be cleaned up.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        {
+            panic!("failed to restore {directory} permissions: {error}");
+        }
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{directory}");
     }
 }
