@@ -4,7 +4,7 @@ Scrim adds access control inside Git repositories: private branches, private fil
 
 A scrim is a theatre curtain that looks solid or see-through depending on how it is lit. Everyone shares the same repository, and each person sees as much as their access allows.
 
-> **Status: early development.** Nothing is usable yet. Work is on milestone M1 (private branches: policy engine, Postgres store, and per-user ref hiding are in place; pre-receive guard and CLI are next). See the [roadmap](docs/ROADMAP.md).
+> **Status: early development.** Nothing is usable yet. Work is on milestone M1 (private branches: policy engine, Postgres store, per-user ref hiding, and pre-receive push/merge-leak guards are in place; admin API and CLI are next). See the [roadmap](docs/ROADMAP.md).
 
 ## Why
 

@@ -23,7 +23,9 @@ use axum::{
 };
 use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
-use scrim_server::{AuthenticatedMember, PgPolicyStore, PolicyStore, PolicyStoreError};
+use scrim_server::{
+    AuditLogEntry, AuthenticatedMember, PgPolicyStore, PolicyStore, PolicyStoreError,
+};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tempfile::TempDir;
@@ -421,4 +423,60 @@ async fn router_hides_private_branches_using_postgres_policy() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// One `audit_log` row as read back: actor, action, target type, target name
+/// and details.
+type AuditLogRow = (
+    Option<i64>,
+    String,
+    String,
+    String,
+    sqlx::types::Json<serde_json::Value>,
+);
+
+/// Reads back the single `audit_log` row whose `target_name` is `target_name`.
+async fn fetch_audit_row(pool: &PgPool, target_name: &str) -> AuditLogRow {
+    match sqlx::query_as::<_, AuditLogRow>(
+        "SELECT actor_member_id, action, target_type, target_name, details \
+         FROM audit_log WHERE target_name = $1",
+    )
+    .bind(target_name)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => panic!("failed to read audit row for {target_name}: {error}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn records_audit_events_with_and_without_actor() {
+    let (pool, store) = connect().await;
+    let suffix = unique_suffix();
+    let member_id = insert_member(&pool, &format!("auditor-{suffix}")).await;
+
+    for actor_member_id in [Some(member_id), None] {
+        let target_name = format!("team-{suffix}.git:refs/heads/main:{actor_member_id:?}");
+        let details = serde_json::json!({ "leaked_refs": ["refs/heads/private/x"], "count": 1 });
+        let entry = AuditLogEntry {
+            actor_member_id,
+            action: "branch.merge_leak_override".to_owned(),
+            target_type: "repository_ref".to_owned(),
+            target_name: target_name.clone(),
+            details: details.clone(),
+        };
+        if let Err(error) = store.record_audit_event(entry).await {
+            panic!("failed to record audit event: {error}");
+        }
+
+        let (stored_actor, action, target_type, stored_target_name, stored_details) =
+            fetch_audit_row(&pool, &target_name).await;
+        assert_eq!(stored_actor, actor_member_id);
+        assert_eq!(action, "branch.merge_leak_override");
+        assert_eq!(target_type, "repository_ref");
+        assert_eq!(stored_target_name, target_name);
+        assert_eq!(stored_details.0, details);
+    }
 }

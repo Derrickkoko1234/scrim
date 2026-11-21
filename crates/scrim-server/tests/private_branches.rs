@@ -15,6 +15,11 @@
 //!
 //! `symref.git` and `chained.git` hide `refs/heads/private/*` behind symbolic
 //! refs, and `complex.git` has a complex-glob rule no current ref matches.
+//!
+//! The pre-receive guard tests at the end push with real `git` clients and
+//! with hand-written `git-receive-pack` requests (empty packs, thin packs
+//! with a hidden delta base, non-UTF-8 ref names) that a normal client would
+//! never send.
 
 mod common;
 
@@ -28,8 +33,8 @@ use common::{GitSandbox, bearer_header, spawn_server_with_store};
 use http_body_util::BodyExt;
 use scrim_policy::BranchRule;
 use scrim_server::{
-    AuthenticatedMember, MemberRepoPolicy, MemoryPolicyStore, PolicyStore, PolicyStoreError,
-    PolicyStoreFuture,
+    ALLOW_MERGE_LEAK_PUSH_OPTION, AuditLogEntry, AuthenticatedMember, MemberRepoPolicy,
+    MemoryPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture,
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -208,10 +213,18 @@ struct Fixture {
     chained_commits: BTreeMap<String, String>,
     /// Commit IDs of `complex.git` branches; `HEAD` is detached at `main`.
     complex_commits: BTreeMap<String, String>,
+    /// Shares its audit log with the store the server uses.
+    store: MemoryPolicyStore,
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_store(|store| -> Arc<dyn PolicyStore> { Arc::new(store) }).await
+    }
+
+    /// Like [`Fixture::start`], serving the store `wrap_store` builds around
+    /// [`build_store`]'s store.
+    async fn start_with_store(wrap_store: fn(MemoryPolicyStore) -> Arc<dyn PolicyStore>) -> Self {
         let root = match TempDir::new() {
             Ok(root) => root,
             Err(error) => panic!("failed to create root dir: {error}"),
@@ -277,8 +290,9 @@ impl Fixture {
             panic!("failed to detach HEAD: {error}");
         }
 
+        let store = build_store();
         let base_url =
-            spawn_server_with_store(root.path().to_path_buf(), Arc::new(build_store())).await;
+            spawn_server_with_store(root.path().to_path_buf(), wrap_store(store.clone())).await;
         Self {
             root,
             scratch,
@@ -291,6 +305,7 @@ impl Fixture {
             symref_commits,
             chained_commits,
             complex_commits,
+            store,
         }
     }
 
@@ -365,7 +380,11 @@ impl Fixture {
 /// Runs `scenario` against a fresh [`Fixture`] on a blocking thread so the
 /// synchronous `git` processes never stall the server's runtime.
 async fn with_fixture(scenario: fn(&Fixture)) {
-    let fixture = Fixture::start().await;
+    run_scenario(Fixture::start().await, scenario).await;
+}
+
+/// Runs `scenario` against `fixture` on a blocking thread.
+async fn run_scenario(fixture: Fixture, scenario: fn(&Fixture)) {
     let join_result = tokio::task::spawn_blocking(move || scenario(&fixture)).await;
     if let Err(error) = join_result {
         panic!("scenario failed: {error}");
@@ -805,6 +824,10 @@ impl PolicyStore for FailingPolicyStore {
     ) -> PolicyStoreFuture<'a, MemberRepoPolicy> {
         Box::pin(async { Err(PolicyStoreError::Internal("database offline".to_owned())) })
     }
+
+    fn record_audit_event<'a>(&'a self, _entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async { Err(PolicyStoreError::Internal("database offline".to_owned())) })
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1129,4 +1152,902 @@ async fn repos_with_reftable_or_alternates_are_not_found() {
         let (status, _) = advertisement(root.path(), store, "real-reftable.git", ALICE_TOKEN).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+}
+
+/// Clones `team.git` as `member` into a new directory `name` of the scratch
+/// directory and returns its path.
+fn clone_team_as(fixture: &Fixture, member: Member, name: &str) -> std::path::PathBuf {
+    fixture.git_as(
+        member,
+        "0",
+        fixture.scratch.path(),
+        &["clone", "--quiet", &fixture.url("team.git"), name],
+    );
+    fixture.scratch.path().join(name)
+}
+
+/// Writes `file_name` with `contents` in `dir` and commits it.
+fn commit_file(fixture: &Fixture, dir: &Path, file_name: &str, contents: &str) {
+    if let Err(error) = std::fs::write(dir.join(file_name), contents) {
+        panic!("failed to write {file_name}: {error}");
+    }
+    fixture.sandbox.git(dir, &["add", file_name]);
+    fixture
+        .sandbox
+        .git(dir, &["commit", "--quiet", "-m", file_name]);
+}
+
+/// Whether `ref_name` exists in the server-side bare `repo`.
+fn server_ref_exists(fixture: &Fixture, repo: &str, ref_name: &str) -> bool {
+    fixture
+        .sandbox
+        .try_git(
+            &fixture.root.path().join(repo),
+            &["rev-parse", "--verify", "--quiet", ref_name],
+        )
+        .status
+        .success()
+}
+
+/// Runs `git push <args>` in `dir` as `member` and asserts that it failed,
+/// returning git's stderr.
+fn assert_push_rejected(fixture: &Fixture, member: Member, dir: &Path, args: &[&str]) -> String {
+    let mut push_args = vec!["push"];
+    push_args.extend_from_slice(args);
+    let output = fixture.try_git_as(member, "0", dir, &push_args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success(),
+        "push {args:?} as {} should fail: {stderr}",
+        member.name
+    );
+    stderr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_member_cannot_create_update_or_delete_glob_matched_refs() {
+    with_fixture(|fixture| {
+        let carol_dir = clone_team_as(fixture, CAROL, "carol-globs");
+        commit_file(fixture, &carol_dir, "carol.txt", "carol\n");
+
+        // `release-99` matches the complex glob `refs/heads/release-*` and
+        // `team/secret` matches `refs/heads/*/secret`; neither exists yet, so
+        // `transfer.hideRefs` cannot cover them and only the guard stops them.
+        for target in ["release-99", "team/secret"] {
+            let stderr = assert_push_rejected(
+                fixture,
+                CAROL,
+                &carol_dir,
+                &["origin", &format!("HEAD:refs/heads/{target}")],
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "you do not have access to ref refs/heads/{target}"
+                )),
+                "{stderr}"
+            );
+            for group in ["core", "security"] {
+                assert!(!stderr.contains(group), "group name leaked: {stderr}");
+            }
+            assert!(!server_ref_exists(
+                fixture,
+                "team.git",
+                &format!("refs/heads/{target}")
+            ));
+        }
+        // Prefix and exact rules (already hidden by `transfer.hideRefs`).
+        for target in ["private/new", "secret"] {
+            assert_push_rejected(
+                fixture,
+                CAROL,
+                &carol_dir,
+                &["origin", &format!("HEAD:refs/heads/{target}")],
+            );
+            assert!(!server_ref_exists(
+                fixture,
+                "team.git",
+                &format!("refs/heads/{target}")
+            ));
+        }
+
+        // Overlapping rules intersect: alice is in `core`, not `security`.
+        let alice_dir = clone_team_as(fixture, ALICE, "alice-globs");
+        commit_file(fixture, &alice_dir, "alice.txt", "alice\n");
+        let stderr = assert_push_rejected(
+            fixture,
+            ALICE,
+            &alice_dir,
+            &["origin", "HEAD:refs/heads/team/secret"],
+        );
+        assert!(
+            stderr.contains("you do not have access to ref refs/heads/team/secret"),
+            "{stderr}"
+        );
+
+        // Bob may create both; carol may then neither update nor delete them.
+        let bob_dir = clone_team_as(fixture, BOB, "bob-globs");
+        let mut bob_commits = BTreeMap::new();
+        for target in ["release-99", "team/secret"] {
+            fixture.sandbox.git(
+                &bob_dir,
+                &["checkout", "--quiet", "-B", "work", "origin/main"],
+            );
+            commit_file(fixture, &bob_dir, &target.replace('/', "_"), target);
+            fixture.git_as(
+                BOB,
+                "0",
+                &bob_dir,
+                &[
+                    "push",
+                    "--quiet",
+                    "origin",
+                    &format!("HEAD:refs/heads/{target}"),
+                ],
+            );
+            bob_commits.insert(
+                target,
+                fixture.server_ref("team.git", &format!("refs/heads/{target}")),
+            );
+        }
+        for (target, bob_commit) in &bob_commits {
+            let ref_name = format!("refs/heads/{target}");
+            assert_push_rejected(
+                fixture,
+                CAROL,
+                &carol_dir,
+                &["origin", &format!("+HEAD:{ref_name}")],
+            );
+            assert_push_rejected(
+                fixture,
+                CAROL,
+                &carol_dir,
+                &["origin", "--delete", &ref_name],
+            );
+            assert_eq!(&fixture.server_ref("team.git", &ref_name), bob_commit);
+        }
+    })
+    .await;
+}
+
+/// The all-zero object ID used for ref creation.
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
+/// A version 2 pack with no objects, followed by its SHA-1 checksum.
+const EMPTY_PACK: [u8; 32] = [
+    b'P', b'A', b'C', b'K', 0, 0, 0, 2, 0, 0, 0, 0, 0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea,
+    0xb5, 0x10, 0xad, 0x6a, 0xc7, 0x5c, 0x82, 0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
+];
+
+/// Encodes `payload` as a single pkt-line.
+fn pkt_line_bytes(payload: &[u8]) -> Vec<u8> {
+    let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
+    line.extend_from_slice(payload);
+    line
+}
+
+/// Builds a `git-receive-pack` request creating each `(new_oid, ref_name)`
+/// with an empty pack, i.e. without sending a single object.
+fn empty_pack_push_request(creations: &[(&str, &[u8])], push_options: &[&str]) -> Vec<u8> {
+    let mut request = Vec::new();
+    for (index, (new_oid, ref_name)) in creations.iter().enumerate() {
+        let mut command = format!("{ZERO_OID} {new_oid} ").into_bytes();
+        command.extend_from_slice(ref_name);
+        if index == 0 {
+            command.extend_from_slice(b"\0report-status");
+            if !push_options.is_empty() {
+                command.extend_from_slice(b" push-options");
+            }
+        }
+        command.push(b'\n');
+        request.extend_from_slice(&pkt_line_bytes(&command));
+    }
+    request.extend_from_slice(b"0000");
+    if !push_options.is_empty() {
+        for push_option in push_options {
+            request.extend_from_slice(&pkt_line_bytes(push_option.as_bytes()));
+        }
+        request.extend_from_slice(b"0000");
+    }
+    request.extend_from_slice(&EMPTY_PACK);
+    request
+}
+
+/// POSTs `request_body` to `/team.git/git-receive-pack` of `fixture`'s
+/// repositories as `token` and returns git's status report, or `None` if the
+/// response stream failed.
+async fn receive_pack_rpc(
+    fixture: &Fixture,
+    store: Arc<dyn PolicyStore>,
+    token: &str,
+    request_body: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let request = match Request::builder()
+        .method("POST")
+        .uri("/team.git/git-receive-pack")
+        .header(header::AUTHORIZATION, bearer_header(token))
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-request",
+        )
+        .body(Body::from(request_body))
+    {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build request: {error}"),
+    };
+    let router = scrim_server::router_with_policy_store(fixture.root.path().to_path_buf(), store);
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("router call failed: {error}"),
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    match response.into_body().collect().await {
+        Ok(collected) => Some(collected.to_bytes().to_vec()),
+        Err(_) => None,
+    }
+}
+
+/// Asserts that git's status report refused every update of a push because
+/// the pre-receive hook declined it.
+fn assert_hook_declined(report: Option<Vec<u8>>, description: &str) {
+    let Some(report) = report else {
+        panic!("{description}: receive-pack failed instead of declining");
+    };
+    assert!(
+        contains_bytes(&report, b"pre-receive hook declined"),
+        "{description}: {}",
+        String::from_utf8_lossy(&report)
+    );
+}
+
+/// `H1`: an empty pack naming a hidden object ID passes git's connectivity
+/// check (the object exists on the server) and would publish it.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_pack_push_of_hidden_objects_is_rejected() {
+    let fixture = Fixture::start().await;
+    let store: Arc<dyn PolicyStore> = Arc::new(fixture.store.clone());
+    let hidden_commit = Fixture::commit(&fixture.team_commits, "private/wip");
+    let hidden_blob = stdout_text(&fixture.sandbox.git(
+        &fixture.root.path().join("team.git"),
+        &["rev-parse", "refs/heads/private/wip:private_wip.txt"],
+    ))
+    .trim()
+    .to_owned();
+
+    let cases: [(&str, &str, &[u8]); 2] = [
+        ("hidden commit", &hidden_commit, b"refs/heads/steal"),
+        ("hidden blob", &hidden_blob, b"refs/tags/steal-blob"),
+    ];
+    for (description, hidden_oid, ref_name) in cases {
+        let report = receive_pack_rpc(
+            &fixture,
+            Arc::clone(&store),
+            CAROL_TOKEN,
+            empty_pack_push_request(&[(hidden_oid, ref_name)], &[]),
+        )
+        .await;
+        assert_hook_declined(report, description);
+        let ref_name = String::from_utf8_lossy(ref_name);
+        assert!(
+            !server_ref_exists(&fixture, "team.git", &ref_name),
+            "{ref_name} was created"
+        );
+    }
+
+    // Control: the same request naming a visible commit is accepted.
+    let main_commit = Fixture::commit(&fixture.team_commits, "main");
+    let report = receive_pack_rpc(
+        &fixture,
+        store,
+        CAROL_TOKEN,
+        empty_pack_push_request(&[(&main_commit, b"refs/heads/carol-copy")], &[]),
+    )
+    .await;
+    let Some(report) = report else {
+        panic!("visible empty-pack push failed");
+    };
+    assert!(
+        contains_bytes(&report, b"ok refs/heads/carol-copy"),
+        "{}",
+        String::from_utf8_lossy(&report)
+    );
+    assert_eq!(
+        fixture.server_ref("team.git", "refs/heads/carol-copy"),
+        main_commit
+    );
+}
+
+/// `L4`: git itself would accept a ref name with invalid UTF-8.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_utf8_ref_name_push_is_rejected() {
+    let fixture = Fixture::start().await;
+    let store: Arc<dyn PolicyStore> = Arc::new(fixture.store.clone());
+    let main_commit = Fixture::commit(&fixture.team_commits, "main");
+    let report = receive_pack_rpc(
+        &fixture,
+        store,
+        BOB_TOKEN,
+        empty_pack_push_request(&[(&main_commit, b"refs/heads/caf\xff")], &[]),
+    )
+    .await;
+    assert_hook_declined(report, "non-UTF-8 ref name");
+    let refs = fixture
+        .sandbox
+        .git(&fixture.root.path().join("team.git"), &["for-each-ref"]);
+    assert!(
+        !contains_bytes(&refs.stdout, b"refs/heads/caf"),
+        "{}",
+        stdout_text(&refs)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_leak_guard_rejects_private_merges_and_audits_overrides() {
+    with_fixture(|fixture| {
+        let dir = clone_team_as(fixture, ALICE, "alice-leak");
+        let main_before = fixture.server_ref("team.git", "refs/heads/main");
+
+        // A merge of `private/wip` into `main` is refused with advice.
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "merged", "origin/main"],
+        );
+        fixture.sandbox.git(
+            &dir,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "origin/private/wip",
+            ],
+        );
+        let stderr =
+            assert_push_rejected(fixture, ALICE, &dir, &["origin", "HEAD:refs/heads/main"]);
+        assert!(stderr.contains("refs/heads/main"), "{stderr}");
+        assert!(stderr.contains("squash"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("-o {ALLOW_MERGE_LEAK_PUSH_OPTION}")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("private/wip"), "{stderr}");
+        // Neither the leaked commit nor how many there are is revealed.
+        let wip_commit = Fixture::commit(&fixture.team_commits, "private/wip");
+        assert!(!stderr.contains(&wip_commit[..7]), "{stderr}");
+        assert!(!stderr.contains("commit(s)"), "{stderr}");
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/main"),
+            main_before
+        );
+
+        // So is fast-forwarding a new public branch to it.
+        assert_push_rejected(
+            fixture,
+            ALICE,
+            &dir,
+            &[
+                "origin",
+                "refs/remotes/origin/private/wip:refs/heads/public-copy",
+            ],
+        );
+        assert!(!server_ref_exists(
+            fixture,
+            "team.git",
+            "refs/heads/public-copy"
+        ));
+
+        // A squash merge creates new commits and is accepted.
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "squashed", "origin/main"],
+        );
+        fixture.sandbox.git(
+            &dir,
+            &["merge", "--quiet", "--squash", "origin/private/wip"],
+        );
+        fixture
+            .sandbox
+            .git(&dir, &["commit", "--quiet", "-m", "squashed wip"]);
+        fixture.git_as(
+            ALICE,
+            "0",
+            &dir,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        assert!(fixture.store.audit_entries().is_empty());
+
+        // The override lands a real merge and is audited.
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "override", "origin/main"],
+        );
+        fixture.sandbox.git(
+            &dir,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "origin/private/wip",
+            ],
+        );
+        fixture.git_as(
+            ALICE,
+            "0",
+            &dir,
+            &[
+                "push",
+                "--quiet",
+                "-o",
+                ALLOW_MERGE_LEAK_PUSH_OPTION,
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+        );
+        let pushed = stdout_text(&fixture.sandbox.git(&dir, &["rev-parse", "HEAD"]))
+            .trim()
+            .to_owned();
+        assert_eq!(fixture.server_ref("team.git", "refs/heads/main"), pushed);
+        let audit_entries = fixture.store.audit_entries();
+        assert_eq!(audit_entries.len(), 1, "{audit_entries:?}");
+        let entry = &audit_entries[0];
+        assert_eq!(entry.actor_member_id, Some(1));
+        assert_eq!(entry.action, "branch.merge_leak_override");
+        assert_eq!(entry.target_type, "repository_ref");
+        assert_eq!(entry.target_name, "team.git:refs/heads/main");
+        assert_eq!(entry.details["leaked_commit_count"], 1);
+        assert_eq!(entry.details["new_oid"], pushed.as_str());
+        assert_eq!(
+            entry.details["sample_leaked_commits"][0],
+            Fixture::commit(&fixture.team_commits, "private/wip").as_str()
+        );
+
+        // Merging the wider `main` into the narrower `private/wip` never leaks.
+        fixture.sandbox.git(
+            &dir,
+            &[
+                "checkout",
+                "--quiet",
+                "-b",
+                "narrowing",
+                "origin/private/wip",
+            ],
+        );
+        fixture.sandbox.git(
+            &dir,
+            &["merge", "--quiet", "--no-ff", "--no-edit", "origin/main"],
+        );
+        fixture.git_as(
+            ALICE,
+            "0",
+            &dir,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/private/wip"],
+        );
+        assert_eq!(fixture.store.audit_entries().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_push_cannot_carry_a_new_private_commit_into_main() {
+    with_fixture(|fixture| {
+        let dir = clone_team_as(fixture, ALICE, "alice-atomic");
+        let main_before = fixture.server_ref("team.git", "refs/heads/main");
+        let wip_before = fixture.server_ref("team.git", "refs/heads/private/wip");
+
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "wip", "origin/private/wip"],
+        );
+        commit_file(fixture, &dir, "new-private.txt", "private\n");
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "merged", "origin/main"],
+        );
+        fixture
+            .sandbox
+            .git(&dir, &["merge", "--quiet", "--no-ff", "--no-edit", "wip"]);
+
+        assert_push_rejected(
+            fixture,
+            ALICE,
+            &dir,
+            &[
+                "origin",
+                "wip:refs/heads/private/wip",
+                "merged:refs/heads/main",
+            ],
+        );
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/main"),
+            main_before
+        );
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/private/wip"),
+            wip_before
+        );
+        assert!(fixture.store.audit_entries().is_empty());
+    })
+    .await;
+}
+
+/// The override only relaxes the merge-leak check, never ref authorization
+/// or the hidden-object check.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_leak_override_does_not_bypass_access_checks() {
+    let fixture = Fixture::start().await;
+    let store: Arc<dyn PolicyStore> = Arc::new(fixture.store.clone());
+    let hidden_commit = Fixture::commit(&fixture.team_commits, "private/wip");
+    let report = receive_pack_rpc(
+        &fixture,
+        store,
+        CAROL_TOKEN,
+        empty_pack_push_request(
+            &[(&hidden_commit, b"refs/heads/steal")],
+            &[ALLOW_MERGE_LEAK_PUSH_OPTION],
+        ),
+    )
+    .await;
+    assert_hook_declined(report, "hidden commit with override");
+    assert!(!server_ref_exists(&fixture, "team.git", "refs/heads/steal"));
+
+    run_scenario(fixture, |fixture| {
+        let dir = clone_team_as(fixture, CAROL, "carol-override");
+        commit_file(fixture, &dir, "carol.txt", "carol\n");
+        for target in ["private/new", "release-99"] {
+            assert_push_rejected(
+                fixture,
+                CAROL,
+                &dir,
+                &[
+                    "-o",
+                    ALLOW_MERGE_LEAK_PUSH_OPTION,
+                    "origin",
+                    &format!("HEAD:refs/heads/{target}"),
+                ],
+            );
+            assert!(!server_ref_exists(
+                fixture,
+                "team.git",
+                &format!("refs/heads/{target}")
+            ));
+        }
+        assert!(fixture.store.audit_entries().is_empty());
+    })
+    .await;
+}
+
+/// Delegates to a [`MemoryPolicyStore`] but cannot write audit entries.
+struct AuditFailingPolicyStore {
+    inner: MemoryPolicyStore,
+}
+
+impl PolicyStore for AuditFailingPolicyStore {
+    fn authenticate_token_hash<'a>(
+        &'a self,
+        token_hash: &'a [u8; 32],
+    ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>> {
+        self.inner.authenticate_token_hash(token_hash)
+    }
+
+    fn load_member_repo_policy<'a>(
+        &'a self,
+        member_id: i64,
+        repo_key: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberRepoPolicy> {
+        self.inner.load_member_repo_policy(member_id, repo_key)
+    }
+
+    fn record_audit_event<'a>(&'a self, _entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async { Err(PolicyStoreError::Internal("audit log offline".to_owned())) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_leak_override_is_refused_when_it_cannot_be_audited() {
+    let fixture = Fixture::start_with_store(|store| -> Arc<dyn PolicyStore> {
+        Arc::new(AuditFailingPolicyStore { inner: store })
+    })
+    .await;
+    run_scenario(fixture, |fixture| {
+        let dir = clone_team_as(fixture, ALICE, "alice-unaudited");
+        let main_before = fixture.server_ref("team.git", "refs/heads/main");
+        fixture.sandbox.git(
+            &dir,
+            &["checkout", "--quiet", "-b", "merged", "origin/main"],
+        );
+        fixture.sandbox.git(
+            &dir,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "origin/private/wip",
+            ],
+        );
+        assert_push_rejected(
+            fixture,
+            ALICE,
+            &dir,
+            &[
+                "-o",
+                ALLOW_MERGE_LEAK_PUSH_OPTION,
+                "origin",
+                "HEAD:refs/heads/main",
+            ],
+        );
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/main"),
+            main_before
+        );
+    })
+    .await;
+}
+
+/// Lowercase hex encoding of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Decodes a 40-digit hex SHA-1 object ID into its raw bytes.
+fn raw_object_id(object_id: &str) -> Vec<u8> {
+    let decoded: Option<Vec<u8>> = (0..object_id.len())
+        .step_by(2)
+        .map(|index| {
+            object_id
+                .get(index..index + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect();
+    match decoded {
+        Some(bytes) if bytes.len() == 20 => bytes,
+        _ => panic!("not a SHA-1 object ID: {object_id}"),
+    }
+}
+
+/// The SHA-1 object ID git gives an object of `object_type` with `content`.
+fn object_id(object_type: &str, content: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(format!("{object_type} {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hex(hasher.finalize().as_slice())
+}
+
+/// zlib-compresses `data`, as pack entries store it.
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    if let Err(error) = encoder.write_all(data) {
+        panic!("zlib compression failed: {error}");
+    }
+    match encoder.finish() {
+        Ok(compressed) => compressed,
+        Err(error) => panic!("zlib compression failed: {error}"),
+    }
+}
+
+/// Encodes a pack entry header: the object type in bits 4-6 of the first
+/// byte, then the uncompressed size, four bits first, seven bits per byte.
+fn pack_entry_header(pack_type: u8, size: usize) -> Vec<u8> {
+    let mut header = Vec::new();
+    let mut byte = (pack_type << 4) | (size & 0x0f) as u8;
+    let mut remaining = size >> 4;
+    while remaining > 0 {
+        header.push(byte | 0x80);
+        byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+    }
+    header.push(byte);
+    header
+}
+
+/// Encodes a size in a delta header: seven bits per byte, low bits first.
+fn delta_size(size: usize) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut remaining = size;
+    loop {
+        let byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining == 0 {
+            encoded.push(byte);
+            return encoded;
+        }
+        encoded.push(byte | 0x80);
+    }
+}
+
+/// One entry of a hand-built pack.
+enum PackEntry {
+    /// A whole object: pack type (1 commit, 2 tree, 3 blob) and content.
+    Whole(u8, Vec<u8>),
+    /// A `REF_DELTA` (pack type 7) against the object with this ID.
+    RefDelta(String, Vec<u8>),
+}
+
+/// Builds a version 2 pack of `entries` with its SHA-1 trailer.
+fn build_pack(entries: &[PackEntry]) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let mut pack = b"PACK".to_vec();
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    let Ok(entry_count) = u32::try_from(entries.len()) else {
+        panic!("too many pack entries");
+    };
+    pack.extend_from_slice(&entry_count.to_be_bytes());
+    for entry in entries {
+        match entry {
+            PackEntry::Whole(pack_type, content) => {
+                pack.extend_from_slice(&pack_entry_header(*pack_type, content.len()));
+                pack.extend_from_slice(&zlib(content));
+            }
+            PackEntry::RefDelta(base_id, delta) => {
+                pack.extend_from_slice(&pack_entry_header(7, delta.len()));
+                pack.extend_from_slice(&raw_object_id(base_id));
+                pack.extend_from_slice(&zlib(delta));
+            }
+        }
+    }
+    let trailer = Sha1::digest(&pack);
+    pack.extend_from_slice(trailer.as_slice());
+    pack
+}
+
+/// Builds a `git-receive-pack` request applying `(old_oid, new_oid,
+/// ref_name)` with `pack`.
+fn pack_push_request(old_oid: &str, new_oid: &str, ref_name: &str, pack: &[u8]) -> Vec<u8> {
+    let command = format!("{old_oid} {new_oid} {ref_name}\0report-status\n");
+    let mut request = pkt_line_bytes(command.as_bytes());
+    request.extend_from_slice(b"0000");
+    request.extend_from_slice(pack);
+    request
+}
+
+/// Finding #1: a thin pack whose `REF_DELTA` names a hidden blob as its base
+/// makes `index-pack --fix-thin` copy that blob from the repository into the
+/// quarantined pack, so the blob looks "sent". A tree in the same pack
+/// pointing at it must not publish it on `main`.
+#[tokio::test(flavor = "multi_thread")]
+async fn thin_pack_delta_base_cannot_smuggle_a_hidden_blob() {
+    let fixture = Fixture::start().await;
+    let store: Arc<dyn PolicyStore> = Arc::new(fixture.store.clone());
+    let team_dir = fixture.root.path().join("team.git");
+    let hidden_blob = stdout_text(&fixture.sandbox.git(
+        &team_dir,
+        &["rev-parse", "refs/heads/private/wip:private_wip.txt"],
+    ))
+    .trim()
+    .to_owned();
+    // An attacker can learn the size through the delta error oracle
+    // documented in pre_receive.rs; the test simply reads it.
+    let hidden_size_text = stdout_text(
+        &fixture
+            .sandbox
+            .git(&team_dir, &["cat-file", "-s", &hidden_blob]),
+    );
+    let Ok(hidden_size) = hidden_size_text.trim().parse::<usize>() else {
+        panic!("unexpected blob size {hidden_size_text:?}");
+    };
+    let main_before = Fixture::commit(&fixture.team_commits, "main");
+
+    let mut tree = b"100644 leak.txt\0".to_vec();
+    tree.extend_from_slice(&raw_object_id(&hidden_blob));
+    let tree_id = object_id("tree", &tree);
+    let commit = format!(
+        "tree {tree_id}\nparent {main_before}\n\
+         author Carol <carol@example.com> 1700000000 +0000\n\
+         committer Carol <carol@example.com> 1700000000 +0000\n\nsmuggle\n"
+    )
+    .into_bytes();
+    let commit_id = object_id("commit", &commit);
+    // A delta valid for any base of the hidden blob's size: one literal
+    // insert of `result`, no copies.
+    let result = b"smuggled\n";
+    let mut delta = delta_size(hidden_size);
+    delta.extend_from_slice(&delta_size(result.len()));
+    delta.push(result.len() as u8);
+    delta.extend_from_slice(result);
+    let pack = build_pack(&[
+        PackEntry::Whole(1, commit),
+        PackEntry::Whole(2, tree),
+        PackEntry::RefDelta(hidden_blob.clone(), delta),
+    ]);
+
+    let report = receive_pack_rpc(
+        &fixture,
+        store,
+        CAROL_TOKEN,
+        pack_push_request(&main_before, &commit_id, "refs/heads/main", &pack),
+    )
+    .await;
+    assert_hook_declined(report, "thin pack with a hidden delta base");
+    assert_eq!(
+        fixture.server_ref("team.git", "refs/heads/main"),
+        main_before
+    );
+}
+
+/// Re-adding a deleted file with the same bytes reuses a blob that is in the
+/// repository and reachable from `main`'s history (though not from its tip):
+/// the thin-pack defense must still accept it.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_member_can_restore_content_from_visible_history() {
+    with_fixture(|fixture| {
+        let dir = clone_team_as(fixture, CAROL, "carol-revert");
+        commit_file(fixture, &dir, "old.txt", "old visible content\n");
+        fixture.sandbox.git(&dir, &["rm", "--quiet", "old.txt"]);
+        fixture
+            .sandbox
+            .git(&dir, &["commit", "--quiet", "-m", "remove old.txt"]);
+        fixture.git_as(
+            CAROL,
+            "0",
+            &dir,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+
+        commit_file(fixture, &dir, "old.txt", "old visible content\n");
+        fixture.git_as(
+            CAROL,
+            "0",
+            &dir,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        let pushed = fixture.sandbox.git(&dir, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/main"),
+            stdout_text(&pushed).trim()
+        );
+    })
+    .await;
+}
+
+/// Finding #4: on a case-insensitive file system `refs/heads/VAULT` is the
+/// loose ref file of `refs/heads/vault`, so a write to it must be judged by
+/// the rules of `refs/heads/vault`. Refs are packed first, as `git gc` would,
+/// so no loose file blocks the create and a missing check would overwrite the
+/// hidden ref there.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_member_cannot_write_hidden_refs_through_case_variants() {
+    with_fixture(|fixture| {
+        fixture.sandbox.git(
+            &fixture.root.path().join("team.git"),
+            &["pack-refs", "--all"],
+        );
+        let dir = clone_team_as(fixture, CAROL, "carol-case");
+        commit_file(fixture, &dir, "carol.txt", "carol\n");
+
+        for target in ["refs/heads/Private/wip", "refs/heads/VAULT"] {
+            let stderr = assert_push_rejected(
+                fixture,
+                CAROL,
+                &dir,
+                &["origin", &format!("+HEAD:{target}")],
+            );
+            assert!(
+                stderr.contains(&format!("you do not have access to ref {target}")),
+                "{stderr}"
+            );
+        }
+        // A case variant of a visible ref is refused without echoing the
+        // existing spelling.
+        let stderr =
+            assert_push_rejected(fixture, CAROL, &dir, &["origin", "+HEAD:refs/heads/Main"]);
+        assert!(
+            stderr.contains("ref name conflicts with an existing ref"),
+            "{stderr}"
+        );
+
+        for hidden in ["private/wip", "vault"] {
+            assert_eq!(
+                fixture.server_ref("team.git", &format!("refs/heads/{hidden}")),
+                Fixture::commit(&fixture.team_commits, hidden),
+                "{hidden} changed on the server"
+            );
+        }
+        assert_eq!(
+            fixture.server_ref("team.git", "refs/heads/main"),
+            Fixture::commit(&fixture.team_commits, "main")
+        );
+    })
+    .await;
 }

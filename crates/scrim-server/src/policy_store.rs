@@ -13,6 +13,7 @@ use std::{
     future::Future,
     pin::Pin,
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use scrim_policy::{BranchPolicy, BranchRule, PolicyError};
@@ -43,6 +44,21 @@ pub struct MemberRepoPolicy {
     pub member_groups: BTreeSet<String>,
     /// The repository's compiled branch rules (empty if it has none).
     pub branch_policy: BranchPolicy,
+}
+
+/// One append-only entry written to `audit_log`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditLogEntry {
+    /// ID of the acting member (`None` when not tied to a member row).
+    pub actor_member_id: Option<i64>,
+    /// Machine-readable action name, e.g. `branch.merge_leak_override`.
+    pub action: String,
+    /// Kind of target acted on, e.g. `repository_ref`.
+    pub target_type: String,
+    /// Human-readable target identifier, e.g. `team/app.git:refs/heads/main`.
+    pub target_name: String,
+    /// Structured JSON metadata stored in `audit_log.details`.
+    pub details: serde_json::Value,
 }
 
 /// Errors a [`PolicyStore`] reports. Callers must treat every error as "deny".
@@ -115,6 +131,10 @@ pub trait PolicyStore: Send + Sync + 'static {
         member_id: i64,
         repo_key: &'a str,
     ) -> PolicyStoreFuture<'a, MemberRepoPolicy>;
+
+    /// Appends `entry` to the audit log. Callers guarding security overrides
+    /// must fail closed if recording the audit event fails.
+    fn record_audit_event<'a>(&'a self, entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()>;
 }
 
 /// Compiles `rules` for `repo_key`, mapping a rejected rule to
@@ -179,6 +199,17 @@ impl PolicyStore for StaticPolicyStore {
             }
         })
     }
+
+    fn record_audit_event<'a>(&'a self, entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
+        // M0 has no database, so the log output is the audit trail.
+        tracing::info!(
+            action = %entry.action,
+            target_type = %entry.target_type,
+            target_name = %entry.target_name,
+            "audit event"
+        );
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// One member of a [`MemoryPolicyStore`] and the hash of their token.
@@ -194,6 +225,9 @@ pub struct MemoryPolicyStore {
     members: Vec<MemoryMember>,
     groups_by_member: BTreeMap<i64, BTreeSet<String>>,
     rules_by_repository: BTreeMap<String, Vec<BranchRule>>,
+    /// Shared by every clone, so a test can keep a handle and inspect what a
+    /// server-owned clone recorded.
+    audit_log: Arc<Mutex<Vec<AuditLogEntry>>>,
 }
 
 impl fmt::Debug for MemoryPolicyStore {
@@ -203,6 +237,7 @@ impl fmt::Debug for MemoryPolicyStore {
             .field("member_count", &self.members.len())
             .field("groups_by_member", &self.groups_by_member)
             .field("rules_by_repository", &self.rules_by_repository)
+            .field("audit_entry_count", &self.audit_entry_count())
             .finish()
     }
 }
@@ -236,6 +271,24 @@ impl MemoryPolicyStore {
             .entry(repo_key.into())
             .or_default()
             .push(rule);
+    }
+
+    /// Returns a copy of every audit entry recorded so far (by this store or
+    /// any clone of it), oldest first. Reading only copies the log, so a
+    /// poisoned lock still returns what was recorded.
+    pub fn audit_entries(&self) -> Vec<AuditLogEntry> {
+        match self.audit_log.lock() {
+            Ok(audit_log) => audit_log.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Number of recorded audit entries (see [`Self::audit_entries`]).
+    fn audit_entry_count(&self) -> usize {
+        match self.audit_log.lock() {
+            Ok(audit_log) => audit_log.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 }
 
@@ -278,6 +331,20 @@ impl PolicyStore for MemoryPolicyStore {
                 Err(error) => Err(error),
             }
         })
+    }
+
+    fn record_audit_event<'a>(&'a self, entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
+        // Lock outside the future: a `MutexGuard` is not `Send`.
+        let result = match self.audit_log.lock() {
+            Ok(mut audit_log) => {
+                audit_log.push(entry);
+                Ok(())
+            }
+            Err(_) => Err(PolicyStoreError::Internal(
+                "audit log mutex is poisoned".to_owned(),
+            )),
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -434,5 +501,59 @@ impl PolicyStore for PgPolicyStore {
                 Err(error) => Err(error),
             }
         })
+    }
+
+    fn record_audit_event<'a>(&'a self, entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async move {
+            let result = sqlx::query(
+                "INSERT INTO audit_log (actor_member_id, action, target_type, target_name, details) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(entry.actor_member_id)
+            .bind(entry.action)
+            .bind(entry.target_type)
+            .bind(entry.target_name)
+            .bind(sqlx::types::Json(entry.details))
+            .execute(&self.pool)
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(error) => Err(PolicyStoreError::Database(error)),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuditLogEntry, MemoryPolicyStore, PolicyStore};
+
+    fn make_entry(action: &str, actor_member_id: Option<i64>) -> AuditLogEntry {
+        AuditLogEntry {
+            actor_member_id,
+            action: action.to_owned(),
+            target_type: "repository_ref".to_owned(),
+            target_name: "team/app.git:refs/heads/main".to_owned(),
+            details: serde_json::json!({ "reason": "test" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_audit_log_is_shared_across_clones() {
+        let store = MemoryPolicyStore::new();
+        let handle = store.clone();
+        let first = make_entry("branch.merge_leak_override", Some(7));
+        let second = make_entry("branch.other", None);
+
+        if let Err(error) = store.record_audit_event(first.clone()).await {
+            panic!("recording the first entry failed: {error}");
+        }
+        if let Err(error) = handle.record_audit_event(second.clone()).await {
+            panic!("recording the second entry failed: {error}");
+        }
+
+        assert_eq!(store.audit_entries(), vec![first.clone(), second.clone()]);
+        assert_eq!(handle.audit_entries(), vec![first, second]);
+        assert!(format!("{store:?}").contains("audit_entry_count: 2"));
     }
 }

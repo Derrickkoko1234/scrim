@@ -3,9 +3,11 @@
 //!
 //! Every request can carry its own [`GitVisibilityConfig`], which git applies
 //! through `transfer.hideRefs` so hidden refs are neither advertised nor
-//! fetchable by object ID.
+//! fetchable by object ID. Every `receive-pack` RPC runs with the
+//! server-owned `pre-receive` guard (see [`crate::pre_receive`]).
 
 use std::{
+    ffi::{OsStr, OsString},
     io,
     path::Path,
     process::{ExitStatus, Stdio},
@@ -20,6 +22,8 @@ use tokio::{
 };
 use tokio_util::{io::ReaderStream, task::AbortOnDropHandle};
 
+use crate::pre_receive::PreReceiveSession;
+
 /// Longest `Git-Protocol` header value that is passed on to git.
 const MAX_GIT_PROTOCOL_LENGTH: usize = 256;
 
@@ -31,6 +35,9 @@ const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 
 /// Largest pkt-line git sends or accepts, header included (`LARGE_PACKET_MAX`).
 const MAX_PKT_LINE_BYTES: usize = 65520;
+
+/// Most bytes of a helper git command's stderr kept for logging.
+const MAX_CAPTURED_STDERR_BYTES: usize = 8 * 1024;
 
 /// Which refs a single request must not see.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,6 +137,10 @@ impl ManagedChild {
         self.child.stdout.take()
     }
 
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
     async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait().await
     }
@@ -179,6 +190,7 @@ pub async fn advertise_refs(
         repo_dir,
         git_protocol,
         visibility,
+        None,
         Stdio::null(),
     ) {
         Ok(child) => child,
@@ -234,24 +246,47 @@ pub async fn advertise_refs(
         Some(Bytes::from(initial_bytes)),
         None,
         None,
+        None,
     ))
 }
 
 /// Streams a stateless-RPC exchange for `POST git-upload-pack|git-receive-pack`:
 /// the request body feeds git's stdin while git's stdout becomes the response.
+///
+/// `receive-pack` requires `pre_receive`, the session whose hook git runs
+/// before applying any update; without it (or if its hook is no longer
+/// installed) this fails without starting git, since git silently skips a
+/// missing hook. The session is kept alive in the response stream for as long
+/// as git runs.
 pub fn serve_rpc(
     service: GitService,
     repo_dir: &Path,
     git_protocol: Option<&str>,
     visibility: &GitVisibilityConfig,
     request_body: Body,
+    pre_receive: Option<PreReceiveSession>,
 ) -> io::Result<Body> {
+    if service == GitService::ReceivePack {
+        match &pre_receive {
+            Some(session) => {
+                if let Err(error) = session.verify_hook_installed() {
+                    return Err(error);
+                }
+            }
+            None => {
+                return Err(io::Error::other(
+                    "receive-pack requires the pre-receive guard",
+                ));
+            }
+        }
+    }
     let mut child = match spawn_git(
         service,
         false,
         repo_dir,
         git_protocol,
         visibility,
+        pre_receive.as_ref(),
         Stdio::piped(),
     ) {
         Ok(child) => child,
@@ -336,6 +371,7 @@ pub fn serve_rpc(
         None,
         Some(body_error_rx),
         Some(stdin_pump),
+        pre_receive,
     ))
 }
 
@@ -427,6 +463,11 @@ fn invalid_request(message: &str) -> io::Error {
 /// let a client fetch a hidden ref's commits by their ID. Git clients fall back
 /// to v0 transparently.
 ///
+/// `receive-pack` always advertises push options (so `git push -o` works over
+/// smart HTTP). With `pre_receive`, it also runs that session's hook
+/// directory as `core.hooksPath` (overriding any repository-local hooks) and
+/// passes the hook its callback address and token.
+///
 /// Returns `InvalidInput` without spawning if a hidden-ref pattern is empty or
 /// contains NUL, CR or LF.
 fn spawn_git(
@@ -435,6 +476,7 @@ fn spawn_git(
     repo_dir: &Path,
     git_protocol: Option<&str>,
     visibility: &GitVisibilityConfig,
+    pre_receive: Option<&PreReceiveSession>,
     stdin: Stdio,
 ) -> io::Result<ManagedChild> {
     for pattern in &visibility.hidden_refs {
@@ -463,6 +505,18 @@ fn spawn_git(
             .arg("-c")
             .arg(format!("transfer.hideRefs={pattern}"));
     }
+    if service == GitService::ReceivePack {
+        command.arg("-c").arg("receive.advertisePushOptions=true");
+    }
+    if let Some(session) = pre_receive {
+        let mut hooks_path_setting = OsString::from("core.hooksPath=");
+        hooks_path_setting.push(session.hooks_dir());
+        command.arg("-c").arg(hooks_path_setting);
+        // Always keep the received pack (never explode it into loose
+        // objects): `unpack-objects` skips objects the repository already
+        // has, so the guard could not tell which objects the pusher sent.
+        command.arg("-c").arg("receive.unpackLimit=1");
+    }
     command.arg(service.subcommand());
     if service == GitService::UploadPack {
         // Prevent git from falling back to `<dir>/.git` or `<dir>.git`.
@@ -488,6 +542,9 @@ fn spawn_git(
         && !visibility.is_enforced()
     {
         command.env("GIT_PROTOCOL", git_protocol);
+    }
+    if let Some(session) = pre_receive {
+        command.envs(session.hook_env());
     }
 
     #[cfg(unix)]
@@ -575,6 +632,108 @@ fn parse_ref_listing(listing: &str) -> io::Result<Vec<RepoRefEntry>> {
     Ok(entries)
 }
 
+/// Runs `git --git-dir <repo_dir> <args>` with the same isolated environment
+/// as the protocol services plus `extra_env`, writes `stdin_bytes` to its
+/// stdin, and returns its stdout.
+///
+/// Replace refs are ignored, so the history git walks is the stored one. The
+/// whole process group is killed if the future is dropped. Fails if git cannot
+/// start or exits unsuccessfully (its stderr is logged, not returned).
+pub(crate) async fn run_isolated_git(
+    repo_dir: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &OsStr)],
+    stdin_bytes: Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(repo_dir).args(args);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match command.spawn() {
+        Ok(child) => ManagedChild::new(child),
+        Err(error) => return Err(error),
+    };
+    let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
+        (child.take_stdin(), child.take_stdout(), child.take_stderr())
+    else {
+        return Err(io::Error::other("git pipes were not set up"));
+    };
+
+    // Write stdin and drain both outputs at once, so neither side can block
+    // on a full pipe.
+    let write_stdin = async move {
+        let result = stdin.write_all(&stdin_bytes).await;
+        // Dropping stdin closes the pipe, which ends git's `--stdin` input.
+        drop(stdin);
+        match result {
+            Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
+            _ => Ok(()),
+        }
+    };
+    let read_stdout = async {
+        let mut output = Vec::new();
+        match stdout.read_to_end(&mut output).await {
+            Ok(_) => Ok(output),
+            Err(error) => Err(error),
+        }
+    };
+    let read_stderr = async {
+        let mut kept = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read_count = match stderr.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(count) => count,
+            };
+            let room = MAX_CAPTURED_STDERR_BYTES - kept.len();
+            kept.extend_from_slice(&buffer[..read_count.min(room)]);
+        }
+        kept
+    };
+    let (write_result, stdout_result, stderr_bytes) =
+        tokio::join!(write_stdin, read_stdout, read_stderr);
+
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(error) => return Err(error),
+    };
+    let subcommand = match args.first() {
+        Some(subcommand) => *subcommand,
+        None => "",
+    };
+    if !status.success() {
+        tracing::warn!(
+            %status,
+            "git {subcommand} stderr: {}",
+            String::from_utf8_lossy(&stderr_bytes).trim_end()
+        );
+        return Err(io::Error::other(format!(
+            "git {subcommand} exited with {status}"
+        )));
+    }
+    if let Err(error) = write_result {
+        return Err(error);
+    }
+    stdout_result
+}
+
 fn invalid_ref_line(line: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -633,9 +792,11 @@ async fn log_stderr(service: GitService, mut stderr: ChildStderr) {
 }
 
 struct OutputStream {
-    // Declared before `_stdin_pump` so dropping the stream kills git before
-    // aborting the pump closes its stdin pipe.
+    // Declared before `_pre_receive` and `_stdin_pump` so dropping the stream
+    // kills git before the hook directory is deleted (git would silently skip
+    // a missing hook) and before aborting the pump closes its stdin pipe.
     child: ManagedChild,
+    _pre_receive: Option<PreReceiveSession>,
     _stdin_pump: Option<AbortOnDropHandle<()>>,
     reader: ReaderStream<ChildStdout>,
     body_error_rx: Option<oneshot::Receiver<io::Error>>,
@@ -659,8 +820,9 @@ async fn recv_body_error(body_error_rx: &mut Option<oneshot::Receiver<io::Error>
 
 /// Turns git's stdout into a response body, optionally preceded by `prefix`.
 ///
-/// `ManagedChild` and the stdin-pump handle live in the stream state so a
-/// client disconnect kills git's process group and aborts the pump. Any request
+/// `ManagedChild`, the stdin-pump handle and the pre-receive session live in
+/// the stream state so a client disconnect kills git's process group, aborts
+/// the pump and closes the hook callback listener. Any request
 /// body error or non-zero git exit yields an `Err` item so hyper aborts the
 /// response instead of terminating it cleanly.
 fn stream_child_output(
@@ -669,9 +831,11 @@ fn stream_child_output(
     prefix: Option<Bytes>,
     body_error_rx: Option<oneshot::Receiver<io::Error>>,
     stdin_pump: Option<AbortOnDropHandle<()>>,
+    pre_receive: Option<PreReceiveSession>,
 ) -> Body {
     let initial_state = Some(Box::new(OutputStream {
         child,
+        _pre_receive: pre_receive,
         _stdin_pump: stdin_pump,
         reader: ReaderStream::new(stdout),
         body_error_rx,
@@ -1097,6 +1261,7 @@ mod tests {
                 git_protocol,
                 &hide_private_branches(),
                 Body::from(request),
+                None,
             ) {
                 Ok(body) => body,
                 Err(error) => panic!("serve_rpc failed: {error}"),
@@ -1124,6 +1289,7 @@ mod tests {
             None,
             &hide_private_branches(),
             Body::from(request),
+            None,
         ) {
             Ok(body) => body,
             Err(error) => panic!("serve_rpc failed: {error}"),
@@ -1133,6 +1299,20 @@ mod tests {
             Err(error) => panic!("fetch body failed: {error}"),
         };
         assert!(contains(&response, "PACK"));
+    }
+
+    #[tokio::test]
+    async fn receive_pack_never_runs_without_the_pre_receive_guard() {
+        let repo = create_test_repo();
+        let result = serve_rpc(
+            GitService::ReceivePack,
+            &repo.dir,
+            None,
+            &GitVisibilityConfig::default(),
+            Body::empty(),
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1149,6 +1329,7 @@ mod tests {
                 &repo.dir,
                 None,
                 &visibility,
+                None,
                 Stdio::null(),
             ) {
                 Ok(_) => panic!("{pattern:?} should be rejected"),

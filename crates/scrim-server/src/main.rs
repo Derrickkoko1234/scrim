@@ -1,4 +1,8 @@
 //! The scrim-server binary: serves bare Git repositories over smart HTTP.
+//!
+//! The same binary is git's `pre-receive` hook: started by `git receive-pack`
+//! with `SCRIM_HOOK_MODE=pre-receive`, it asks the running server for its
+//! verdict instead of serving.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
@@ -12,7 +16,10 @@ use std::{
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Parser};
-use scrim_server::{MAX_TOKEN_BYTES, PgPolicyStore, SecretString, TokenAuth};
+use scrim_server::{
+    MAX_TOKEN_BYTES, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, SecretString,
+    TokenAuth, run_pre_receive_hook_process,
+};
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::EnvFilter;
@@ -68,8 +75,28 @@ struct Config {
     database_url: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Checked before logging or argument parsing: in hook mode, stderr goes
+    // to the pusher and git passes the hook no server arguments. The hook is
+    // synchronous, so no async runtime is started for it.
+    if std::env::var_os(PRE_RECEIVE_HOOK_MODE_ENV).is_some_and(|mode| mode == PRE_RECEIVE_HOOK_MODE)
+    {
+        std::process::exit(run_pre_receive_hook_process());
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return Err(error),
+    };
+    runtime.block_on(run_server())
+}
+
+/// Parses the configuration and serves until Ctrl-C.
+async fn run_server() -> anyhow::Result<()> {
     let mut env_filter = EnvFilter::new("info");
     if let Ok(from_env) = EnvFilter::try_from_default_env() {
         env_filter = from_env;

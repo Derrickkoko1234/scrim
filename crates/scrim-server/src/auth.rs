@@ -277,8 +277,8 @@ mod tests {
         WWW_AUTHENTICATE_VALUE, candidate_token_hash, require_auth,
     };
     use crate::policy_store::{
-        AuthenticatedMember, MemberRepoPolicy, PolicyStore, PolicyStoreError, PolicyStoreFuture,
-        StaticPolicyStore,
+        AuditLogEntry, AuthenticatedMember, MemberRepoPolicy, PolicyStore, PolicyStoreError,
+        PolicyStoreFuture, StaticPolicyStore,
     };
 
     /// Returns whether `header_value` carries the token `auth` was built from,
@@ -306,6 +306,10 @@ mod tests {
             _member_id: i64,
             _repo_key: &'a str,
         ) -> PolicyStoreFuture<'a, MemberRepoPolicy> {
+            Box::pin(async { Err(PolicyStoreError::Internal("store offline".to_owned())) })
+        }
+
+        fn record_audit_event<'a>(&'a self, _entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
             Box::pin(async { Err(PolicyStoreError::Internal("store offline".to_owned())) })
         }
     }

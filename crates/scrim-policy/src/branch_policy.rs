@@ -17,8 +17,9 @@ use crate::ref_glob::validate_ref_glob;
 /// Characters that make a pattern a glob rather than a literal ref name.
 const GLOB_METACHARACTERS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 
-/// Most symbolic-ref hops [`BranchPolicy::is_ref_chain_visible`] follows
-/// before failing closed. Git itself gives up after 5.
+/// Most symbolic-ref hops the chain-following checks (such as
+/// [`BranchPolicy::is_ref_chain_visible`]) follow before failing closed.
+/// Git itself gives up after 5.
 const MAX_SYMREF_DEPTH: usize = 16;
 
 /// Restricts every ref matching `pattern` to members of `allowed_groups`.
@@ -72,6 +73,9 @@ enum RuleKind {
 struct CompiledRule {
     allowed_groups: BTreeSet<String>,
     matcher: GlobMatcher,
+    /// The same glob matched ignoring ASCII case, for
+    /// [`BranchPolicy::is_ref_visible_case_insensitive`].
+    case_insensitive_matcher: GlobMatcher,
     kind: RuleKind,
 }
 
@@ -122,9 +126,18 @@ impl BranchPolicy {
                 Ok(glob) => glob,
                 Err(source) => return Err(PolicyError::GlobCompile { pattern, source }),
             };
+            let case_insensitive_glob = match GlobBuilder::new(&pattern)
+                .literal_separator(false)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(glob) => glob,
+                Err(source) => return Err(PolicyError::GlobCompile { pattern, source }),
+            };
             compiled_rules.push(CompiledRule {
                 allowed_groups,
                 matcher: glob.compile_matcher(),
+                case_insensitive_matcher: case_insensitive_glob.compile_matcher(),
                 kind: classify_pattern(&pattern),
             });
         }
@@ -144,9 +157,26 @@ impl BranchPolicy {
     /// every matching rule shares at least one group with `member_groups`;
     /// a matching rule with no allowed groups hides the ref from everyone.
     pub fn is_ref_visible(&self, ref_name: &str, member_groups: &BTreeSet<String>) -> bool {
+        self.matching_rules(ref_name)
+            .all(|rule| !rule.allowed_groups.is_disjoint(member_groups))
+    }
+
+    /// Like [`BranchPolicy::is_ref_visible`], but a rule also applies when its
+    /// glob matches `ref_name` ignoring ASCII case.
+    ///
+    /// Used to authorize ref writes: on a case-insensitive file system (macOS,
+    /// Windows) `refs/heads/Private/wip` and `refs/heads/private/wip` are the
+    /// same loose ref file, so a write to the former must be judged by the
+    /// rules of the latter. Never more permissive than
+    /// [`BranchPolicy::is_ref_visible`].
+    pub fn is_ref_visible_case_insensitive(
+        &self,
+        ref_name: &str,
+        member_groups: &BTreeSet<String>,
+    ) -> bool {
         self.rules
             .iter()
-            .filter(|rule| rule.matcher.is_match(ref_name))
+            .filter(|rule| rule.case_insensitive_matcher.is_match(ref_name))
             .all(|rule| !rule.allowed_groups.is_disjoint(member_groups))
     }
 
@@ -156,25 +186,105 @@ impl BranchPolicy {
     /// Each hop must pass [`BranchPolicy::is_ref_visible`]: a visible symbolic
     /// ref pointing at a hidden branch would otherwise advertise the hidden
     /// branch's commit. Fails closed (returns `false`) on a cycle or a chain
-    /// longer than 16 hops.
+    /// longer than [`MAX_SYMREF_DEPTH`] hops.
     pub fn is_ref_chain_visible(
         &self,
         ref_name: &str,
         symrefs: &BTreeMap<&str, &str>,
         member_groups: &BTreeSet<String>,
     ) -> bool {
-        let mut visited = BTreeSet::new();
-        let mut current = ref_name;
-        for _ in 0..=MAX_SYMREF_DEPTH {
-            if !visited.insert(current) || !self.is_ref_visible(current, member_groups) {
-                return false;
-            }
-            match symrefs.get(current) {
-                Some(target) => current = target,
-                None => return true,
-            }
+        match resolve_symref_chain(ref_name, symrefs) {
+            Some(chain) => chain
+                .iter()
+                .all(|hop| self.is_ref_visible(hop, member_groups)),
+            None => false,
         }
-        false
+    }
+
+    /// Reports whether everyone who could ever see `target_ref` may also see
+    /// `source_ref`, whatever groups they belong to: `audience(target_ref) ⊆
+    /// audience(source_ref)`.
+    ///
+    /// The pre-receive merge-leak guard uses this before letting commits from
+    /// `source_ref` land in `target_ref`: if it returns `false`, some member
+    /// could read those commits through `target_ref` without being allowed to
+    /// see `source_ref`.
+    ///
+    /// # Rule
+    ///
+    /// Let `S` be the rules matching `source_ref` and `T` the rules matching
+    /// `target_ref`. A member with groups `M` sees a ref iff `M` shares a group
+    /// with every rule matching it. The answer is `true` iff either
+    ///
+    /// - some rule in `T` has no allowed groups, so nobody can see
+    ///   `target_ref` and its audience is empty; or
+    /// - for every `s` in `S` there is a `t` in `T` whose allowed groups are a
+    ///   subset of `s`'s (anyone satisfying `t` then satisfies `s`).
+    ///
+    /// This is exact, not just safe: if some `s` has no such `t` (and no `t` is
+    /// empty), picking one group from each `t` outside `s` builds a member who
+    /// sees `target_ref` but not `source_ref`.
+    ///
+    /// # Edge cases
+    ///
+    /// - An unrestricted `source_ref` (empty `S`) is always `true`.
+    /// - A restricted `source_ref` into an unrestricted `target_ref` (empty
+    ///   `T`) is `false`, since a member with no groups sees `target_ref`.
+    /// - A `source_ref` hidden from everyone is `false` unless `target_ref` is
+    ///   also hidden from everyone.
+    /// - Both refs are judged by their own names; see
+    ///   [`BranchPolicy::is_ref_chain_at_least_as_visible_as`] to follow
+    ///   `source_ref`'s symbolic refs.
+    pub fn is_ref_at_least_as_visible_as(&self, source_ref: &str, target_ref: &str) -> bool {
+        let target_rules: Vec<&CompiledRule> = self.matching_rules(target_ref).collect();
+        if target_rules
+            .iter()
+            .any(|target_rule| target_rule.allowed_groups.is_empty())
+        {
+            return true;
+        }
+        self.matching_rules(source_ref).all(|source_rule| {
+            target_rules.iter().any(|target_rule| {
+                target_rule
+                    .allowed_groups
+                    .is_subset(&source_rule.allowed_groups)
+            })
+        })
+    }
+
+    /// Like [`BranchPolicy::is_ref_at_least_as_visible_as`], but follows
+    /// `source_ref` through `symrefs` (symbolic ref name -> target) and
+    /// requires every hop to be at least as visible as `target_ref`.
+    ///
+    /// Checking each hop is the same as checking the union of the rules
+    /// matching any hop, so a public alias of a private branch counts as
+    /// private. `target_ref` is judged by its own name only.
+    ///
+    /// Always fails closed (returns `false`) on a cycle or a chain longer than
+    /// [`MAX_SYMREF_DEPTH`] hops, even when nobody can see `target_ref`: a
+    /// malformed chain is rejected rather than reasoned about.
+    pub fn is_ref_chain_at_least_as_visible_as(
+        &self,
+        source_ref: &str,
+        symrefs: &BTreeMap<&str, &str>,
+        target_ref: &str,
+    ) -> bool {
+        match resolve_symref_chain(source_ref, symrefs) {
+            Some(chain) => chain
+                .iter()
+                .all(|hop| self.is_ref_at_least_as_visible_as(hop, target_ref)),
+            None => false,
+        }
+    }
+
+    /// Returns the compiled rules whose glob matches `ref_name`.
+    fn matching_rules<'policy>(
+        &'policy self,
+        ref_name: &'policy str,
+    ) -> impl Iterator<Item = &'policy CompiledRule> + 'policy {
+        self.rules
+            .iter()
+            .filter(move |rule| rule.matcher.is_match(ref_name))
     }
 
     /// Plans the `transfer.hideRefs` values for a member of `member_groups`.
@@ -350,6 +460,30 @@ impl HiddenRefPlan {
     }
 }
 
+/// Lists `ref_name` followed by every ref it leads to through `symrefs`
+/// (symbolic ref name -> target), ending at the first non-symbolic ref.
+///
+/// Returns `None` when the chain revisits a ref or needs more than
+/// [`MAX_SYMREF_DEPTH`] hops, so callers can fail closed.
+fn resolve_symref_chain<'a>(
+    ref_name: &'a str,
+    symrefs: &BTreeMap<&'a str, &'a str>,
+) -> Option<Vec<&'a str>> {
+    let mut chain: Vec<&str> = Vec::new();
+    let mut current = ref_name;
+    for _ in 0..=MAX_SYMREF_DEPTH {
+        if chain.contains(&current) {
+            return None;
+        }
+        chain.push(current);
+        match symrefs.get(current) {
+            Some(target) => current = target,
+            None => return Some(chain),
+        }
+    }
+    None
+}
+
 /// Sorts a validated pattern into the [`RuleKind`] that decides how it is
 /// expressed in `transfer.hideRefs`.
 fn classify_pattern(pattern: &str) -> RuleKind {
@@ -493,6 +627,46 @@ mod tests {
         assert!(policy.is_ref_visible("refs/heads/private/alice/wip", &groups(&["core"])));
         assert!(policy.is_ref_visible("refs/heads/main", &outsider));
         assert!(policy.is_ref_visible("refs/heads/privateer", &outsider));
+    }
+
+    #[test]
+    fn case_insensitive_visibility_applies_rules_ignoring_case() {
+        let policy = compile(vec![
+            rule("refs/heads/private/*", &["core"]),
+            rule("refs/heads/vault", &["core"]),
+            rule("refs/heads/*/secret", &["security"]),
+        ]);
+        let outsider = groups(&["guests"]);
+        for ref_name in [
+            "refs/heads/Private/wip",
+            "refs/heads/PRIVATE/wip",
+            "refs/heads/VAULT",
+            "refs/heads/Vault",
+            "REFS/HEADS/private/wip",
+            "refs/heads/team/SECRET",
+        ] {
+            // The exact-case check alone would let these through.
+            assert!(policy.is_ref_visible(ref_name, &outsider), "{ref_name}");
+            assert!(
+                !policy.is_ref_visible_case_insensitive(ref_name, &outsider),
+                "{ref_name}"
+            );
+        }
+        assert!(!policy.is_ref_visible_case_insensitive("refs/heads/private/wip", &outsider));
+        assert!(
+            policy.is_ref_visible_case_insensitive("refs/heads/Private/wip", &groups(&["core"]))
+        );
+        assert!(policy.is_ref_visible_case_insensitive("refs/heads/main", &outsider));
+        assert!(policy.is_ref_visible_case_insensitive("refs/heads/vaults", &outsider));
+        // Every rule matching ignoring case must still be satisfied.
+        assert!(
+            !policy
+                .is_ref_visible_case_insensitive("refs/heads/PRIVATE/Secret", &groups(&["core"]))
+        );
+        assert!(policy.is_ref_visible_case_insensitive(
+            "refs/heads/PRIVATE/Secret",
+            &groups(&["core", "security"])
+        ));
     }
 
     #[test]
@@ -734,6 +908,171 @@ mod tests {
                 "ref {ref_name:?} with {hide_refs:?}"
             );
         }
+    }
+
+    /// Policy shared by the visibility-ordering tests. `refs/heads/main` is
+    /// unrestricted; `private/secret` needs both `core` and `security`.
+    fn visibility_ordering_policy() -> BranchPolicy {
+        compile(vec![
+            rule("refs/heads/locked/*", &[]),
+            rule("refs/heads/private/*", &["core"]),
+            rule("refs/heads/private2/*", &["core"]),
+            rule("refs/heads/shared/*", &["core", "contractors"]),
+            rule("refs/heads/*/secret", &["security"]),
+            rule("refs/heads/finance/*", &["finance"]),
+        ])
+    }
+
+    #[test]
+    fn visibility_ordering_follows_audience_inclusion() {
+        let policy = visibility_ordering_policy();
+        // (source, target, is target's audience within source's)
+        let cases = [
+            // Restricted into unrestricted widens the audience.
+            ("refs/heads/locked/x", "refs/heads/main", false),
+            ("refs/heads/private/wip", "refs/heads/main", false),
+            // Nobody can see a locked target, so nothing leaks into it.
+            ("refs/heads/private/wip", "refs/heads/locked/x", true),
+            ("refs/heads/locked/x", "refs/heads/locked/y", true),
+            // An unrestricted source never leaks.
+            ("refs/heads/main", "refs/heads/private/wip", true),
+            ("refs/heads/main", "refs/heads/develop", true),
+            // Same groups.
+            ("refs/heads/private/wip", "refs/heads/private2/wip", true),
+            // Widening and narrowing.
+            ("refs/heads/private/wip", "refs/heads/shared/wip", false),
+            ("refs/heads/shared/wip", "refs/heads/private/wip", true),
+            // Overlapping rules: secret needs core AND security.
+            ("refs/heads/private/secret", "refs/heads/private/wip", false),
+            ("refs/heads/private/wip", "refs/heads/private/secret", true),
+            // Disjoint groups.
+            ("refs/heads/finance/q3", "refs/heads/private/wip", false),
+            ("refs/heads/private/wip", "refs/heads/finance/q3", false),
+        ];
+        for (source_ref, target_ref, expected) in cases {
+            assert_eq!(
+                policy.is_ref_at_least_as_visible_as(source_ref, target_ref),
+                expected,
+                "source {source_ref:?} target {target_ref:?}"
+            );
+        }
+    }
+
+    /// Cross-checks the subset rule against brute force over every member
+    /// built from the policy's groups plus one outsider group.
+    #[test]
+    fn visibility_ordering_matches_brute_force_audiences() {
+        let policy = visibility_ordering_policy();
+        let all_groups = ["core", "contractors", "security", "finance", "guests"];
+        let members: Vec<BTreeSet<String>> = (0..1_u32 << all_groups.len())
+            .map(|mask| {
+                all_groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, group)| (*group).to_owned())
+                    .collect()
+            })
+            .collect();
+        let refs = [
+            "refs/heads/main",
+            "refs/heads/locked/x",
+            "refs/heads/private/wip",
+            "refs/heads/private2/wip",
+            "refs/heads/shared/wip",
+            "refs/heads/private/secret",
+            "refs/heads/team/secret",
+            "refs/heads/finance/q3",
+        ];
+        for source_ref in refs {
+            for target_ref in refs {
+                let is_audience_included = members.iter().all(|member| {
+                    !policy.is_ref_visible(target_ref, member)
+                        || policy.is_ref_visible(source_ref, member)
+                });
+                assert_eq!(
+                    policy.is_ref_at_least_as_visible_as(source_ref, target_ref),
+                    is_audience_included,
+                    "source {source_ref:?} target {target_ref:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chain_visibility_ordering_checks_every_source_hop() {
+        let policy = visibility_ordering_policy();
+        let symrefs = BTreeMap::from([
+            ("refs/heads/alias", "refs/heads/private/wip"),
+            ("refs/heads/default", "refs/heads/alias"),
+            ("refs/heads/public-alias", "refs/heads/main"),
+            ("refs/heads/loop-a", "refs/heads/loop-b"),
+            ("refs/heads/loop-b", "refs/heads/loop-a"),
+        ]);
+        // A public-looking alias of a private branch is as private as it.
+        assert!(policy.is_ref_at_least_as_visible_as("refs/heads/alias", "refs/heads/main"));
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/alias",
+            &symrefs,
+            "refs/heads/main"
+        ));
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/default",
+            &symrefs,
+            "refs/heads/shared/wip"
+        ));
+        assert!(policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/default",
+            &symrefs,
+            "refs/heads/private2/wip"
+        ));
+        assert!(policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/public-alias",
+            &symrefs,
+            "refs/heads/main"
+        ));
+        // Non-symbolic refs behave like the single-ref check.
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/private/wip",
+            &symrefs,
+            "refs/heads/main"
+        ));
+
+        // A cycle fails closed, even into a ref nobody can see.
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/loop-a",
+            &symrefs,
+            "refs/heads/main"
+        ));
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            "refs/heads/loop-a",
+            &symrefs,
+            "refs/heads/locked/x"
+        ));
+
+        // A chain longer than the limit fails closed; one at the limit passes.
+        let names: Vec<String> = (0..=MAX_SYMREF_DEPTH + 1)
+            .map(|index| format!("refs/heads/hop{index}"))
+            .collect();
+        let long_chain: BTreeMap<&str, &str> = names
+            .windows(2)
+            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+            .collect();
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            &names[0],
+            &long_chain,
+            "refs/heads/main"
+        ));
+        assert!(!policy.is_ref_chain_at_least_as_visible_as(
+            &names[0],
+            &long_chain,
+            "refs/heads/locked/x"
+        ));
+        assert!(policy.is_ref_chain_at_least_as_visible_as(
+            &names[1],
+            &long_chain,
+            "refs/heads/main"
+        ));
     }
 
     #[test]

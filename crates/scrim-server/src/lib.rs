@@ -5,7 +5,10 @@
 //! decompression or repository lookup. Each Git request then gets its own
 //! `transfer.hideRefs` list, built from the repository's branch rules and the
 //! member's groups, so refs the member may not see are neither advertised,
-//! fetchable by object ID, nor pushable.
+//! fetchable by object ID, nor pushable. Every push additionally passes the
+//! server-owned `pre-receive` guard (see [`run_pre_receive_hook_process`]),
+//! which authorizes each ref write exactly, refuses hidden objects smuggled in
+//! by ID, and blocks merges that would expose private commits.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
@@ -14,6 +17,7 @@
 mod auth;
 mod git_service;
 mod policy_store;
+mod pre_receive;
 mod repo_path;
 
 use std::{
@@ -38,9 +42,14 @@ use git_service::{
     serve_rpc,
 };
 pub use policy_store::{
-    AuthenticatedMember, MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore, PolicyStore,
-    PolicyStoreError, PolicyStoreFuture, StaticPolicyStore,
+    AuditLogEntry, AuthenticatedMember, MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore,
+    PolicyStore, PolicyStoreError, PolicyStoreFuture, StaticPolicyStore,
 };
+pub use pre_receive::{
+    ALLOW_MERGE_LEAK_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV,
+    run_pre_receive_hook_process,
+};
+use pre_receive::{HookDir, PreReceiveContext, start_pre_receive_session};
 use repo_path::{RepoHead, read_valid_head, resolve_bare_repo};
 pub use secrecy::SecretString;
 
@@ -60,10 +69,16 @@ pub fn router(repo_root: PathBuf, auth: TokenAuth) -> Router {
 /// Incoming requests are traced (method and path only), authenticated against
 /// `policy_store`, and (for gzip request bodies) decompressed transparently
 /// before repository resolution. Any store failure is answered with `500`.
+///
+/// Pushes run the scrim-server binary as git's `pre-receive` hook (see
+/// [`run_pre_receive_hook_process`]); the hook directory is set up on the
+/// first push, and set up again if it has gone missing, and a push is
+/// answered with `500` if the binary cannot be found.
 pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> Router {
     let state = AppState {
         repo_root,
         policy_store: Arc::clone(&policy_store),
+        hook_dir: Arc::new(tokio::sync::Mutex::new(None)),
     };
     Router::new()
         // Axum wildcards cannot be followed by a literal suffix, so a single
@@ -93,6 +108,36 @@ pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn Policy
 struct AppState {
     repo_root: PathBuf,
     policy_store: Arc<dyn PolicyStore>,
+    /// Created on the first push rather than with the router, so routers
+    /// that never accept a push (and `cargo test --lib`, where the server
+    /// binary may not be built) do not need the hook binary. Replaced when
+    /// its hook is no longer installed; see [`current_hook_dir`].
+    hook_dir: Arc<tokio::sync::Mutex<Option<Arc<HookDir>>>>,
+}
+
+/// Returns the shared hook directory, creating it on first use and creating a
+/// fresh one whenever the current one fails [`HookDir::verify_installed`]
+/// (for example after a temporary-file cleaner deleted it), so the server
+/// heals itself instead of refusing every push until restarted.
+///
+/// A replaced directory is deleted once the last push still using it ends.
+async fn current_hook_dir(
+    hook_dir: &tokio::sync::Mutex<Option<Arc<HookDir>>>,
+) -> std::io::Result<Arc<HookDir>> {
+    let mut current = hook_dir.lock().await;
+    if let Some(dir) = current.as_ref()
+        && dir.verify_installed().is_ok()
+    {
+        return Ok(Arc::clone(dir));
+    }
+    match HookDir::create() {
+        Ok(created) => {
+            let created = Arc::new(created);
+            *current = Some(Arc::clone(&created));
+            Ok(created)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The kind of smart-HTTP endpoint a request path addresses.
@@ -118,7 +163,7 @@ fn parse_path(path: &str) -> Option<(&str, Endpoint)> {
 }
 
 async fn handle_request(State(state): State<AppState>, request: Request) -> Response {
-    let mut response = route_request(&state.repo_root, state.policy_store.as_ref(), request).await;
+    let mut response = route_request(&state, request).await;
     // Git responses must never be cached by clients or proxies.
     let headers = response.headers_mut();
     headers.insert(
@@ -133,11 +178,9 @@ async fn handle_request(State(state): State<AppState>, request: Request) -> Resp
     response
 }
 
-async fn route_request(
-    repo_root: &Path,
-    policy_store: &dyn PolicyStore,
-    request: Request,
-) -> Response {
+async fn route_request(state: &AppState, request: Request) -> Response {
+    let repo_root = state.repo_root.as_path();
+    let policy_store = state.policy_store.as_ref();
     let (parts, body) = request.into_parts();
 
     // `require_auth` always inserts the member; its absence is a wiring bug,
@@ -235,8 +278,40 @@ async fn route_request(
             .await
             .map(|body| (service, "advertisement", body))
     } else {
-        serve_rpc(service, &resolved_repo.dir, git_protocol, &visibility, body)
-            .map(|body| (service, "result", body))
+        let pre_receive = if service == GitService::ReceivePack {
+            let hook_dir = match current_hook_dir(&state.hook_dir).await {
+                Ok(hook_dir) => hook_dir,
+                Err(error) => {
+                    tracing::error!(%error, "cannot set up the pre-receive hook");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let context = PreReceiveContext {
+                repo_dir: resolved_repo.dir.clone(),
+                canonical_key: resolved_repo.canonical_key.clone(),
+                member: member.clone(),
+                policy,
+                policy_store: Arc::clone(&state.policy_store),
+            };
+            match start_pre_receive_session(hook_dir, context).await {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    tracing::error!(%error, "cannot start the pre-receive callback");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        } else {
+            None
+        };
+        serve_rpc(
+            service,
+            &resolved_repo.dir,
+            git_protocol,
+            &visibility,
+            body,
+            pre_receive,
+        )
+        .map(|body| (service, "result", body))
     };
 
     match result {
