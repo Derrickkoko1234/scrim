@@ -1,0 +1,64 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: Check DCO sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Signed-off-by trailers
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          commits="$(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}")"
+          if [[ -z "${commits}" ]]; then
+            echo "No non-merge commits to verify in ${BASE_SHA}..${HEAD_SHA}."
+            exit 0
+          fi
+
+          failed=0
+          while IFS= read -r sha; do
+            author_name="$(git log -1 --format='%an' "${sha}")"
+            author_email="$(git log -1 --format='%ae' "${sha}")"
+            expected="Signed-off-by: ${author_name} <${author_email}>"
+
+            trailers="$(git log -1 --format='%(trailers:key=Signed-off-by,separator=%x0a)' "${sha}" | tr -d '\r')"
+            if ! printf '%s\n' "${trailers}" | grep -Fxq -- "${expected}"; then
+              short_sha="$(git rev-parse --short "${sha}")"
+              subject="$(git log -1 --format='%s' "${sha}")"
+              echo "ERROR: Missing or mismatched DCO sign-off on ${short_sha}: ${subject}"
+              echo "  Expected: ${expected}"
+              failed=1
+            fi
+          done <<< "${commits}"
+
+          if [[ "${failed}" -ne 0 ]]; then
+            echo ""
+            echo "Every commit must include a 'Signed-off-by: <Name> <email>' trailer matching the commit author."
+            echo "To fix this, run:"
+            echo "  git rebase --signoff origin/${BASE_REF}"
+            echo "  git push --force-with-lease"
+            exit 1
+          fi
+
+          echo "All non-merge commits have valid DCO sign-off."

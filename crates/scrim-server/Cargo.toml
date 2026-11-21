@@ -1,0 +1,8 @@
+[package]
+name = "scrim-server"
+version = "0.0.0"
+description = "Self-hosted Git remote that enforces per-user visibility for Scrim for Git"
+license = "AGPL-3.0-only"
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
