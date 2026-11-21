@@ -13,8 +13,10 @@ axum = "0.8.9"
 base64 = "0.23.1"
 clap = { version = "4.6.9", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+scrim-policy = { version = "0.0.0", path = "../scrim-policy" }
 secrecy = "0.10.3"
 sha2 = { version = "0.11.1", features = ["zeroize"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "tls-rustls-ring-native-roots"] }
 subtle = "2.6.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "net", "signal", "io-util", "fs", "sync"] }
 tokio-util = { version = "0.7.20", features = ["io", "rt"] }

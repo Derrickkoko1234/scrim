@@ -7,11 +7,12 @@
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, bail};
-use clap::Parser;
-use scrim_server::{MAX_TOKEN_BYTES, SecretString, TokenAuth};
+use clap::{ArgGroup, Parser};
+use scrim_server::{MAX_TOKEN_BYTES, PgPolicyStore, SecretString, TokenAuth};
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::EnvFilter;
@@ -25,7 +26,17 @@ const MAX_TOKEN_FILE_BYTES: usize = MAX_TOKEN_BYTES + 2;
 const RECOMMENDED_MIN_TOKEN_BYTES: usize = 16;
 
 /// Self-hosted Git remote for Scrim for Git.
+///
+/// Members are authenticated either against PostgreSQL (`--database-url`) or,
+/// for a single-user setup, against one shared token (`--token` or
+/// `--token-file`). Exactly one of the three must be given.
 #[derive(Parser)]
+#[command(group(
+    ArgGroup::new("authentication")
+        .args(["database_url", "token", "token_file"])
+        .required(true)
+        .multiple(false)
+))]
 struct Config {
     /// Directory containing the bare repositories to serve.
     #[arg(long, env = "SCRIM_REPO_ROOT")]
@@ -39,23 +50,22 @@ struct Config {
     /// Authentication token required for all HTTP requests. Prefer passing
     /// `SCRIM_TOKEN` or `--token-file` in production so the token does not
     /// appear in process listings.
-    #[arg(
-        long,
-        env = "SCRIM_TOKEN",
-        hide_env_values = true,
-        conflicts_with = "token_file",
-        required_unless_present = "token_file"
-    )]
+    #[arg(long, env = "SCRIM_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
     /// Path to a file containing the authentication token.
-    #[arg(
-        long,
-        env = "SCRIM_TOKEN_FILE",
-        conflicts_with = "token",
-        required_unless_present = "token"
-    )]
+    #[arg(long, env = "SCRIM_TOKEN_FILE")]
     token_file: Option<PathBuf>,
+
+    /// PostgreSQL connection URL holding members, tokens, groups and branch
+    /// rules, e.g. `postgres://scrim@localhost/scrim`. Pending migrations are
+    /// applied at startup. Prefer the `DATABASE_URL` environment variable so a
+    /// password does not appear in process listings. For a remote server, add
+    /// `sslmode=verify-full` (and `sslrootcert=...` if needed): the default,
+    /// `prefer`, silently falls back to an unencrypted, unauthenticated
+    /// connection.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    database_url: Option<String>,
 }
 
 #[tokio::main]
@@ -82,9 +92,25 @@ async fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error),
     };
 
-    let auth = match load_token_auth(config.token, config.token_file).await {
-        Ok(auth) => auth,
-        Err(error) => return Err(error),
+    let router = if let Some(database_url) = config.database_url {
+        // Keep the URL (and any password in it) out of every error message.
+        let database_url = Zeroizing::new(database_url);
+        let store = match PgPolicyStore::connect(&database_url).await {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)).context("cannot connect to the database");
+            }
+        };
+        if let Err(error) = store.migrate().await {
+            return Err(anyhow::Error::new(error)).context("cannot migrate the database");
+        }
+        scrim_server::router_with_policy_store(repo_root.clone(), Arc::new(store))
+    } else {
+        let auth = match load_token_auth(config.token, config.token_file).await {
+            Ok(auth) => auth,
+            Err(error) => return Err(error),
+        };
+        scrim_server::router(repo_root.clone(), auth)
     };
 
     let listener = match tokio::net::TcpListener::bind(config.listen)
@@ -103,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(repo_root = %repo_root.display(), address = %local_address, "serving");
 
-    axum::serve(listener, scrim_server::router(repo_root, auth))
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
             // If the signal handler cannot be installed, keep serving rather than exit.
             if tokio::signal::ctrl_c().await.is_err() {

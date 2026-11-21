@@ -6,10 +6,12 @@
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Arc,
 };
 
+use axum::Router;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use scrim_server::{SecretString, TokenAuth};
+use scrim_server::{PolicyStore, SecretString, TokenAuth};
 use tempfile::TempDir;
 
 /// Shared authentication token used across integration tests.
@@ -156,6 +158,23 @@ impl GitSandbox {
 
 /// Starts the server on an ephemeral loopback port and returns its base URL.
 pub async fn spawn_server(repo_root: PathBuf, auth: TokenAuth) -> String {
+    serve_router(scrim_server::router(repo_root, auth)).await
+}
+
+/// Like [`spawn_server`], with members and branch rules from `policy_store`.
+pub async fn spawn_server_with_store(
+    repo_root: PathBuf,
+    policy_store: Arc<dyn PolicyStore>,
+) -> String {
+    serve_router(scrim_server::router_with_policy_store(
+        repo_root,
+        policy_store,
+    ))
+    .await
+}
+
+/// Serves `router` on an ephemeral loopback port and returns its base URL.
+async fn serve_router(router: Router) -> String {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
         Err(error) => panic!("failed to bind server listener: {error}"),
@@ -165,7 +184,7 @@ pub async fn spawn_server(repo_root: PathBuf, auth: TokenAuth) -> String {
         Err(error) => panic!("failed to read server address: {error}"),
     };
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, scrim_server::router(repo_root, auth)).await {
+        if let Err(error) = axum::serve(listener, router).await {
             panic!("server failed: {error}");
         }
     });

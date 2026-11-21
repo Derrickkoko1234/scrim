@@ -1,9 +1,9 @@
 //! Constant-time token authentication for Git smart-HTTP requests.
 //!
 //! Configured tokens are hashed with SHA-256 at startup so plaintext secrets are
-//! not retained in memory, and incoming `Authorization` headers (`Bearer` or
-//! `Basic`) are verified in constant time before decompression or repository
-//! path resolution.
+//! not retained in memory. Incoming `Authorization` headers (`Bearer` or
+//! `Basic`) are parsed, the candidate token is hashed, and the hash is looked up
+//! in the [`PolicyStore`] before decompression or repository path resolution.
 
 use std::{fmt, sync::Arc};
 
@@ -18,6 +18,8 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+use crate::policy_store::PolicyStore;
 
 /// Maximum accepted byte length for a configured authentication token.
 pub const MAX_TOKEN_BYTES: usize = 1024;
@@ -110,6 +112,12 @@ impl TokenAuth {
             return false;
         }
         let candidate_digest = sha256_zeroizing(candidate);
+        self.verify_hash(&candidate_digest)
+    }
+
+    /// Returns whether `candidate_digest` is the SHA-256 digest of the
+    /// configured token, compared in constant time.
+    pub(crate) fn verify_hash(&self, candidate_digest: &[u8; 32]) -> bool {
         bool::from(self.digest.as_slice().ct_eq(candidate_digest.as_slice()))
     }
 }
@@ -119,7 +127,7 @@ impl TokenAuth {
 /// With `sha2`'s `zeroize` feature enabled, `Sha256` wipes its internal block
 /// buffer and chaining state on drop, and `finalize_into` writes straight into
 /// the zeroizing output array without an unzeroized stack copy.
-fn sha256_zeroizing(input: &[u8]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn sha256_zeroizing(input: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut digest = Zeroizing::new([0u8; 32]);
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -129,8 +137,13 @@ fn sha256_zeroizing(input: &[u8]) -> Zeroizing<[u8; 32]> {
 
 /// Axum middleware that requires a single valid `Authorization` header on
 /// every incoming request.
+///
+/// The candidate token's SHA-256 hash is looked up in `policy_store`. A match
+/// inserts the [`AuthenticatedMember`](crate::AuthenticatedMember) into the
+/// request extensions; no match yields `401`; a store failure yields `500` so
+/// an unreachable database never lets a request through.
 pub(crate) async fn require_auth(
-    State(auth): State<TokenAuth>,
+    State(policy_store): State<Arc<dyn PolicyStore>>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -148,28 +161,45 @@ pub(crate) async fn require_auth(
     let Ok(header_str) = header_value.to_str() else {
         return unauthorized_response();
     };
-    if !authorize_header_value(&auth, header_str) {
+    let Some(token_hash) = candidate_token_hash(header_str) else {
         return unauthorized_response();
-    }
+    };
+
+    let member = match policy_store.authenticate_token_hash(&token_hash).await {
+        Ok(Some(member)) => member,
+        Ok(None) => return unauthorized_response(),
+        Err(error) => {
+            // The error describes the store failure only; it never contains
+            // the token or its hash.
+            tracing::error!(%error, "failed to authenticate request");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     // Strip the credential once verified so downstream handlers cannot log or forward it.
     request.headers_mut().remove(header::AUTHORIZATION);
+    request.extensions_mut().insert(member);
     next.run(request).await
 }
 
-/// Parses and verifies a single `Authorization` header value (`Bearer` or `Basic`).
-fn authorize_header_value(auth: &TokenAuth, header_value: &str) -> bool {
+/// Parses a single `Authorization` header value (`Bearer` or `Basic`) and
+/// returns the SHA-256 hash of the candidate token it carries.
+///
+/// Returns `None` for an unknown scheme, malformed credentials, or a candidate
+/// that is empty or longer than [`MAX_TOKEN_BYTES`] (no configured token can be
+/// either, so those are rejected before hashing).
+fn candidate_token_hash(header_value: &str) -> Option<Zeroizing<[u8; 32]>> {
     let Some((scheme, remainder)) = header_value.split_once(' ') else {
-        return false;
+        return None;
     };
     // RFC 9110 allows one or more SP octets between auth-scheme and token68.
     let credentials = remainder.trim_start_matches(' ');
     if credentials.is_empty() || credentials.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return false;
+        return None;
     }
 
     if scheme.eq_ignore_ascii_case("bearer") {
-        return auth.verify(credentials.as_bytes());
+        return hash_candidate(credentials.as_bytes());
     }
 
     if scheme.eq_ignore_ascii_case("basic") {
@@ -178,10 +208,10 @@ fn authorize_header_value(auth: &TokenAuth, header_value: &str) -> bool {
         let max_decoded_len = (credentials.len() / 4).saturating_add(1).saturating_mul(3);
         let mut decoded = Zeroizing::new(Vec::with_capacity(max_decoded_len));
         if STANDARD.decode_vec(credentials, &mut decoded).is_err() {
-            return false;
+            return None;
         }
         let Some(colon_index) = decoded.iter().position(|&byte| byte == b':') else {
-            return false;
+            return None;
         };
         let username = &decoded[..colon_index];
         let password = &decoded[colon_index + 1..];
@@ -189,15 +219,23 @@ fn authorize_header_value(auth: &TokenAuth, header_value: &str) -> bool {
         // Support `user:token`, `:token`, and `token:` (e.g. `https://TOKEN@host`).
         // When a non-empty password is supplied, never fall back to username.
         if !password.is_empty() {
-            return auth.verify(password);
+            return hash_candidate(password);
         }
         if !username.is_empty() {
-            return auth.verify(username);
+            return hash_candidate(username);
         }
-        return false;
+        return None;
     }
 
-    false
+    None
+}
+
+/// Hashes `candidate` unless it is empty or longer than [`MAX_TOKEN_BYTES`].
+fn hash_candidate(candidate: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+    if candidate.is_empty() || candidate.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    Some(sha256_zeroizing(candidate))
 }
 
 /// Builds a non-cacheable `401 Unauthorized` response with a Basic challenge.
@@ -228,14 +266,49 @@ mod tests {
         Engine,
         engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
     };
+    use std::sync::Arc;
+
     use http_body_util::BodyExt;
     use secrecy::SecretString;
     use tower::ServiceExt;
 
     use super::{
         AuthConfigError, MAX_AUTHORIZATION_HEADER_BYTES, MAX_TOKEN_BYTES, TokenAuth,
-        WWW_AUTHENTICATE_VALUE, authorize_header_value, require_auth,
+        WWW_AUTHENTICATE_VALUE, candidate_token_hash, require_auth,
     };
+    use crate::policy_store::{
+        AuthenticatedMember, MemberRepoPolicy, PolicyStore, PolicyStoreError, PolicyStoreFuture,
+        StaticPolicyStore,
+    };
+
+    /// Returns whether `header_value` carries the token `auth` was built from,
+    /// following the same parsing path as the middleware.
+    fn authorize_header_value(auth: &TokenAuth, header_value: &str) -> bool {
+        match candidate_token_hash(header_value) {
+            Some(token_hash) => auth.verify_hash(&token_hash),
+            None => false,
+        }
+    }
+
+    /// A store whose every lookup fails, as if the database were unreachable.
+    struct FailingPolicyStore;
+
+    impl PolicyStore for FailingPolicyStore {
+        fn authenticate_token_hash<'a>(
+            &'a self,
+            _token_hash: &'a [u8; 32],
+        ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>> {
+            Box::pin(async { Err(PolicyStoreError::Internal("store offline".to_owned())) })
+        }
+
+        fn load_member_repo_policy<'a>(
+            &'a self,
+            _member_id: i64,
+            _repo_key: &'a str,
+        ) -> PolicyStoreFuture<'a, MemberRepoPolicy> {
+            Box::pin(async { Err(PolicyStoreError::Internal("store offline".to_owned())) })
+        }
+    }
 
     fn make_auth(token: &str) -> TokenAuth {
         match TokenAuth::new(SecretString::from(token.to_owned())) {
@@ -249,16 +322,22 @@ mod tests {
     }
 
     fn test_router(auth: TokenAuth) -> Router {
+        router_with_store(Arc::new(StaticPolicyStore::new(auth)))
+    }
+
+    fn router_with_store(policy_store: Arc<dyn PolicyStore>) -> Router {
         Router::new()
             .route(
                 "/",
                 get(|request: Request<Body>| async move {
                     // Downstream handlers must never see the raw Authorization header.
                     assert!(request.headers().get(header::AUTHORIZATION).is_none());
+                    // ...but must see who was authenticated.
+                    assert!(request.extensions().get::<AuthenticatedMember>().is_some());
                     "ok"
                 }),
             )
-            .layer(middleware::from_fn_with_state(auth, require_auth))
+            .layer(middleware::from_fn_with_state(policy_store, require_auth))
     }
 
     async fn assert_unauthorized(response: axum::response::Response) {
@@ -525,5 +604,25 @@ mod tests {
             Err(error) => panic!("router call failed: {error}"),
         };
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn store_failure_fails_closed_with_internal_server_error() {
+        let request = match Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer any-token")
+            .body(Body::empty())
+        {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build request: {error}"),
+        };
+        let response = match router_with_store(Arc::new(FailingPolicyStore))
+            .oneshot(request)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => panic!("router call failed: {error}"),
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

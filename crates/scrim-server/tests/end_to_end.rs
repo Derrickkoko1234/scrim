@@ -468,6 +468,7 @@ fn scrim_server_command(repo_root: &Path) -> Command {
         .arg(repo_root)
         .env_remove("SCRIM_TOKEN")
         .env_remove("SCRIM_TOKEN_FILE")
+        .env_remove("DATABASE_URL")
         .env_remove("SCRIM_REPO_ROOT")
         .env_remove("SCRIM_LISTEN")
         .env("RUST_LOG", "info")
@@ -535,6 +536,36 @@ fn cli_fails_when_both_token_and_token_file_are_provided() {
     assert!(
         !output.status.success(),
         "expected scrim-server with both --token and --token-file to fail"
+    );
+}
+
+#[test]
+fn cli_fails_when_both_database_url_and_token_are_provided() {
+    let Ok(root) = TempDir::new() else {
+        panic!("failed to create root temp dir");
+    };
+    let output = match scrim_server_command(root.path())
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--database-url",
+            "postgres://scrim@127.0.0.1:1/scrim",
+            "--token",
+            TEST_TOKEN,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => panic!("failed to run scrim-server: {error}"),
+    };
+    assert!(
+        !output.status.success(),
+        "expected scrim-server with both --database-url and --token to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got: {stderr}"
     );
 }
 
