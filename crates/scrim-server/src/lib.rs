@@ -3,6 +3,10 @@
 //! There is no authentication yet: anything that can reach the listener can
 //! read and write every repository under the root.
 
+// The `?` operator and the unwrap/expect family are deliberately forbidden in
+// this codebase; clippy's suggestion to use `?` is allowed away accordingly.
+#![allow(clippy::question_mark)]
+
 mod git_service;
 mod repo_path;
 
@@ -44,7 +48,10 @@ enum Endpoint {
 
 /// Splits a request path into the repository part and the endpoint suffix.
 fn parse_path(path: &str) -> Option<(&str, Endpoint)> {
-    let path = path.strip_prefix('/')?;
+    let path = match path.strip_prefix('/') {
+        Some(path) => path,
+        None => return None,
+    };
     [
         ("/info/refs", Endpoint::InfoRefs),
         ("/git-upload-pack", Endpoint::Rpc(GitService::UploadPack)),
