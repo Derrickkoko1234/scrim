@@ -8,7 +8,40 @@ use std::{
     process::{Command, Output},
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD};
+use scrim_server::{SecretString, TokenAuth};
 use tempfile::TempDir;
+
+/// Shared authentication token used across integration tests.
+pub const TEST_TOKEN: &str = "scrim-test-token-0123456789abcdef";
+
+/// Builds a [`TokenAuth`] from `token`, panicking if the token is invalid.
+pub fn token_auth(token: &str) -> TokenAuth {
+    match TokenAuth::new(SecretString::from(token.to_owned())) {
+        Ok(auth) => auth,
+        Err(error) => panic!("failed to construct test TokenAuth: {error}"),
+    }
+}
+
+/// Builds a [`TokenAuth`] configured with [`TEST_TOKEN`].
+pub fn test_auth() -> TokenAuth {
+    token_auth(TEST_TOKEN)
+}
+
+/// Formats an HTTP `Authorization: Bearer ...` header value.
+pub fn bearer_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// Formats an HTTP `Authorization: Basic ...` header value from `user:password`.
+pub fn basic_header(credentials: &str) -> String {
+    format!("Basic {}", STANDARD.encode(credentials.as_bytes()))
+}
+
+/// Escapes `value` for safe inclusion inside single quotes in POSIX `sh`.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 
 /// Runs real `git` commands with no access to the developer's own config.
 pub struct GitSandbox {
@@ -29,13 +62,23 @@ impl GitSandbox {
         self.git_with_env(dir, args, &[])
     }
 
-    /// Like [`GitSandbox::git`] with extra environment variables.
-    pub fn git_with_env(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    /// Runs `git <args>` in `dir` without asserting that the command succeeded.
+    pub fn try_git(&self, dir: &Path, args: &[&str]) -> Output {
+        self.try_git_with_env(dir, args, &[])
+    }
+
+    /// Like [`GitSandbox::try_git`] with extra environment variables.
+    pub fn try_git_with_env(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
         let path = match std::env::var_os("PATH") {
             Some(path) => path,
             None => panic!("PATH is not set"),
         };
-        let output = match Command::new("git")
+        match Command::new("git")
             .args([
                 "-c",
                 "user.name=Scrim Test",
@@ -55,13 +98,28 @@ impl GitSandbox {
         {
             Ok(output) => output,
             Err(error) => panic!("failed to run git {args:?}: {error}"),
-        };
+        }
+    }
+
+    /// Like [`GitSandbox::git`] with extra environment variables.
+    pub fn git_with_env(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let output = self.try_git_with_env(dir, args, extra_env);
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    /// Returns a `credential.helper=...` git `-c` config value that answers
+    /// `get` requests with `username` and `password`.
+    pub fn credential_helper_config(&self, username: &str, password: &str) -> String {
+        let user = shell_single_quote(username);
+        let pass = shell_single_quote(password);
+        format!(
+            "credential.helper=!f() {{ if [ \"$1\" = \"get\" ]; then printf 'username=%s\\npassword=%s\\n' {user} {pass}; fi; }}; f"
+        )
     }
 
     /// Creates an empty bare repository whose HEAD is `refs/heads/main`.
@@ -97,7 +155,7 @@ impl GitSandbox {
 }
 
 /// Starts the server on an ephemeral loopback port and returns its base URL.
-pub async fn spawn_server(repo_root: PathBuf) -> String {
+pub async fn spawn_server(repo_root: PathBuf, auth: TokenAuth) -> String {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
         Err(error) => panic!("failed to bind server listener: {error}"),
@@ -107,7 +165,7 @@ pub async fn spawn_server(repo_root: PathBuf) -> String {
         Err(error) => panic!("failed to read server address: {error}"),
     };
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, scrim_server::router(repo_root)).await {
+        if let Err(error) = axum::serve(listener, scrim_server::router(repo_root, auth)).await {
             panic!("server failed: {error}");
         }
     });

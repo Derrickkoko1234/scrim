@@ -10,7 +10,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header},
 };
-use common::GitSandbox;
+use common::{GitSandbox, TEST_TOKEN, basic_header, bearer_header, test_auth};
 use flate2::{Compression, write::GzEncoder};
 use http_body_util::BodyExt;
 use tempfile::TempDir;
@@ -23,14 +23,22 @@ fn router_with_repo() -> (TempDir, Router) {
         Err(error) => panic!("failed to create repo root temp dir: {error}"),
     };
     GitSandbox::new().init_bare_with_commit(&root.path().join("test.git"));
-    let router = scrim_server::router(root.path().to_path_buf());
+    let router = scrim_server::router(root.path().to_path_buf(), test_auth());
     (root, router)
 }
 
-async fn get(router: Router, uri: &str, git_protocol: Option<&str>) -> Response<Body> {
+async fn get_with_auth(
+    router: Router,
+    uri: &str,
+    git_protocol: Option<&str>,
+    authorization: Option<&str>,
+) -> Response<Body> {
     let mut request = Request::builder().uri(uri);
     if let Some(value) = git_protocol {
         request = request.header("Git-Protocol", value);
+    }
+    if let Some(value) = authorization {
+        request = request.header(header::AUTHORIZATION, value);
     }
     let request = match request.body(Body::empty()) {
         Ok(request) => request,
@@ -40,6 +48,56 @@ async fn get(router: Router, uri: &str, git_protocol: Option<&str>) -> Response<
         Ok(response) => response,
         Err(error) => panic!("request to {uri} failed: {error}"),
     }
+}
+
+async fn get(router: Router, uri: &str, git_protocol: Option<&str>) -> Response<Body> {
+    let auth = bearer_header(TEST_TOKEN);
+    get_with_auth(router, uri, git_protocol, Some(&auth)).await
+}
+
+async fn assert_unauthorized(response: Response<Body>, context: &str) {
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "expected 401 for {context}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"Scrim\""),
+        "unexpected WWW-Authenticate for {context}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "unexpected Cache-Control for {context}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::PRAGMA)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache"),
+        "unexpected Pragma for {context}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::EXPIRES)
+            .and_then(|value| value.to_str().ok()),
+        Some("Fri, 01 Jan 1980 00:00:00 GMT"),
+        "unexpected Expires for {context}"
+    );
+    assert_eq!(
+        body_bytes(response).await,
+        b"unauthorized",
+        "unexpected body for {context}"
+    );
 }
 
 async fn body_bytes(response: Response<Body>) -> Vec<u8> {
@@ -119,7 +177,8 @@ async fn post_with_wrong_content_type_is_rejected() {
     ] {
         let mut request = Request::builder()
             .method("POST")
-            .uri("/test.git/git-upload-pack");
+            .uri("/test.git/git-upload-pack")
+            .header(header::AUTHORIZATION, bearer_header(TEST_TOKEN));
         if let Some(value) = content_type {
             request = request.header(header::CONTENT_TYPE, value);
         }
@@ -160,7 +219,7 @@ async fn missing_and_unsafe_repositories_are_not_found() {
     let sandbox = GitSandbox::new();
     sandbox.init_bare_with_commit(&root.join("test.git"));
     sandbox.init_bare(&parent.path().join("scrim-test-outside.git"));
-    let router = scrim_server::router(root);
+    let router = scrim_server::router(root, test_auth());
 
     for path in [
         "/missing.git",
@@ -208,7 +267,7 @@ async fn symlink_escaping_the_root_is_not_found() {
     ) {
         panic!("failed to create escaping symlink: {error}");
     }
-    let router = scrim_server::router(root.path().to_path_buf());
+    let router = scrim_server::router(root.path().to_path_buf(), test_auth());
 
     let response = get(router, "/link.git/info/refs?service=git-upload-pack", None).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -231,6 +290,7 @@ async fn gzip_encoded_protocol_v2_request_is_decompressed() {
     let request = match Request::builder()
         .method("POST")
         .uri("/test.git/git-upload-pack")
+        .header(header::AUTHORIZATION, bearer_header(TEST_TOKEN))
         .header(
             header::CONTENT_TYPE,
             "application/x-git-upload-pack-request",
@@ -290,7 +350,7 @@ async fn decoy_dir_next_to_escaping_git_symlink_is_not_found() {
         panic!("failed to create escaping symlink: {error}");
     }
 
-    let router = scrim_server::router(root.path().to_path_buf());
+    let router = scrim_server::router(root.path().to_path_buf(), test_auth());
     for service in ["git-upload-pack", "git-receive-pack"] {
         let uri = format!("/foo/info/refs?service={service}");
         let response = get(router.clone(), &uri, None).await;
@@ -319,7 +379,7 @@ async fn dir_with_escaping_gitdir_file_is_not_found() {
         panic!("failed to write .git gitdir file: {error}");
     }
 
-    let router = scrim_server::router(root.path().to_path_buf());
+    let router = scrim_server::router(root.path().to_path_buf(), test_auth());
     for service in ["git-upload-pack", "git-receive-pack"] {
         let uri = format!("/decoy.git/info/refs?service={service}");
         let response = get(router.clone(), &uri, None).await;
@@ -340,7 +400,7 @@ async fn symlink_resolving_to_repo_root_is_not_found() {
         panic!("failed to create self symlink: {error}");
     }
 
-    let router = scrim_server::router(root.path().to_path_buf());
+    let router = scrim_server::router(root.path().to_path_buf(), test_auth());
     let response = get(router, "/self.git/info/refs?service=git-upload-pack", None).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
@@ -371,6 +431,7 @@ async fn corrupt_gzip_upload_pack_body_aborts_response() {
     let request = match Request::builder()
         .method("POST")
         .uri("/test.git/git-upload-pack")
+        .header(header::AUTHORIZATION, bearer_header(TEST_TOKEN))
         .header(
             header::CONTENT_TYPE,
             "application/x-git-upload-pack-request",
@@ -478,6 +539,133 @@ async fn corrupt_repo_config_returns_internal_server_error() {
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unauthenticated_requests_are_rejected_before_path_or_repo_checks() {
+    let (_root, router) = router_with_repo();
+
+    for uri in [
+        "/test.git/info/refs?service=git-upload-pack",
+        "/missing.git/info/refs?service=git-upload-pack",
+        "/%2e%2e/x/info/refs?service=git-upload-pack",
+        "/test.git/info/refs",
+    ] {
+        let response = get_with_auth(router.clone(), uri, None, None).await;
+        assert_unauthorized(response, uri).await;
+    }
+
+    let post_request = match Request::builder()
+        .method("POST")
+        .uri("/test.git/git-upload-pack")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-upload-pack-request",
+        )
+        .body(Body::empty())
+    {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build unauthenticated POST request: {error}"),
+    };
+    let response = match router.oneshot(post_request).await {
+        Ok(response) => response,
+        Err(error) => panic!("unauthenticated POST request failed: {error}"),
+    };
+    assert_unauthorized(response, "POST /test.git/git-upload-pack").await;
+}
+
+#[tokio::test]
+async fn unauthenticated_corrupt_gzip_post_is_rejected_before_decompression() {
+    let (_root, router) = router_with_repo();
+    let request = match Request::builder()
+        .method("POST")
+        .uri("/test.git/git-upload-pack")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-upload-pack-request",
+        )
+        .header(header::CONTENT_ENCODING, "gzip")
+        .header("Git-Protocol", "version=2")
+        .body(Body::from(&b"definitely-not-valid-gzip-bytes"[..]))
+    {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build unauthenticated gzip POST request: {error}"),
+    };
+
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("router failed: {error}"),
+    };
+    assert_unauthorized(response, "unauthenticated corrupt gzip POST").await;
+}
+
+#[tokio::test]
+async fn invalid_authorization_headers_are_rejected() {
+    let (_root, router) = router_with_repo();
+    let uri = "/test.git/info/refs?service=git-upload-pack";
+
+    let invalid_headers = [
+        ("wrong bearer", bearer_header("wrong-token")),
+        ("wrong basic password", basic_header("scrim:wrong-token")),
+        (
+            "token in username with wrong password",
+            basic_header(&format!("{TEST_TOKEN}:wrong")),
+        ),
+        (
+            "unknown scheme",
+            "Digest username=\"scrim\", realm=\"Scrim\"".to_owned(),
+        ),
+    ];
+
+    for (label, auth_header) in invalid_headers {
+        let response = get_with_auth(router.clone(), uri, None, Some(&auth_header)).await;
+        assert_unauthorized(response, label).await;
+    }
+
+    let duplicate_request = match Request::builder()
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer_header(TEST_TOKEN))
+        .header(header::AUTHORIZATION, bearer_header(TEST_TOKEN))
+        .body(Body::empty())
+    {
+        Ok(request) => request,
+        Err(error) => panic!("failed to build duplicate Authorization request: {error}"),
+    };
+    let response = match router.oneshot(duplicate_request).await {
+        Ok(response) => response,
+        Err(error) => panic!("duplicate Authorization request failed: {error}"),
+    };
+    assert_unauthorized(response, "duplicate Authorization headers").await;
+}
+
+#[tokio::test]
+async fn valid_bearer_and_basic_authorization_formats_succeed() {
+    let (_root, router) = router_with_repo();
+    let uri = "/test.git/info/refs?service=git-upload-pack";
+
+    let valid_headers = [
+        ("bearer", bearer_header(TEST_TOKEN)),
+        (
+            "basic user:token",
+            basic_header(&format!("scrim:{TEST_TOKEN}")),
+        ),
+        ("basic :token", basic_header(&format!(":{TEST_TOKEN}"))),
+        ("basic token:", basic_header(&format!("{TEST_TOKEN}:"))),
+    ];
+
+    for (label, auth_header) in valid_headers {
+        let response = get_with_auth(router.clone(), uri, None, Some(&auth_header)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "expected 200 for {label}"
+        );
+        let body = body_bytes(response).await;
+        assert!(
+            body.starts_with(b"001e# service=git-upload-pack\n0000"),
+            "unexpected body for {label}"
         );
     }
 }

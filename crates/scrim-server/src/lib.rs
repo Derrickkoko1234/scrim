@@ -1,12 +1,14 @@
 //! Pass-through Git smart-HTTP server for bare repositories.
 //!
-//! There is no authentication yet: anything that can reach the listener can
-//! read and write every repository under the root.
+//! All requests require token authentication (`Authorization: Bearer <token>`
+//! or `Authorization: Basic ...`) verified before decompression or repository
+//! lookup.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
 #![allow(clippy::question_mark)]
 
+mod auth;
 mod git_service;
 mod repo_path;
 
@@ -17,26 +19,41 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{HeaderValue, Method, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
 };
-use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::{decompression::RequestDecompressionLayer, trace::TraceLayer};
 
+pub use auth::{AuthConfigError, MAX_TOKEN_BYTES, TokenAuth};
 use git_service::{GitService, advertise_refs, sanitize_git_protocol, serve_rpc};
 use repo_path::resolve_bare_repo;
+pub use secrecy::SecretString;
 
 /// Builds the router that serves the bare repositories found under `repo_root`
 /// over Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`).
 ///
-/// Gzip-encoded request bodies, which git sends for large fetch requests, are
-/// decompressed transparently. Every other path or method yields an error
-/// response.
-pub fn router(repo_root: PathBuf) -> Router {
+/// Incoming requests are traced (method and path only), authenticated against
+/// `auth`, and (for gzip request bodies) decompressed transparently before
+/// repository resolution.
+pub fn router(repo_root: PathBuf, auth: TokenAuth) -> Router {
     Router::new()
         // Axum wildcards cannot be followed by a literal suffix, so a single
         // fallback parses `<repo>/info/refs` and `<repo>/git-*-pack` itself.
         .fallback(handle_request)
         .with_state(repo_root)
         .layer(RequestDecompressionLayer::new())
+        .layer(middleware::from_fn_with_state(auth, auth::require_auth))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                // Record only method and path so query strings or accidental
+                // URI credentials are never written to logs.
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                )
+            }),
+        )
 }
 
 /// The kind of smart-HTTP endpoint a request path addresses.

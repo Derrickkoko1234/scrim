@@ -4,7 +4,7 @@ Scrim adds access control inside Git repositories: private branches, private fil
 
 A scrim is a theatre curtain that looks solid or see-through depending on how it is lit. Everyone shares the same repository, and each person sees as much as their access allows.
 
-> **Status: early development.** Nothing is usable yet. Work is on milestone M0 (a pass-through Git server with token auth). See the [roadmap](docs/ROADMAP.md).
+> **Status: early development.** Nothing is usable yet. Milestone M0 (a pass-through Git server with token auth) is complete; next up is M1 (private branches). See the [roadmap](docs/ROADMAP.md).
 
 ## Why
 
