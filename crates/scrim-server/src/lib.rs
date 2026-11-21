@@ -9,11 +9,16 @@
 //! server-owned `pre-receive` guard (see [`run_pre_receive_hook_process`]),
 //! which authorizes each ref write exactly, refuses hidden objects smuggled in
 //! by ID, and blocks merges that would expose private commits.
+//!
+//! The same authenticated router serves the admin API under `/api/v1` (see
+//! [`MAX_ADMIN_BODY_BYTES`]), through which admins manage members, tokens,
+//! groups, repositories and branch rules in the [`PolicyStore`].
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
 #![allow(clippy::question_mark)]
 
+mod admin_api;
 mod auth;
 mod git_service;
 mod policy_store;
@@ -36,14 +41,19 @@ use axum::{
 };
 use tower_http::{decompression::RequestDecompressionLayer, trace::TraceLayer};
 
+pub use admin_api::MAX_ADMIN_BODY_BYTES;
 pub use auth::{AuthConfigError, MAX_TOKEN_BYTES, TokenAuth};
 use git_service::{
     GitService, GitVisibilityConfig, advertise_refs, list_repo_refs, sanitize_git_protocol,
     serve_rpc,
 };
 pub use policy_store::{
-    AuditLogEntry, AuthenticatedMember, MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore,
-    PolicyStore, PolicyStoreError, PolicyStoreFuture, StaticPolicyStore,
+    API_TOKEN_PREFIX, AuditLogEntry, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
+    CreatedMember, GroupMembershipChange, GroupRecord, GroupWithMembers, IssuedToken,
+    MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_TOKEN_LABEL_BYTES, MemberRecord,
+    MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore, PolicyStore, PolicyStoreError,
+    PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult,
+    StaticPolicyStore,
 };
 pub use pre_receive::{
     ALLOW_MERGE_LEAK_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV,
@@ -74,7 +84,11 @@ pub fn router(repo_root: PathBuf, auth: TokenAuth) -> Router {
 /// [`run_pre_receive_hook_process`]); the hook directory is set up on the
 /// first push, and set up again if it has gone missing, and a push is
 /// answered with `500` if the binary cannot be found.
+///
+/// Paths under `/api/v1` are the admin API instead of Git; repository paths
+/// starting with `api/` can therefore not be registered.
 pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> Router {
+    let admin_router = admin_api::router(repo_root.clone(), Arc::clone(&policy_store));
     let state = AppState {
         repo_root,
         policy_store: Arc::clone(&policy_store),
@@ -85,6 +99,10 @@ pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn Policy
         // fallback parses `<repo>/info/refs` and `<repo>/git-*-pack` itself.
         .fallback(handle_request)
         .with_state(state)
+        // `nest` covers `/api/v1` and `/api/v1/<rest>` but not `/api/v1/`,
+        // which goes to the admin router as is, for its JSON `404`.
+        .route_service("/api/v1/", admin_router.clone().into_service())
+        .nest("/api/v1", admin_router)
         .layer(RequestDecompressionLayer::new())
         .layer(middleware::from_fn_with_state(
             policy_store,

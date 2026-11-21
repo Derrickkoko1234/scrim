@@ -1,5 +1,8 @@
 //! The scrim-server binary: serves bare Git repositories over smart HTTP.
 //!
+//! `scrim-server bootstrap-admin` instead creates the first admin member in
+//! the database and prints their token once.
+//!
 //! The same binary is git's `pre-receive` hook: started by `git receive-pack`
 //! with `SCRIM_HOOK_MODE=pre-receive`, it asks the running server for its
 //! verdict instead of serving.
@@ -9,16 +12,17 @@
 #![allow(clippy::question_mark)]
 
 use std::{
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, bail};
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use scrim_server::{
-    MAX_TOKEN_BYTES, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, SecretString,
-    TokenAuth, run_pre_receive_hook_process,
+    MAX_TOKEN_BYTES, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore,
+    SecretString, TokenAuth, run_pre_receive_hook_process,
 };
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
@@ -38,16 +42,24 @@ const RECOMMENDED_MIN_TOKEN_BYTES: usize = 16;
 /// for a single-user setup, against one shared token (`--token` or
 /// `--token-file`). Exactly one of the three must be given.
 #[derive(Parser)]
-#[command(group(
-    ArgGroup::new("authentication")
-        .args(["database_url", "token", "token_file"])
-        .required(true)
-        .multiple(false)
-))]
+#[command(
+    // A subcommand has its own arguments; the server's are only required
+    // when serving.
+    subcommand_negates_reqs = true,
+    group(
+        ArgGroup::new("authentication")
+            .args(["database_url", "token", "token_file"])
+            .required(true)
+            .multiple(false)
+    )
+)]
 struct Config {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Directory containing the bare repositories to serve.
-    #[arg(long, env = "SCRIM_REPO_ROOT")]
-    repo_root: PathBuf,
+    #[arg(long, env = "SCRIM_REPO_ROOT", required = true)]
+    repo_root: Option<PathBuf>,
 
     /// Address to listen on. Defaults to loopback; place behind a
     /// TLS-terminating reverse proxy if binding externally.
@@ -75,6 +87,32 @@ struct Config {
     database_url: Option<String>,
 }
 
+/// One-off administrative commands.
+#[derive(Subcommand)]
+enum Command {
+    /// Creates the first admin member and prints their API token once.
+    /// Fails if an active admin already exists.
+    BootstrapAdmin(BootstrapAdminArgs),
+}
+
+/// Arguments of `scrim-server bootstrap-admin`.
+#[derive(Args)]
+struct BootstrapAdminArgs {
+    /// PostgreSQL connection URL (see the server's `--database-url`). Pending
+    /// migrations are applied first. Prefer the `DATABASE_URL` environment
+    /// variable so a password does not appear in process listings.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    database_url: String,
+
+    /// Name of the admin member to create.
+    #[arg(long)]
+    name: String,
+
+    /// Label recorded for the admin's first token.
+    #[arg(long, default_value = "bootstrap")]
+    token_label: String,
+}
+
 fn main() -> anyhow::Result<()> {
     // Checked before logging or argument parsing: in hook mode, stderr goes
     // to the pusher and git passes the hook no server arguments. The hook is
@@ -92,28 +130,72 @@ fn main() -> anyhow::Result<()> {
         Ok(runtime) => runtime,
         Err(error) => return Err(error),
     };
-    runtime.block_on(run_server())
+    let config = Config::parse();
+    match config.command {
+        Some(Command::BootstrapAdmin(args)) => runtime.block_on(run_bootstrap_admin(args)),
+        None => runtime.block_on(run_server(config)),
+    }
 }
 
-/// Parses the configuration and serves until Ctrl-C.
-async fn run_server() -> anyhow::Result<()> {
+/// Creates the first admin member and prints their token to stdout.
+async fn run_bootstrap_admin(args: BootstrapAdminArgs) -> anyhow::Result<()> {
+    // Keep the URL (and any password in it) out of every error message.
+    let database_url = Zeroizing::new(args.database_url);
+    let store = match PgPolicyStore::connect(&database_url).await {
+        Ok(store) => store,
+        Err(error) => {
+            return Err(anyhow::Error::new(error)).context("cannot connect to the database");
+        }
+    };
+    drop(database_url);
+    if let Err(error) = store.migrate().await {
+        return Err(anyhow::Error::new(error)).context("cannot migrate the database");
+    }
+    let created = match store.bootstrap_admin(&args.name, &args.token_label).await {
+        Ok(created) => created,
+        Err(error) => {
+            return Err(anyhow::Error::new(error)).context("cannot bootstrap the admin member");
+        }
+    };
+
+    // Write the token straight from the secret, so no unzeroized `String`
+    // copy is made; stdout carries only the token, for easy capture.
+    let mut stdout = std::io::stdout().lock();
+    let written = stdout
+        .write_all(created.token.expose_secret().as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush());
+    if let Err(error) = written {
+        return Err(anyhow::Error::new(error)).context("cannot print the admin token");
+    }
+    eprintln!(
+        "Created admin member {:?} (id {}). The token above is shown only once: store it securely.",
+        created.member.name, created.member.id
+    );
+    Ok(())
+}
+
+/// Serves until Ctrl-C with the parsed server configuration.
+async fn run_server(config: Config) -> anyhow::Result<()> {
     let mut env_filter = EnvFilter::new("info");
     if let Ok(from_env) = EnvFilter::try_from_default_env() {
         env_filter = from_env;
     }
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let config = Config::parse();
-    if !config.repo_root.is_dir() {
+    // clap requires `--repo-root` whenever no subcommand is given.
+    let Some(config_repo_root) = config.repo_root else {
+        bail!("--repo-root is required");
+    };
+    if !config_repo_root.is_dir() {
         bail!(
             "repo root {} is not an existing directory",
-            config.repo_root.display()
+            config_repo_root.display()
         );
     }
-    let repo_root = match config
-        .repo_root
+    let repo_root = match config_repo_root
         .canonicalize()
-        .with_context(|| format!("cannot resolve repo root {}", config.repo_root.display()))
+        .with_context(|| format!("cannot resolve repo root {}", config_repo_root.display()))
     {
         Ok(repo_root) => repo_root,
         Err(error) => return Err(error),

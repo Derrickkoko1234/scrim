@@ -35,5 +35,6 @@ libc = "0.2.191"
 [dev-dependencies]
 flate2 = "1.1.11"
 http-body-util = "0.1.5"
+scrim-cli = { version = "0.0.0", path = "../scrim-cli" }
 sha1 = "0.11.0"
 tower = { version = "0.5.3", features = ["util"] }

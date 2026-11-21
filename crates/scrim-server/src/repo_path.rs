@@ -223,6 +223,221 @@ fn parse_head(bytes: &[u8]) -> Option<RepoHead> {
     is_object_id.then_some(RepoHead::Detached)
 }
 
+/// Where [`locate_bare_repo`] found (or would create) a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BareRepoLocation {
+    /// A valid bare repository already exists; this is its canonical key.
+    Existing(String),
+    /// Nothing exists at the path yet and every existing parent is a plain
+    /// directory, so [`create_bare_repo`] may create it. The string is the
+    /// canonical key with any existing parent directories resolved to their
+    /// on-disk spelling (important on case-insensitive filesystems).
+    Creatable(String),
+}
+
+/// Why a bare repository could not be located or created.
+#[derive(Debug)]
+pub enum BareRepoError {
+    /// The path fails [`is_valid_repo_path`].
+    InvalidPath,
+    /// No bare repository exists and creating one was not requested.
+    NotFound,
+    /// Something other than a valid bare repository occupies the path, or a
+    /// parent is a symlink or not a directory. The message is safe to show.
+    Conflict(&'static str),
+    /// A filesystem or git failure.
+    Io(io::Error),
+}
+
+/// Finds the bare repository at `repo` under `repo_root`, or (with
+/// `create_bare`) checks that [`create_bare_repo`] could create it there.
+///
+/// Fails with [`BareRepoError::NotFound`] when nothing valid exists and
+/// `create_bare` is `false`, and with [`BareRepoError::Conflict`] when the path
+/// is occupied by anything else (a plain directory, a file, a symlink, a broken
+/// repository) or a parent is a symlink or not a directory: nothing is ever
+/// clobbered, and new repositories are never created through a symlink.
+pub async fn locate_bare_repo(
+    repo_root: &Path,
+    repo: &str,
+    create_bare: bool,
+) -> Result<BareRepoLocation, BareRepoError> {
+    if !is_valid_repo_path(repo) {
+        return Err(BareRepoError::InvalidPath);
+    }
+    if let Some(resolved) = resolve_bare_repo(repo_root, repo).await {
+        return Ok(BareRepoLocation::Existing(resolved.canonical_key));
+    }
+    if !create_bare {
+        return Err(BareRepoError::NotFound);
+    }
+    let canonical_root = match tokio::fs::canonicalize(repo_root).await {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => return Err(BareRepoError::Io(error)),
+    };
+    let segments: Vec<&str> = repo.split('/').collect();
+    let first_missing = match first_missing_segment(&canonical_root, &segments).await {
+        Ok(first_missing) => first_missing,
+        Err(error) => return Err(error),
+    };
+    let canonical_key =
+        match canonical_creatable_key(&canonical_root, &segments, first_missing).await {
+            Ok(key) => key,
+            Err(error) => return Err(error),
+        };
+    Ok(BareRepoLocation::Creatable(canonical_key))
+}
+
+/// Builds the canonical key a new repository will have after creation, using
+/// the on-disk spelling of any existing parent directories (`0..first_missing`)
+/// so case-insensitive filesystems cannot register one spelling while Git
+/// later looks up policy under another.
+async fn canonical_creatable_key(
+    canonical_root: &Path,
+    segments: &[&str],
+    first_missing: usize,
+) -> Result<String, BareRepoError> {
+    let mut key_parts = Vec::with_capacity(segments.len());
+    if first_missing > 0 {
+        let mut existing_parent = canonical_root.to_path_buf();
+        for segment in &segments[..first_missing] {
+            existing_parent.push(segment);
+        }
+        let canonical_parent = match tokio::fs::canonicalize(&existing_parent).await {
+            Ok(path) => path,
+            Err(error) => return Err(BareRepoError::Io(error)),
+        };
+        if !canonical_parent.starts_with(canonical_root) {
+            return Err(BareRepoError::Conflict(
+                "a parent of the repository path escapes the repository root",
+            ));
+        }
+        let Some(parent_key) = canonical_repo_key(canonical_root, &canonical_parent) else {
+            return Err(BareRepoError::InvalidPath);
+        };
+        key_parts.push(parent_key);
+    }
+    for segment in &segments[first_missing..] {
+        key_parts.push((*segment).to_owned());
+    }
+    let combined = key_parts.join("/");
+    if is_valid_repo_path(&combined) {
+        Ok(combined)
+    } else {
+        Err(BareRepoError::InvalidPath)
+    }
+}
+
+/// Creates a bare repository (`HEAD` -> `refs/heads/main`) at `repo` under
+/// `repo_root` and returns its canonical key.
+///
+/// Missing parents are created one directory at a time; existing parents must
+/// be plain directories (not symlinks), and the target must not exist (see
+/// [`locate_bare_repo`]). `git init` runs without any system or user git
+/// config. If anything fails after directories were created, they are removed
+/// again.
+pub async fn create_bare_repo(repo_root: &Path, repo: &str) -> Result<String, BareRepoError> {
+    if !is_valid_repo_path(repo) {
+        return Err(BareRepoError::InvalidPath);
+    }
+    let canonical_root = match tokio::fs::canonicalize(repo_root).await {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => return Err(BareRepoError::Io(error)),
+    };
+    let segments: Vec<&str> = repo.split('/').collect();
+    let first_missing = match first_missing_segment(&canonical_root, &segments).await {
+        Ok(first_missing) => first_missing,
+        Err(error) => return Err(error),
+    };
+
+    let mut path = canonical_root;
+    let mut created_dirs = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        path.push(segment);
+        if index < first_missing {
+            continue;
+        }
+        // `create_dir`, unlike `create_dir_all`, fails if anything (including
+        // a symlink planted since the check above) already has this name.
+        match tokio::fs::create_dir(&path).await {
+            Ok(()) => created_dirs.push(path.clone()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                remove_created_dirs(&created_dirs).await;
+                return Err(BareRepoError::Conflict(
+                    "the repository path was created concurrently",
+                ));
+            }
+            Err(error) => {
+                remove_created_dirs(&created_dirs).await;
+                return Err(BareRepoError::Io(error));
+            }
+        }
+    }
+
+    if let Err(error) = crate::git_service::init_bare_repository(&path).await {
+        remove_created_dirs(&created_dirs).await;
+        return Err(BareRepoError::Io(error));
+    }
+    match resolve_bare_repo(repo_root, repo).await {
+        Some(resolved) => Ok(resolved.canonical_key),
+        None => {
+            remove_created_dirs(&created_dirs).await;
+            Err(BareRepoError::Io(io::Error::other(
+                "the initialized repository failed verification",
+            )))
+        }
+    }
+}
+
+/// Returns the index of the first segment of `segments` (joined onto
+/// `canonical_root`) that does not exist, after checking that every existing
+/// one before it is a real directory, not a symlink.
+///
+/// Fails with [`BareRepoError::Conflict`] if the final segment exists.
+async fn first_missing_segment(
+    canonical_root: &Path,
+    segments: &[&str],
+) -> Result<usize, BareRepoError> {
+    let mut path = canonical_root.to_path_buf();
+    for (index, segment) in segments.iter().enumerate() {
+        path.push(segment);
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(index),
+            Err(error) => return Err(BareRepoError::Io(error)),
+        };
+        if index + 1 == segments.len() {
+            return Err(BareRepoError::Conflict(
+                "the repository path already exists but is not a valid bare repository",
+            ));
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(BareRepoError::Conflict(
+                "a parent of the repository path is a symlink or not a directory",
+            ));
+        }
+    }
+    Err(BareRepoError::Conflict(
+        "the repository path already exists but is not a valid bare repository",
+    ))
+}
+
+/// Best-effort removal of directories [`create_bare_repo`] created, deepest
+/// (the repository itself, with whatever `git init` wrote) first; a parent
+/// is only removed while empty.
+async fn remove_created_dirs(created_dirs: &[PathBuf]) {
+    for (index, dir) in created_dirs.iter().enumerate().rev() {
+        let result = if index + 1 == created_dirs.len() {
+            tokio::fs::remove_dir_all(dir).await
+        } else {
+            tokio::fs::remove_dir(dir).await
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, dir = %dir.display(), "cannot remove a partly created repository directory");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

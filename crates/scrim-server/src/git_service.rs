@@ -734,6 +734,23 @@ pub(crate) async fn run_isolated_git(
     stdout_result
 }
 
+/// Initializes an empty bare repository whose `HEAD` is `refs/heads/main` in
+/// the existing, empty directory `repo_dir`, with the same isolated
+/// environment as every other git invocation.
+pub(crate) async fn init_bare_repository(repo_dir: &Path) -> io::Result<()> {
+    match run_isolated_git(
+        repo_dir,
+        &["init", "--quiet", "--bare", "--initial-branch=main"],
+        &[],
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn invalid_ref_line(line: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,

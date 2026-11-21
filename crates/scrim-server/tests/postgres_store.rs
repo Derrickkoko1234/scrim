@@ -10,6 +10,7 @@ mod common;
 
 use std::{
     collections::BTreeSet,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -24,10 +25,15 @@ use axum::{
 use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
 use scrim_server::{
-    AuditLogEntry, AuthenticatedMember, PgPolicyStore, PolicyStore, PolicyStoreError,
+    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, PgPolicyStore,
+    PolicyStore, PolicyStoreError,
 };
+use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -479,4 +485,570 @@ async fn records_audit_events_with_and_without_actor() {
         assert_eq!(stored_target_name, target_name);
         assert_eq!(stored_details.0, details);
     }
+}
+
+/// A [`PgPolicyStore`] confined to a schema of its own, so admin tests can
+/// count admins and members without seeing other tests' rows.
+struct IsolatedStore {
+    pool: PgPool,
+    store: PgPolicyStore,
+    admin_pool: PgPool,
+    schema: String,
+}
+
+impl IsolatedStore {
+    async fn new() -> Self {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(database_url) => database_url,
+            Err(_) => panic!("DATABASE_URL must point to PostgreSQL to run these tests"),
+        };
+        let admin_pool = match PgPool::connect(&database_url).await {
+            Ok(pool) => pool,
+            Err(error) => panic!("failed to connect: {error}"),
+        };
+        // `unique_suffix` is digits and `-`, so this is a safe identifier.
+        let schema = format!("scrim_test_{}", unique_suffix().replace('-', "_"));
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin_pool)
+            .await
+        {
+            panic!("failed to create schema {schema}: {error}");
+        }
+        let options = match PgConnectOptions::from_str(&database_url) {
+            Ok(options) => options.options([("search_path", schema.as_str())]),
+            Err(error) => panic!("invalid DATABASE_URL: {error}"),
+        };
+        let pool = match PgPoolOptions::new().connect_with(options).await {
+            Ok(pool) => pool,
+            Err(error) => panic!("failed to connect to schema {schema}: {error}"),
+        };
+        let store = PgPolicyStore::from_pool(pool.clone());
+        if let Err(error) = store.migrate().await {
+            panic!("failed to migrate schema {schema}: {error}");
+        }
+        Self {
+            pool,
+            store,
+            admin_pool,
+            schema,
+        }
+    }
+
+    /// Drops the schema (skipped when a test panics, leaving it to inspect).
+    async fn drop_schema(self) {
+        self.pool.close().await;
+        if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {} CASCADE",
+            self.schema
+        )))
+        .execute(&self.admin_pool)
+        .await
+        {
+            panic!("failed to drop schema {}: {error}", self.schema);
+        }
+    }
+
+    /// `(action, target_type, target_name)` of every audit row, oldest first.
+    async fn audit_rows(&self) -> Vec<(String, String, String)> {
+        match sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, target_type, target_name FROM audit_log ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => panic!("failed to read audit rows: {error}"),
+        }
+    }
+
+    /// Every audit column rendered as text, to search for leaked secrets.
+    async fn audit_text(&self) -> String {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(string_agg(audit_log::text, '\n'), '') FROM audit_log",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(text) => text,
+            Err(error) => panic!("failed to read audit log: {error}"),
+        }
+    }
+
+    async fn count(&self, sql: &'static str) -> i64 {
+        match sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => panic!("count query failed ({sql}): {error}"),
+        }
+    }
+}
+
+fn member_request(name: &str, is_admin: bool, groups: &[&str]) -> CreateMemberRequest {
+    CreateMemberRequest {
+        name: name.to_owned(),
+        is_admin,
+        is_machine: false,
+        groups: group_set(groups),
+        token_label: format!("{name}-laptop"),
+    }
+}
+
+async fn create_member_ok(store: &PgPolicyStore, request: CreateMemberRequest) -> CreatedMember {
+    match store.create_member(None, request).await {
+        Ok(created) => created,
+        Err(error) => panic!("create_member failed: {error}"),
+    }
+}
+
+fn assert_conflict<T>(result: Result<T, PolicyStoreError>, expected: &str) {
+    match result {
+        Err(PolicyStoreError::Conflict(message)) => assert_eq!(message, expected),
+        Err(error) => panic!("expected a conflict ({expected}), got: {error}"),
+        Ok(_) => panic!("expected a conflict ({expected}), but it succeeded"),
+    }
+}
+
+fn assert_not_found<T>(result: Result<T, PolicyStoreError>) {
+    match result {
+        Err(PolicyStoreError::NotFound(_)) => {}
+        Err(error) => panic!("expected not found, got: {error}"),
+        Ok(_) => panic!("expected not found, but it succeeded"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn bootstraps_exactly_one_admin_even_concurrently() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let attempts = futures_util::future::join_all(
+        ["first", "second", "third", "fourth"]
+            .into_iter()
+            .map(|name| store.bootstrap_admin(name, "bootstrap")),
+    )
+    .await;
+    let mut created = Vec::new();
+    for attempt in attempts {
+        match attempt {
+            Ok(member) => created.push(member),
+            Err(PolicyStoreError::Conflict(message)) => {
+                assert_eq!(message, "an active admin already exists");
+            }
+            Err(error) => panic!("unexpected bootstrap error: {error}"),
+        }
+    }
+    assert_eq!(created.len(), 1, "exactly one bootstrap may succeed");
+    let Some(admin) = created.pop() else {
+        panic!("no admin was created");
+    };
+    assert!(admin.member.is_admin);
+    let token = admin.token.expose_secret().to_owned();
+    assert!(token.starts_with("scrim_") && token.len() == 70);
+    match authenticate(store, &token).await {
+        Some(member) => {
+            assert_eq!(member.name, admin.member.name);
+            assert!(member.is_admin);
+        }
+        None => panic!("the bootstrap token does not authenticate"),
+    }
+    assert_conflict(
+        store.bootstrap_admin("later", "bootstrap").await,
+        "an active admin already exists",
+    );
+
+    // Only the digest is stored, and the audit row names no token.
+    let stored_hash = match sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT token_hash FROM member_tokens WHERE label = 'bootstrap'",
+    )
+    .fetch_one(&isolated.pool)
+    .await
+    {
+        Ok(hash) => hash,
+        Err(error) => panic!("failed to read the token row: {error}"),
+    };
+    assert_eq!(stored_hash, token_hash(&token).to_vec());
+    assert_eq!(
+        isolated.audit_rows().await,
+        [(
+            "member.bootstrap_admin".to_owned(),
+            "member".to_owned(),
+            admin.member.name.clone()
+        )]
+    );
+    assert!(!isolated.audit_text().await.contains(&token));
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn administers_groups_members_and_tokens() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let admin = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let admin_id = Some(admin.member.id);
+
+    for group in ["core", "security"] {
+        if let Err(error) = store.create_group(admin_id, group).await {
+            panic!("create_group {group} failed: {error}");
+        }
+    }
+    assert_conflict(
+        store.create_group(admin_id, "core").await,
+        "group already exists",
+    );
+
+    // A missing group rolls the whole grant back.
+    assert_not_found(
+        store
+            .create_member(
+                admin_id,
+                member_request("alice", false, &["core", "ghosts"]),
+            )
+            .await,
+    );
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM members WHERE name = 'alice'")
+            .await,
+        0
+    );
+    let alice = create_member_ok(store, member_request("alice", false, &["core"])).await;
+    assert_eq!(alice.member.groups, ["core"]);
+    assert_conflict(
+        store
+            .create_member(admin_id, member_request("alice", false, &[]))
+            .await,
+        "member already exists",
+    );
+    let first_token = alice.token.expose_secret().to_owned();
+    match authenticate(store, &first_token).await {
+        Some(member) => assert_eq!(member.name, "alice"),
+        None => panic!("alice's token does not authenticate"),
+    }
+    let second = match store.issue_member_token(admin_id, "alice", "ci").await {
+        Ok(issued) => issued,
+        Err(error) => panic!("issue_member_token failed: {error}"),
+    };
+    let second_token = second.token.expose_secret().to_owned();
+    assert_ne!(first_token, second_token);
+    assert!(authenticate(store, &second_token).await.is_some());
+
+    for (expected, call) in [
+        (true, "add"),
+        (false, "add"),
+        (true, "remove"),
+        (false, "remove"),
+    ] {
+        let change = if call == "add" {
+            store.add_group_member(admin_id, "security", "alice").await
+        } else {
+            store
+                .remove_group_member(admin_id, "security", "alice")
+                .await
+        };
+        match change {
+            Ok(change) => assert_eq!(change.changed, expected, "{call}"),
+            Err(error) => panic!("{call} failed: {error}"),
+        }
+    }
+    assert_not_found(store.add_group_member(admin_id, "ghosts", "alice").await);
+    assert_not_found(store.add_group_member(admin_id, "core", "nobody").await);
+
+    let groups = match store.list_groups().await {
+        Ok(groups) => groups,
+        Err(error) => panic!("list_groups failed: {error}"),
+    };
+    let summary: Vec<(String, Vec<String>)> = groups
+        .into_iter()
+        .map(|group| (group.name, group.members))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("core".to_owned(), vec!["alice".to_owned()]),
+            ("security".to_owned(), Vec::new()),
+        ]
+    );
+
+    match store.revoke_member(admin_id, "alice").await {
+        Ok(result) => assert!(result.revoked),
+        Err(error) => panic!("revoke failed: {error}"),
+    }
+    assert!(authenticate(store, &first_token).await.is_none());
+    assert!(authenticate(store, &second_token).await.is_none());
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM member_tokens mt JOIN members m ON m.id = mt.member_id WHERE m.name = 'alice' AND mt.revoked_at IS NULL")
+            .await,
+        0
+    );
+    match store.revoke_member(admin_id, "alice").await {
+        Ok(result) => assert!(!result.revoked),
+        Err(error) => panic!("second revoke failed: {error}"),
+    }
+    assert_not_found(store.issue_member_token(admin_id, "alice", "again").await);
+    let active = match store.list_members(false).await {
+        Ok(members) => members,
+        Err(error) => panic!("list_members failed: {error}"),
+    };
+    assert_eq!(
+        active
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        ["root"]
+    );
+    let everyone = match store.list_members(true).await {
+        Ok(members) => members,
+        Err(error) => panic!("list_members failed: {error}"),
+    };
+    assert_eq!(everyone.len(), 2);
+    assert!(
+        everyone
+            .iter()
+            .any(|member| member.name == "alice" && member.revoked)
+    );
+
+    // The last active admin is protected, also against two racing
+    // revocations of the only two admins.
+    assert_conflict(
+        store.revoke_member(admin_id, "root").await,
+        "cannot revoke the last active admin",
+    );
+    create_member_ok(store, member_request("root2", true, &[])).await;
+    let (first, second) = tokio::join!(
+        store.revoke_member(admin_id, "root"),
+        store.revoke_member(admin_id, "root2"),
+    );
+    let outcomes = [first, second];
+    let revoked_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(result) if result.revoked))
+        .count();
+    let conflict_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Err(PolicyStoreError::Conflict(_))))
+        .count();
+    assert_eq!((revoked_count, conflict_count), (1, 1));
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM members WHERE is_admin AND revoked_at IS NULL")
+            .await,
+        1
+    );
+
+    let actions: Vec<String> = isolated
+        .audit_rows()
+        .await
+        .into_iter()
+        .map(|(action, _, _)| action)
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "member.bootstrap_admin",
+            "group.create",
+            "group.create",
+            "member.grant",
+            "member.token_issue",
+            "group.member_add",
+            "group.member_remove",
+            "member.revoke",
+            "member.grant",
+            "member.revoke",
+        ]
+    );
+    let audit_text = isolated.audit_text().await;
+    for token in [&first_token, &second_token] {
+        assert!(!audit_text.contains(token.as_str()));
+    }
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn administers_repositories_and_branch_rules() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let alice = create_member_ok(store, member_request("alice", false, &[])).await;
+    for group in ["core", "security"] {
+        if let Err(error) = store.create_group(None, group).await {
+            panic!("create_group failed: {error}");
+        }
+    }
+    if let Err(error) = store.add_group_member(None, "core", "alice").await {
+        panic!("add_group_member failed: {error}");
+    }
+
+    let registered = match store.register_repository(None, "team/app.git").await {
+        Ok(registered) => registered,
+        Err(error) => panic!("register failed: {error}"),
+    };
+    assert!(registered.created);
+    match store.register_repository(None, "team/app.git").await {
+        Ok(again) => {
+            assert!(!again.created);
+            assert_eq!(again.repository.id, registered.repository.id);
+        }
+        Err(error) => panic!("second register failed: {error}"),
+    }
+    for invalid in ["api/app.git", "../app.git", ""] {
+        match store.register_repository(None, invalid).await {
+            Err(PolicyStoreError::InvalidInput(_)) => {}
+            Err(error) => panic!("unexpected error for {invalid:?}: {error}"),
+            Ok(_) => panic!("{invalid:?} was registered"),
+        }
+    }
+    if let Err(error) = store.register_repository(None, "alpha.git").await {
+        panic!("register failed: {error}");
+    }
+    match store.list_repositories().await {
+        Ok(repositories) => assert_eq!(
+            repositories
+                .iter()
+                .map(|repository| repository.path.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha.git", "team/app.git"]
+        ),
+        Err(error) => panic!("list_repositories failed: {error}"),
+    }
+
+    let pattern = "refs/heads/private/*";
+    assert_not_found(
+        store
+            .set_branch_rule(None, "missing.git", pattern, group_set(&["core"]))
+            .await,
+    );
+    assert_not_found(
+        store
+            .set_branch_rule(None, "team/app.git", pattern, group_set(&["ghosts"]))
+            .await,
+    );
+    match store
+        .set_branch_rule(None, "team/app.git", "heads/*", group_set(&["core"]))
+        .await
+    {
+        Err(PolicyStoreError::InvalidInput(_)) => {}
+        Err(error) => panic!("unexpected error: {error}"),
+        Ok(_) => panic!("an invalid glob was stored"),
+    }
+
+    if let Err(error) = store
+        .set_branch_rule(None, "team/app.git", pattern, group_set(&["core"]))
+        .await
+    {
+        panic!("set_branch_rule failed: {error}");
+    }
+    let policy = match store
+        .load_member_repo_policy(alice.member.id, "team/app.git")
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => panic!("load failed: {error}"),
+    };
+    assert!(
+        policy
+            .branch_policy
+            .is_ref_visible("refs/heads/private/x", &policy.member_groups)
+    );
+
+    // Replacing the groups takes effect for the next policy load.
+    if let Err(error) = store
+        .set_branch_rule(None, "team/app.git", pattern, group_set(&["security"]))
+        .await
+    {
+        panic!("updating the rule failed: {error}");
+    }
+    let policy = match store
+        .load_member_repo_policy(alice.member.id, "team/app.git")
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => panic!("load failed: {error}"),
+    };
+    assert!(
+        !policy
+            .branch_policy
+            .is_ref_visible("refs/heads/private/x", &policy.member_groups)
+    );
+    match store.list_branch_rules("team/app.git").await {
+        Ok(rules) => {
+            assert_eq!(rules.len(), 1);
+            assert_eq!(
+                rules
+                    .first()
+                    .map(|rule| (rule.pattern.as_str(), rule.groups.clone())),
+                Some((pattern, vec!["security".to_owned()]))
+            );
+        }
+        Err(error) => panic!("list_branch_rules failed: {error}"),
+    }
+    match store.list_branch_rules("alpha.git").await {
+        Ok(rules) => assert!(rules.is_empty()),
+        Err(error) => panic!("list_branch_rules failed: {error}"),
+    }
+    assert_not_found(store.list_branch_rules("missing.git").await);
+
+    match store
+        .remove_branch_rule(None, "team/app.git", pattern)
+        .await
+    {
+        Ok(removed) => assert!(removed),
+        Err(error) => panic!("remove_branch_rule failed: {error}"),
+    }
+    assert_not_found(
+        store
+            .remove_branch_rule(None, "team/app.git", pattern)
+            .await,
+    );
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM branch_rule_groups")
+            .await,
+        0
+    );
+
+    let target = format!("team/app.git:{pattern}");
+    let rows = isolated.audit_rows().await;
+    let rule_rows: Vec<(String, String, String)> = rows
+        .into_iter()
+        .filter(|(_, target_type, _)| target_type != "group" && target_type != "group_membership")
+        .filter(|(action, _, _)| action != "member.grant")
+        .collect();
+    assert_eq!(
+        rule_rows,
+        [
+            (
+                "repository.register".to_owned(),
+                "repository".to_owned(),
+                "team/app.git".to_owned()
+            ),
+            (
+                "repository.register".to_owned(),
+                "repository".to_owned(),
+                "alpha.git".to_owned()
+            ),
+            (
+                "branch_rule.set".to_owned(),
+                "branch_rule".to_owned(),
+                target.clone()
+            ),
+            (
+                "branch_rule.set".to_owned(),
+                "branch_rule".to_owned(),
+                target.clone()
+            ),
+            (
+                "branch_rule.remove".to_owned(),
+                "branch_rule".to_owned(),
+                target
+            ),
+        ]
+    );
+    isolated.drop_schema().await;
 }
