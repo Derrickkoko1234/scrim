@@ -347,6 +347,7 @@ async fn static_store_answers_administration_with_not_implemented() {
         "/api/v1/secret-scopes/recipients?repo=new.git&scope=dev",
         None,
     ));
+    routes.push((Method::GET, "/api/v1/groups/core/recipients", None));
     for (method, uri, body) in routes {
         let reply = send(&router, method.clone(), uri, Some(TEST_TOKEN), body).await;
         assert_eq!(
@@ -1969,4 +1970,117 @@ async fn secret_scopes_and_recipients_lifecycle() {
             && entry.target_name == "team/app.git:prod"
             && entry.details == json!({ "repository": "team/app.git", "scope": "prod" })
     }));
+}
+
+#[tokio::test]
+async fn group_recipients_lifecycle_and_authorization() {
+    let api = Api::new();
+    api.create_group("core").await;
+    api.create_group("ops").await;
+
+    let alice_token = api.create_member("alice", &["core"]).await;
+    let _bob_token = api.create_member("bob", &["core"]).await;
+    let zoe_token = api.create_member("zoe", &["core"]).await;
+    let charlie_token = api.create_member("charlie", &["ops"]).await;
+    let _revoked_token = api.create_member("revoked_user", &["core"]).await;
+
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/members/alice/public-key",
+        Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        StatusCode::OK,
+    )
+    .await;
+    let zoe_key_reply = api
+        .call(
+            Method::PUT,
+            "/api/v1/me/public-key",
+            Some(&zoe_token),
+            Some(json!({ "public_key": TEST_AGE_KEY_3 })),
+        )
+        .await;
+    assert_eq!(zoe_key_reply.status, StatusCode::OK);
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/members/charlie/public-key",
+        Some(json!({ "public_key": TEST_AGE_KEY_2 })),
+        StatusCode::OK,
+    )
+    .await;
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/members/revoked_user/public-key",
+        Some(json!({ "public_key": TEST_AGE_KEY_2 })),
+        StatusCode::OK,
+    )
+    .await;
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/members/revoked_user",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // Authorized group member (alice in `core`) gets 200 with Cache-Control: no-store,
+    // keyed recipients sorted ascending, `bob` in `members_without_key`, and revoked member excluded.
+    let alice_reply = api
+        .call(
+            Method::GET,
+            "/api/v1/groups/core/recipients",
+            Some(&alice_token),
+            None,
+        )
+        .await;
+    assert_eq!(alice_reply.status, StatusCode::OK);
+    assert_no_store(&alice_reply);
+    assert_eq!(
+        alice_reply.json,
+        json!({
+            "group": "core",
+            "recipients": [
+                { "member": "alice", "public_key": TEST_AGE_KEY_1 },
+                { "member": "zoe", "public_key": TEST_AGE_KEY_3 },
+            ],
+            "members_without_key": ["bob"],
+        })
+    );
+
+    // Unauthorized non-admin (charlie in `ops`) gets 403 for `core`
+    // AND 403 (not 404) for nonexistent group `ghosts`.
+    for uri in [
+        "/api/v1/groups/core/recipients",
+        "/api/v1/groups/ghosts/recipients",
+    ] {
+        let forbidden = api.call(Method::GET, uri, Some(&charlie_token), None).await;
+        assert_eq!(forbidden.status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(forbidden.error(), "access to this group is forbidden");
+    }
+
+    // Admin (not in `ops`) gets 200 for `ops`, 404 for nonexistent `ghosts`,
+    // and 400 for an invalid group name.
+    let admin_ops = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/groups/ops/recipients",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        admin_ops,
+        json!({
+            "group": "ops",
+            "recipients": [{ "member": "charlie", "public_key": TEST_AGE_KEY_2 }],
+            "members_without_key": [],
+        })
+    );
+    let admin_missing = api
+        .admin(Method::GET, "/api/v1/groups/ghosts/recipients", None)
+        .await;
+    assert_eq!(admin_missing.status, StatusCode::NOT_FOUND);
+    let admin_invalid = api
+        .admin(Method::GET, "/api/v1/groups/.bad/recipients", None)
+        .await;
+    assert_eq!(admin_invalid.status, StatusCode::BAD_REQUEST);
 }

@@ -285,6 +285,18 @@ pub struct ScopeRecipientsRecord {
     pub members_without_key: Vec<String>,
 }
 
+/// Active members of one group, split into those with a registered `age`
+/// public key and those without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRecipientsRecord {
+    /// Name of the group.
+    pub group: String,
+    /// Active members in this group who have a public key, sorted by member name ascending.
+    pub recipients: Vec<ScopeRecipient>,
+    /// Active members in this group without a public key, sorted ascending.
+    pub members_without_key: Vec<String>,
+}
+
 /// Errors a [`PolicyStore`] reports. Callers must treat every error as "deny".
 ///
 /// No variant ever carries a token, a token hash, or database credentials.
@@ -635,6 +647,19 @@ pub trait PolicyStore: Send + Sync + 'static {
         scope: &'a str,
     ) -> PolicyStoreFuture<'a, ScopeRecipientsRecord> {
         let _ = (repository, scope);
+        unsupported()
+    }
+
+    /// Resolves active (non-revoked) members of `group`, split into keyed
+    /// `recipients` and `members_without_key`, both sorted by member name.
+    ///
+    /// Returns [`PolicyStoreError::InvalidInput`] on invalid group name and
+    /// [`PolicyStoreError::NotFound`] if `group` does not exist.
+    fn resolve_group_recipients<'a>(
+        &'a self,
+        group: &'a str,
+    ) -> PolicyStoreFuture<'a, GroupRecipientsRecord> {
+        let _ = group;
         unsupported()
     }
 }
@@ -1910,17 +1935,11 @@ impl PolicyStore for MemoryPolicyStore {
                 })
                 .collect();
             matching_members.sort_by(|left, right| left.name.cmp(&right.name));
-            let mut recipients = Vec::new();
-            let mut members_without_key = Vec::new();
-            for member in matching_members {
-                match &member.public_key {
-                    Some(public_key) => recipients.push(ScopeRecipient {
-                        member: member.name.clone(),
-                        public_key: public_key.clone(),
-                    }),
-                    None => members_without_key.push(member.name.clone()),
-                }
-            }
+            let (recipients, members_without_key) = partition_recipients(
+                matching_members
+                    .into_iter()
+                    .map(|member| (member.name.clone(), member.public_key.clone())),
+            );
             Ok(ScopeRecipientsRecord {
                 repository: repository.to_owned(),
                 scope: scope.to_owned(),
@@ -1930,6 +1949,61 @@ impl PolicyStore for MemoryPolicyStore {
             })
         }))
     }
+
+    fn resolve_group_recipients<'a>(
+        &'a self,
+        group: &'a str,
+    ) -> PolicyStoreFuture<'a, GroupRecipientsRecord> {
+        if let Err(error) = validate_group_name(group) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if !state.group_ids.contains_key(group) {
+                return Err(group_not_found_error());
+            }
+            let mut matching_members: Vec<&MemoryMember> = state
+                .members
+                .iter()
+                .filter(|member| {
+                    !member.is_revoked
+                        && state
+                            .groups_by_member
+                            .get(&member.id)
+                            .is_some_and(|member_groups| member_groups.contains(group))
+                })
+                .collect();
+            matching_members.sort_by(|left, right| left.name.cmp(&right.name));
+            let (recipients, members_without_key) = partition_recipients(
+                matching_members
+                    .into_iter()
+                    .map(|member| (member.name.clone(), member.public_key.clone())),
+            );
+            Ok(GroupRecipientsRecord {
+                group: group.to_owned(),
+                recipients,
+                members_without_key,
+            })
+        }))
+    }
+}
+
+/// Splits member `(name, public_key)` pairs (already sorted by name) into
+/// keyed recipients and members without a key.
+fn partition_recipients(
+    members: impl IntoIterator<Item = (String, Option<String>)>,
+) -> (Vec<ScopeRecipient>, Vec<String>) {
+    let mut recipients = Vec::new();
+    let mut members_without_key = Vec::new();
+    for (member_name, public_key) in members {
+        match public_key {
+            Some(public_key) => recipients.push(ScopeRecipient {
+                member: member_name,
+                public_key,
+            }),
+            None => members_without_key.push(member_name),
+        }
+    }
+    (recipients, members_without_key)
 }
 
 /// The request [`PolicyStore::bootstrap_admin`] turns into a member.
@@ -3550,21 +3624,70 @@ impl PolicyStore for PgPolicyStore {
                 return Err(error);
             }
 
-            let mut recipients = Vec::new();
-            let mut members_without_key = Vec::new();
-            for (member_name, public_key) in member_rows {
-                match public_key {
-                    Some(public_key) => recipients.push(ScopeRecipient {
-                        member: member_name,
-                        public_key,
-                    }),
-                    None => members_without_key.push(member_name),
-                }
-            }
+            let (recipients, members_without_key) = partition_recipients(member_rows);
             Ok(ScopeRecipientsRecord {
                 repository: repository.to_owned(),
                 scope: scope.to_owned(),
                 groups,
+                recipients,
+                members_without_key,
+            })
+        })
+    }
+
+    fn resolve_group_recipients<'a>(
+        &'a self,
+        group: &'a str,
+    ) -> PolicyStoreFuture<'a, GroupRecipientsRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_group_name(group) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) =
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .execute(&mut *transaction)
+                    .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+
+            let group_id = sqlx::query_scalar::<_, i64>("SELECT id FROM groups WHERE name = $1")
+                .bind(group)
+                .fetch_optional(&mut *transaction)
+                .await;
+            let group_id = match group_id {
+                Ok(Some(group_id)) => group_id,
+                Ok(None) => return Err(group_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            let member_rows = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT m.name, m.public_key \
+                 FROM group_memberships gm \
+                 JOIN members m ON m.id = gm.member_id \
+                 WHERE gm.group_id = $1 \
+                   AND m.revoked_at IS NULL \
+                 ORDER BY m.name COLLATE \"C\"",
+            )
+            .bind(group_id)
+            .fetch_all(&mut *transaction)
+            .await;
+            let member_rows = match member_rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+
+            let (recipients, members_without_key) = partition_recipients(member_rows);
+            Ok(GroupRecipientsRecord {
+                group: group.to_owned(),
                 recipients,
                 members_without_key,
             })

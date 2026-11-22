@@ -121,19 +121,12 @@ impl ScopeKeysFile {
         if recipients.is_empty() {
             return Err(CryptoError::NoRecipients);
         }
-        let payload = build_wrapped_payload(scope, generation, data_key);
-        let mut wrapped = Vec::with_capacity(recipients.len());
-        for (member, public_key) in recipients {
-            let ciphertext = match age::encrypt(public_key.as_age_recipient(), &payload) {
-                Ok(ciphertext) => ciphertext,
-                Err(error) => return Err(CryptoError::Encryption(error.to_string())),
-            };
-            wrapped.push(WrappedRecipientKey {
-                member: member.clone(),
-                public_key: public_key.as_str().to_owned(),
-                wrapped_key: BASE64.encode(ciphertext),
-            });
-        }
+        let payload =
+            build_bound_payload(WRAPPED_KEY_DOMAIN, scope, generation, data_key.as_bytes());
+        let wrapped = match wrap_payload_for_recipients(&payload, recipients) {
+            Ok(wrapped) => wrapped,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             version: FILE_FORMAT_VERSION,
             scope: scope.to_owned(),
@@ -170,23 +163,28 @@ impl ScopeKeysFile {
         if let Err(error) = validate_generation(self.generation) {
             return Err(error);
         }
-        let public_key = identity.public_key();
-        let Some(entry) = self
-            .recipients
-            .iter()
-            .find(|entry| entry.public_key == public_key.as_str())
-        else {
-            return Err(CryptoError::Unauthorized);
+        let payload = match decrypt_recipient_payload(
+            &self.recipients,
+            identity,
+            MAX_WRAPPED_PAYLOAD_BYTES,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return Err(error),
         };
-        let ciphertext = match BASE64.decode(&entry.wrapped_key) {
-            Ok(ciphertext) => ciphertext,
-            Err(_) => return Err(CryptoError::Unauthorized),
+        let Some(key_bytes) = strip_bound_payload(
+            &payload,
+            WRAPPED_KEY_DOMAIN,
+            expected_scope,
+            self.generation,
+        ) else {
+            return Err(CryptoError::WrappedKeyMismatch);
         };
-        let payload = match decrypt_wrapped_payload(&ciphertext, identity) {
-            Some(payload) => payload,
-            None => return Err(CryptoError::Unauthorized),
-        };
-        parse_wrapped_payload(&payload, expected_scope, self.generation)
+        let mut key = Zeroizing::new([0_u8; DATA_KEY_BYTES]);
+        if key_bytes.len() != key.len() {
+            return Err(CryptoError::WrappedKeyMismatch);
+        }
+        key.copy_from_slice(key_bytes);
+        Ok(ScopeDataKey(key))
     }
 
     /// Serializes the file as TOML.
@@ -225,31 +223,10 @@ impl ScopeKeysFile {
         if let Err(error) = validate_generation(file.generation) {
             return Err(error);
         }
-        if file.recipients.is_empty() {
-            return Err(CryptoError::NoRecipients);
+        match sort_and_validate_recipients(&mut file.recipients) {
+            Ok(()) => Ok(file),
+            Err(error) => Err(error),
         }
-        file.recipients
-            .sort_by(|left, right| left.member.cmp(&right.member));
-        for pair in file.recipients.windows(2) {
-            if let [left, right] = pair
-                && left.member == right.member
-            {
-                return Err(CryptoError::DuplicateMember {
-                    member: right.member.clone(),
-                });
-            }
-        }
-        for entry in &file.recipients {
-            if let Err(error) = MemberPublicKey::parse(&entry.public_key) {
-                return Err(error);
-            }
-            if BASE64.decode(&entry.wrapped_key).is_err() {
-                return Err(CryptoError::InvalidEncoding {
-                    field: "wrapped_key",
-                });
-            }
-        }
-        Ok(file)
     }
 
     /// Returns each member's parsed public key, for re-wrapping a new key to
@@ -260,39 +237,150 @@ impl ScopeKeysFile {
     /// Returns [`CryptoError::InvalidPublicKey`] or
     /// [`CryptoError::DuplicateMember`] for a malformed recipient list.
     pub fn recipient_public_keys(&self) -> Result<BTreeMap<String, MemberPublicKey>, CryptoError> {
-        let mut keys = BTreeMap::new();
-        for entry in &self.recipients {
-            let public_key = match MemberPublicKey::parse(&entry.public_key) {
-                Ok(public_key) => public_key,
-                Err(error) => return Err(error),
-            };
-            if keys.insert(entry.member.clone(), public_key).is_some() {
-                return Err(CryptoError::DuplicateMember {
-                    member: entry.member.clone(),
-                });
-            }
-        }
-        Ok(keys)
+        parse_recipient_public_keys(&self.recipients)
     }
 }
 
-/// Builds the domain-bound plaintext that `age` wraps for each recipient.
-fn build_wrapped_payload(
-    scope: &str,
+/// Builds the domain-bound plaintext that `age` wraps for each recipient:
+/// `domain || name || "\n" || generation (decimal) || "\n" || key`.
+pub(crate) fn build_bound_payload(
+    domain: &[u8],
+    name: &str,
     generation: u64,
-    data_key: &ScopeDataKey,
+    key: &[u8],
 ) -> Zeroizing<Vec<u8>> {
     let generation_text = generation.to_string();
     let mut payload = Zeroizing::new(Vec::with_capacity(
-        WRAPPED_KEY_DOMAIN.len() + scope.len() + 1 + generation_text.len() + 1 + DATA_KEY_BYTES,
+        domain.len() + name.len() + 1 + generation_text.len() + 1 + key.len(),
     ));
-    payload.extend_from_slice(WRAPPED_KEY_DOMAIN);
-    payload.extend_from_slice(scope.as_bytes());
+    payload.extend_from_slice(domain);
+    payload.extend_from_slice(name.as_bytes());
     payload.push(b'\n');
     payload.extend_from_slice(generation_text.as_bytes());
     payload.push(b'\n');
-    payload.extend_from_slice(data_key.as_bytes());
+    payload.extend_from_slice(key);
     payload
+}
+
+/// Checks the domain, name and generation of a decrypted payload built by
+/// [`build_bound_payload`] and returns the trailing key bytes, or `None` if
+/// any part does not match.
+pub(crate) fn strip_bound_payload<'payload>(
+    payload: &'payload [u8],
+    domain: &[u8],
+    expected_name: &str,
+    expected_generation: u64,
+) -> Option<&'payload [u8]> {
+    let Some(rest) = payload.strip_prefix(domain) else {
+        return None;
+    };
+    let Some(rest) = rest.strip_prefix(expected_name.as_bytes()) else {
+        return None;
+    };
+    let Some(rest) = rest.strip_prefix(b"\n") else {
+        return None;
+    };
+    let Some(rest) = rest.strip_prefix(expected_generation.to_string().as_bytes()) else {
+        return None;
+    };
+    rest.strip_prefix(b"\n")
+}
+
+/// Encrypts `payload` with `age` to every recipient, in member-name order.
+pub(crate) fn wrap_payload_for_recipients(
+    payload: &[u8],
+    recipients: &BTreeMap<String, MemberPublicKey>,
+) -> Result<Vec<WrappedRecipientKey>, CryptoError> {
+    let mut wrapped = Vec::with_capacity(recipients.len());
+    for (member, public_key) in recipients {
+        let ciphertext = match age::encrypt(public_key.as_age_recipient(), payload) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => return Err(CryptoError::Encryption(error.to_string())),
+        };
+        wrapped.push(WrappedRecipientKey {
+            member: member.clone(),
+            public_key: public_key.as_str().to_owned(),
+            wrapped_key: BASE64.encode(ciphertext),
+        });
+    }
+    Ok(wrapped)
+}
+
+/// Finds the entry wrapped to `identity`'s public key and decrypts it,
+/// reading at most `max_payload_bytes + 1` bytes.
+///
+/// Returns [`CryptoError::Unauthorized`] when no entry matches or the entry
+/// does not decrypt.
+pub(crate) fn decrypt_recipient_payload(
+    recipients: &[WrappedRecipientKey],
+    identity: &MemberIdentity,
+    max_payload_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let public_key = identity.public_key();
+    let Some(entry) = recipients
+        .iter()
+        .find(|entry| entry.public_key == public_key.as_str())
+    else {
+        return Err(CryptoError::Unauthorized);
+    };
+    let ciphertext = match BASE64.decode(&entry.wrapped_key) {
+        Ok(ciphertext) => ciphertext,
+        Err(_) => return Err(CryptoError::Unauthorized),
+    };
+    match decrypt_wrapped_payload(&ciphertext, identity, max_payload_bytes) {
+        Some(payload) => Ok(payload),
+        None => Err(CryptoError::Unauthorized),
+    }
+}
+
+/// Validates a parsed recipient list in place: non-empty, sorted by member
+/// name with no duplicates, canonical `age1...` keys and base64 wrapped keys.
+pub(crate) fn sort_and_validate_recipients(
+    recipients: &mut [WrappedRecipientKey],
+) -> Result<(), CryptoError> {
+    if recipients.is_empty() {
+        return Err(CryptoError::NoRecipients);
+    }
+    recipients.sort_by(|left, right| left.member.cmp(&right.member));
+    for pair in recipients.windows(2) {
+        if let [left, right] = pair
+            && left.member == right.member
+        {
+            return Err(CryptoError::DuplicateMember {
+                member: right.member.clone(),
+            });
+        }
+    }
+    for entry in recipients.iter() {
+        if let Err(error) = MemberPublicKey::parse(&entry.public_key) {
+            return Err(error);
+        }
+        if BASE64.decode(&entry.wrapped_key).is_err() {
+            return Err(CryptoError::InvalidEncoding {
+                field: "wrapped_key",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Parses each recipient's public key, rejecting duplicate member names.
+pub(crate) fn parse_recipient_public_keys(
+    recipients: &[WrappedRecipientKey],
+) -> Result<BTreeMap<String, MemberPublicKey>, CryptoError> {
+    let mut keys = BTreeMap::new();
+    for entry in recipients {
+        let public_key = match MemberPublicKey::parse(&entry.public_key) {
+            Ok(public_key) => public_key,
+            Err(error) => return Err(error),
+        };
+        if keys.insert(entry.member.clone(), public_key).is_some() {
+            return Err(CryptoError::DuplicateMember {
+                member: entry.member.clone(),
+            });
+        }
+    }
+    Ok(keys)
 }
 
 /// Decrypts an `age` ciphertext into a pre-sized zeroizing buffer, returning
@@ -300,6 +388,7 @@ fn build_wrapped_payload(
 fn decrypt_wrapped_payload(
     ciphertext: &[u8],
     identity: &MemberIdentity,
+    max_payload_bytes: usize,
 ) -> Option<Zeroizing<Vec<u8>>> {
     let decryptor = match age::Decryptor::new(ciphertext) {
         Ok(decryptor) => decryptor,
@@ -312,7 +401,7 @@ fn decrypt_wrapped_payload(
     };
     // Sized so `read_to_end` never reallocates, which would leave unzeroized
     // copies of the key in freed memory.
-    let limit = MAX_WRAPPED_PAYLOAD_BYTES + 1;
+    let limit = max_payload_bytes + 1;
     let mut payload = Zeroizing::new(Vec::with_capacity(limit + 1));
     match reader.take(limit as u64).read_to_end(&mut payload) {
         Ok(_) => Some(payload),
@@ -320,42 +409,12 @@ fn decrypt_wrapped_payload(
     }
 }
 
-/// Checks the domain, scope and generation of a decrypted payload and extracts
-/// the data key.
-fn parse_wrapped_payload(
-    payload: &[u8],
-    expected_scope: &str,
-    expected_generation: u64,
-) -> Result<ScopeDataKey, CryptoError> {
-    let Some(rest) = payload.strip_prefix(WRAPPED_KEY_DOMAIN) else {
-        return Err(CryptoError::WrappedKeyMismatch);
-    };
-    let Some(rest) = rest.strip_prefix(expected_scope.as_bytes()) else {
-        return Err(CryptoError::WrappedKeyMismatch);
-    };
-    let Some(rest) = rest.strip_prefix(b"\n") else {
-        return Err(CryptoError::WrappedKeyMismatch);
-    };
-    let Some(rest) = rest.strip_prefix(expected_generation.to_string().as_bytes()) else {
-        return Err(CryptoError::WrappedKeyMismatch);
-    };
-    let Some(key_bytes) = rest.strip_prefix(b"\n") else {
-        return Err(CryptoError::WrappedKeyMismatch);
-    };
-    if key_bytes.len() != DATA_KEY_BYTES {
-        return Err(CryptoError::WrappedKeyMismatch);
-    }
-    let mut key = Zeroizing::new([0_u8; DATA_KEY_BYTES]);
-    key.copy_from_slice(key_bytes);
-    Ok(ScopeDataKey(key))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
     /// Predicate recognising the expected error in table-driven tests.
-    type ErrorCheck = fn(&CryptoError) -> bool;
+    pub(crate) type ErrorCheck = fn(&CryptoError) -> bool;
 
     pub(crate) fn data_key() -> ScopeDataKey {
         match ScopeDataKey::generate() {

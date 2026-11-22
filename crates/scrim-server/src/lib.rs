@@ -51,12 +51,12 @@ use git_service::{
 };
 pub use policy_store::{
     API_TOKEN_PREFIX, AuditLogEntry, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
-    CreatedMember, GroupMembershipChange, GroupRecord, GroupWithMembers, IssuedToken,
-    MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_SCOPE_NAME_BYTES, MAX_TOKEN_LABEL_BYTES,
-    MemberPublicKeyRecord, MemberRecord, MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore,
-    PolicyStore, PolicyStoreError, PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord,
-    RevokeMemberResult, ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
-    StaticPolicyStore,
+    CreatedMember, GroupMembershipChange, GroupRecipientsRecord, GroupRecord, GroupWithMembers,
+    IssuedToken, MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_SCOPE_NAME_BYTES,
+    MAX_TOKEN_LABEL_BYTES, MemberPublicKeyRecord, MemberRecord, MemberRepoPolicy,
+    MemoryPolicyStore, PgPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture,
+    RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult, ScopeRecipient,
+    ScopeRecipientsRecord, SecretScopeRecord, StaticPolicyStore,
 };
 pub use pre_receive::{
     ALLOW_MERGE_LEAK_PUSH_OPTION, ALLOW_SECRET_SCAN_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE,

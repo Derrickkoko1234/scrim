@@ -216,7 +216,9 @@ pub fn load_and_decrypt_scope(
     Ok((keys_file, data_key, bundle))
 }
 
-fn write_repo_file_atomic(dest_path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+/// Writes `contents` to a temporary sibling file, syncs it, and renames it over
+/// `dest_path`, creating parent directories as needed.
+pub(crate) fn write_repo_file_atomic(dest_path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let parent = match dest_path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),

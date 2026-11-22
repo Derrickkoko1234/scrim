@@ -1,4 +1,7 @@
-//! Client-side secret encryption for Scrim for Git.
+//! Client-side encryption of secret scopes and private files for Scrim for
+//! Git.
+//!
+//! # Secret scopes
 //!
 //! Each secret scope (such as `dev` or `prod`) has a random 32-byte
 //! [`ScopeDataKey`]. The data key encrypts the scope's secrets with
@@ -15,39 +18,67 @@
 //! re-wraps it for a new recipient set and re-encrypts the secrets, so removed
 //! members lose access to everything written afterwards.
 //!
+//! # Private files
+//!
+//! Each access group has a random 64-byte [`GroupDataKey`], wrapped with `age`
+//! for every group member in `.scrim/group-keys/<group>.toml`
+//! ([`GroupKeysFile`]) under a payload domain distinct from scope keys, so the
+//! two kinds of wrapped key can never be swapped. [`encrypt_file`] turns a
+//! private file into a binary `SCRIMFILE\0` blob with deterministic
+//! AES-256-SIV, authenticating the group, generation and repo-relative path,
+//! so identical content always yields identical bytes and `git status` stays
+//! clean. Non-members get a readable placeholder ([`format_placeholder`])
+//! that embeds the blob verbatim, so [`extract_placeholder_blob`] restores
+//! the exact original Git object. [`rotate_group_key`] issues a fresh key at
+//! the next generation for a new member set.
+//!
 //! This crate implements no cryptographic primitives itself; it only composes
-//! the audited `age` and `chacha20poly1305` crates.
+//! the audited `age`, `chacha20poly1305` and `aes-siv` crates.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
 #![allow(clippy::question_mark)]
 
 mod dotenv;
+mod file_crypto;
+mod group_key;
 mod identity;
+mod placeholder;
 mod rotation;
 mod scope_key;
 mod secrets;
 mod validation;
 
 pub use dotenv::format_dotenv;
+pub use file_crypto::{
+    ENCRYPTED_FILE_MAGIC, EncryptedFileHeader, decrypt_file, encrypt_file, is_encrypted_file,
+    parse_encrypted_file_header,
+};
+pub use group_key::{GroupDataKey, GroupKeysFile, RotatedGroupKey, rotate_group_key};
 pub use identity::{MemberIdentity, MemberPublicKey};
+pub use placeholder::{
+    ExtractedPlaceholder, extract_placeholder, extract_placeholder_blob, format_placeholder,
+    is_placeholder,
+};
 pub use rotation::{RotatedScope, rotate_scope};
 pub use scope_key::{ScopeDataKey, ScopeKeysFile, WrappedRecipientKey};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use secrets::{EncryptedSecretsFile, SecretBundle};
 pub use validation::{
-    MAX_SCOPE_NAME_BYTES, MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRETS_PER_SCOPE,
-    validate_scope_name, validate_secret_key,
+    MAX_FILE_PATH_BYTES, MAX_GROUP_NAME_BYTES, MAX_PRIVATE_FILE_BYTES, MAX_SCOPE_NAME_BYTES,
+    MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRETS_PER_SCOPE, validate_file_path,
+    validate_group_name, validate_scope_name, validate_secret_key,
 };
 
-/// The only on-disk format version of both `.scrim/keys/<scope>.toml` and
-/// `.scrim/secrets/<scope>.enc` this crate reads or writes.
+/// The only on-disk format version of `.scrim/keys/<scope>.toml`,
+/// `.scrim/secrets/<scope>.enc`, `.scrim/group-keys/<group>.toml` and
+/// encrypted private file blobs this crate reads or writes.
 pub const FILE_FORMAT_VERSION: u32 = 1;
 
-/// Errors produced while validating, encrypting or decrypting scope keys and
-/// secrets.
+/// Errors produced while validating, encrypting or decrypting scope keys,
+/// secrets, group keys and private files.
 ///
-/// No variant ever carries secret key material or secret values.
+/// No variant ever carries key material, secret values or file plaintext.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     /// The scope name breaks a naming rule (see [`validate_scope_name`]).
@@ -65,6 +96,29 @@ pub enum CryptoError {
         key: String,
         /// Human-readable description of the broken rule.
         reason: &'static str,
+    },
+    /// The group name breaks a naming rule (see [`validate_group_name`]).
+    #[error("invalid group name {group:?}: {reason}")]
+    InvalidGroupName {
+        /// The rejected group name.
+        group: String,
+        /// Human-readable description of the broken rule.
+        reason: &'static str,
+    },
+    /// The repo-relative file path breaks a rule (see
+    /// [`validate_file_path`]).
+    #[error("invalid file path {path:?}: {reason}")]
+    InvalidFilePath {
+        /// The rejected path.
+        path: String,
+        /// Human-readable description of the broken rule.
+        reason: &'static str,
+    },
+    /// A private file exceeds [`MAX_PRIVATE_FILE_BYTES`].
+    #[error("private file is larger than the {max_bytes}-byte limit")]
+    FileTooLarge {
+        /// The enforced limit.
+        max_bytes: usize,
     },
     /// A secret value exceeds [`MAX_SECRET_VALUE_BYTES`].
     #[error("secret {key:?} is larger than the {max_bytes}-byte limit")]
@@ -111,6 +165,14 @@ pub enum CryptoError {
         /// The scope recorded in the file.
         found: String,
     },
+    /// A file belongs to a different group than the caller expected.
+    #[error("file is for group {found:?}, expected {expected:?}")]
+    GroupMismatch {
+        /// The group the caller asked for.
+        expected: String,
+        /// The group recorded in the file.
+        found: String,
+    },
     /// A file belongs to a different key generation than the caller expected.
     #[error("file is for key generation {found}, expected {expected}")]
     GenerationMismatch {
@@ -128,18 +190,35 @@ pub enum CryptoError {
         /// The repeated member name.
         member: String,
     },
-    /// The identity is not a recipient of this scope's data key, or its
-    /// wrapped key could not be decrypted.
-    #[error("identity is not authorized to decrypt this scope")]
+    /// The identity is not a recipient of this scope's or group's data key,
+    /// or its wrapped key could not be decrypted.
+    #[error("identity is not authorized to decrypt this scope or group")]
     Unauthorized,
-    /// The wrapped key decrypted, but was bound to a different scope or
-    /// generation (a substituted or rolled-back blob) or was malformed.
-    #[error("wrapped key is not bound to this scope and generation")]
+    /// The wrapped key decrypted, but was bound to a different scope, group,
+    /// key kind or generation (a substituted or rolled-back blob) or was
+    /// malformed.
+    #[error("wrapped key is not bound to this scope or group and generation")]
     WrappedKeyMismatch,
     /// Authenticated decryption of the secrets failed: wrong key, or the
     /// ciphertext, nonce, scope or generation was tampered with.
     #[error("secrets failed authenticated decryption")]
     DecryptionFailed,
+    /// Authenticated decryption of a private file failed: wrong key, or the
+    /// ciphertext, tag, group, generation or path was tampered with.
+    #[error("private file failed authenticated decryption")]
+    FileDecryptionFailed,
+    /// The bytes are not a well-formed encrypted private file blob.
+    #[error("invalid encrypted file: {reason}")]
+    InvalidEncryptedFile {
+        /// Human-readable description of the problem.
+        reason: &'static str,
+    },
+    /// The bytes are not an intact, unedited private file placeholder.
+    #[error("invalid private file placeholder: {reason}")]
+    InvalidPlaceholder {
+        /// Human-readable description of the problem.
+        reason: &'static str,
+    },
     /// The decrypted secrets payload is not a JSON object of strings. Parser
     /// details are deliberately dropped because they may quote secret values.
     #[error("decrypted secrets payload is malformed")]

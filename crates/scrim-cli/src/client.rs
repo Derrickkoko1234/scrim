@@ -297,6 +297,15 @@ pub struct ScopeRecipientsResponse {
     pub members_without_key: Vec<String>,
 }
 
+/// Active members of a group and their registered public keys, used to wrap
+/// the group's private-file data key.
+#[derive(Debug, Deserialize)]
+pub struct GroupRecipientsResponse {
+    pub group: String,
+    pub recipients: Vec<ScopeRecipientInfo>,
+    pub members_without_key: Vec<String>,
+}
+
 /// Blocking HTTP client for talking to a Scrim server's `/api/v1` endpoints.
 pub struct ScrimClient {
     base_url: String,
@@ -515,6 +524,13 @@ impl ScrimClient {
             "/api/v1/secret-scopes/recipients",
             &[("repo", repository), ("scope", scope)],
         )
+    }
+
+    /// Fetches the members of `group` who can receive its private-file key
+    /// (`GET /api/v1/groups/{group}/recipients`).
+    pub fn get_group_recipients(&self, group: &str) -> anyhow::Result<GroupRecipientsResponse> {
+        let api_path = format!("/api/v1/groups/{}/recipients", encode_path_segment(group));
+        self.send_empty(Method::GET, &api_path, &[])
     }
 
     fn send_empty<R: for<'de> Deserialize<'de>>(

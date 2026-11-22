@@ -1,4 +1,4 @@
-//! Name and size limits for scopes and secrets.
+//! Name and size limits for scopes, secrets, groups and private files.
 
 use crate::CryptoError;
 
@@ -10,6 +10,12 @@ pub const MAX_SECRET_KEY_BYTES: usize = 128;
 pub const MAX_SECRET_VALUE_BYTES: usize = 256 * 1024;
 /// Most secrets a single scope may hold.
 pub const MAX_SECRETS_PER_SCOPE: usize = 4096;
+/// Longest accepted private-file group name, in bytes.
+pub const MAX_GROUP_NAME_BYTES: usize = 64;
+/// Largest private file plaintext accepted for encryption, in bytes (64 MiB).
+pub const MAX_PRIVATE_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Longest accepted repo-relative private file path, in bytes.
+pub const MAX_FILE_PATH_BYTES: usize = 4096;
 
 /// Checks that `scope` is safe to use as a file stem for
 /// `.scrim/keys/<scope>.toml` and `.scrim/secrets/<scope>.enc`.
@@ -81,6 +87,86 @@ pub fn validate_secret_key(key: &str) -> Result<(), CryptoError> {
     Ok(())
 }
 
+/// Checks that `group` is safe to use as a file stem for
+/// `.scrim/group-keys/<group>.toml` and to embed in encrypted file headers.
+///
+/// The rules match [`validate_scope_name`]: 1 to [`MAX_GROUP_NAME_BYTES`]
+/// ASCII bytes, starting with `[A-Za-z0-9]` and otherwise only
+/// `[A-Za-z0-9._-]`.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidGroupName`] naming the broken rule.
+pub fn validate_group_name(group: &str) -> Result<(), CryptoError> {
+    let reject = |reason| {
+        Err(CryptoError::InvalidGroupName {
+            group: group.to_owned(),
+            reason,
+        })
+    };
+    let bytes = group.as_bytes();
+    let Some(first) = bytes.first() else {
+        return reject("group name must not be empty");
+    };
+    if bytes.len() > MAX_GROUP_NAME_BYTES {
+        return reject("group name is longer than 64 bytes");
+    }
+    if !first.is_ascii_alphanumeric() {
+        return reject("group name must start with an ASCII letter or digit");
+    }
+    let is_allowed = |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
+    if !bytes.iter().all(is_allowed) {
+        return reject("group name may only contain ASCII letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
+/// Checks that `path` is a normalized repo-relative path, as bound into a
+/// private file's associated data and printed in its placeholder.
+///
+/// A valid path is 1 to [`MAX_FILE_PATH_BYTES`] bytes of `/`-separated
+/// segments with no ASCII control characters, no `\`, no leading or
+/// trailing `/`, and no empty, `.` or `..` segments. Rejecting
+/// non-normalized spellings means each file has exactly one valid path, so
+/// the same blob cannot be accepted under two names.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidFilePath`] naming the broken rule.
+pub fn validate_file_path(path: &str) -> Result<(), CryptoError> {
+    let reject = |reason| {
+        Err(CryptoError::InvalidFilePath {
+            path: path.to_owned(),
+            reason,
+        })
+    };
+    if path.is_empty() {
+        return reject("file path must not be empty");
+    }
+    if path.len() > MAX_FILE_PATH_BYTES {
+        return reject("file path is longer than 4096 bytes");
+    }
+    if path.bytes().any(|byte| byte.is_ascii_control()) {
+        return reject("file path must not contain control characters");
+    }
+    if path.contains('\\') {
+        return reject("file path must use '/' separators, not '\\'");
+    }
+    if path.starts_with('/') {
+        return reject("file path must be relative to the repository root");
+    }
+    if path.ends_with('/') {
+        return reject("file path must not end with '/'");
+    }
+    if path
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return reject("file path must not contain empty, '.' or '..' segments");
+    }
+    Ok(())
+}
+
 /// Rejects generation 0; generations start at 1.
 pub(crate) fn validate_generation(generation: u64) -> Result<(), CryptoError> {
     if generation == 0 {
@@ -133,6 +219,78 @@ mod tests {
             match validate_scope_name(scope) {
                 Err(CryptoError::InvalidScopeName { .. }) => {}
                 other => panic!("{scope:?} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validates_group_names_like_scope_names() {
+        let long = "g".repeat(MAX_GROUP_NAME_BYTES);
+        for group in ["backend", "Team-2", "eu.west_1", "0", long.as_str()] {
+            if let Err(error) = validate_group_name(group) {
+                panic!("{group:?} should be valid: {error}");
+            }
+        }
+        let too_long = "g".repeat(MAX_GROUP_NAME_BYTES + 1);
+        for group in [
+            "",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "-team",
+            "team x",
+            "téam",
+            too_long.as_str(),
+        ] {
+            match validate_group_name(group) {
+                Err(CryptoError::InvalidGroupName { .. }) => {}
+                other => panic!("{group:?} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_normalized_file_paths() {
+        let long = "p".repeat(MAX_FILE_PATH_BYTES);
+        for path in [
+            "secrets.txt",
+            "config/prod/db.yml",
+            ".env",
+            "dir/.hidden/file",
+            "a..b/c",
+            "unicode/caf\u{e9}.md",
+            long.as_str(),
+        ] {
+            if let Err(error) = validate_file_path(path) {
+                panic!("{path:?} should be valid: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unnormalized_file_paths() {
+        let too_long = "p".repeat(MAX_FILE_PATH_BYTES + 1);
+        for path in [
+            "",
+            "/etc/passwd",
+            "dir/",
+            "a//b",
+            "./a",
+            "a/./b",
+            "../a",
+            "a/../b",
+            ".",
+            "..",
+            "a\\b",
+            "a\nb",
+            "a\0b",
+            "a\u{7f}b",
+            too_long.as_str(),
+        ] {
+            match validate_file_path(path) {
+                Err(CryptoError::InvalidFilePath { .. }) => {}
+                other => panic!("{path:?} should be rejected, got {other:?}"),
             }
         }
     }

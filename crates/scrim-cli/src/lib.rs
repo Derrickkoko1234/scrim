@@ -12,7 +12,10 @@
 mod cli;
 pub mod client;
 pub mod config;
+mod filter;
 mod git;
+mod private_cmd;
+pub mod private_store;
 pub mod secrets_store;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,9 +45,10 @@ use crate::config::{
     resolve_identity_path, save_config, save_member_identity,
 };
 use crate::git::{
-    git_local_config_get, git_local_config_set, git_remote_add, git_remote_get_url,
-    git_remote_set_url, git_toplevel, validate_remote_name,
+    git_configure_scrim_filter, git_local_config_get, git_local_config_set, git_remote_add,
+    git_remote_get_url, git_remote_set_url, git_toplevel, validate_remote_name,
 };
+use crate::private_store::paths_file_path;
 use crate::secrets_store::{
     list_local_scopes, load_and_decrypt_scope, read_scope_keys, read_scope_secrets,
     require_repo_root, write_scope_keys, write_scope_secrets,
@@ -323,6 +327,19 @@ where
             config_path_result.as_deref().ok(),
             env,
             inherit_child_stdio,
+        ),
+        Command::Private(private_args) => private_cmd::handle_private(
+            private_args.command,
+            key_file.as_deref(),
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
+        Command::FilterProcess => private_cmd::handle_filter_process(
+            key_file.as_deref(),
+            config_path_result.as_deref().ok(),
+            env,
         ),
     }
 }
@@ -678,6 +695,12 @@ fn handle_init(args: InitArgs, client: &ScrimClient, env: &mut CliEnv<'_>) -> an
         if let Err(err) = git_local_config_set(&env.cwd, "scrim.server", client.base_url()) {
             return Err(err);
         }
+        if let Some(root) = &toplevel
+            && paths_file_path(root).exists()
+            && let Err(err) = git_configure_scrim_filter(root)
+        {
+            return Err(err);
+        }
 
         if let Some((remote_url, replace_existing)) = remote_action {
             let result = if replace_existing {
@@ -874,8 +897,29 @@ fn handle_access(
                 return Ok(());
             }
 
-            rotate_scopes_after_revocation(&res.name, repo, client, cli_key_file, config_path, env);
-            Ok(())
+            let rotated_scopes = rotate_scopes_after_revocation(
+                &res.name,
+                repo,
+                client,
+                cli_key_file,
+                config_path,
+                env,
+            );
+            let rotated_groups = private_cmd::rotate_groups_after_revocation(
+                &res.name,
+                client,
+                cli_key_file,
+                config_path,
+                env,
+            );
+            if rotated_scopes || rotated_groups {
+                write_line(
+                    env.stdout,
+                    "Remember to commit and push the updated .scrim/ files.",
+                )
+            } else {
+                Ok(())
+            }
         }
         AccessCommand::List { all } => {
             let res = match client.list_members(all) {
@@ -934,6 +978,8 @@ fn handle_access(
     }
 }
 
+/// Rotates every local secret scope that lists the revoked `member`, warning
+/// (never failing) on local problems. Returns whether any scope was rotated.
 fn rotate_scopes_after_revocation(
     member: &str,
     repo_flag: Option<String>,
@@ -941,16 +987,16 @@ fn rotate_scopes_after_revocation(
     cli_key_file: Option<&Path>,
     config_path: Option<&Path>,
     env: &mut CliEnv<'_>,
-) {
+) -> bool {
     let repo_root = match git_toplevel(&env.cwd) {
         Ok(Some(root)) => root,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(err) => {
             let _ = writeln!(
                 env.stderr,
                 "warning: member '{member}' was revoked on the server, but local git repository discovery failed ({err}); run 'scrim secrets sync --scope <scope>' if needed"
             );
-            return;
+            return false;
         }
     };
 
@@ -961,11 +1007,11 @@ fn rotate_scopes_after_revocation(
                 env.stderr,
                 "warning: member '{member}' was revoked on the server, but local scopes could not be listed ({err}); run 'scrim secrets sync --scope <scope>' if needed"
             );
-            return;
+            return false;
         }
     };
     if local_scopes.is_empty() {
-        return;
+        return false;
     }
 
     let mut affected = Vec::new();
@@ -986,7 +1032,7 @@ fn rotate_scopes_after_revocation(
         }
     }
     if affected.is_empty() {
-        return;
+        return false;
     }
 
     let identity = match load_member_identity(cli_key_file, &|k| env.env_var(k), config_path) {
@@ -998,7 +1044,7 @@ fn rotate_scopes_after_revocation(
                 "warning: member '{member}' was revoked on the server, but local scope(s) ({}) still need rotation ({err}); run 'scrim secrets sync --scope <scope>'",
                 scope_names.join(", ")
             );
-            return;
+            return false;
         }
     };
 
@@ -1138,16 +1184,11 @@ fn rotate_scopes_after_revocation(
         }
     }
 
-    if rotated_any {
-        if !keys_to_rotate.is_empty() {
-            let key_list: Vec<String> = keys_to_rotate.into_iter().collect();
-            let _ = print_secrets_to_rotate(env.stdout, &key_list);
-        }
-        let _ = write_line(
-            env.stdout,
-            "Remember to commit and push the updated .scrim/ files.",
-        );
+    if rotated_any && !keys_to_rotate.is_empty() {
+        let key_list: Vec<String> = keys_to_rotate.into_iter().collect();
+        let _ = print_secrets_to_rotate(env.stdout, &key_list);
     }
+    rotated_any
 }
 
 fn handle_branch(

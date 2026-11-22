@@ -25,9 +25,9 @@ use axum::{
 use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
 use scrim_server::{
-    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, MemberPublicKeyRecord,
-    PgPolicyStore, PolicyStore, PolicyStoreError, ScopeRecipient, ScopeRecipientsRecord,
-    SecretScopeRecord,
+    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, GroupRecipientsRecord,
+    MemberPublicKeyRecord, PgPolicyStore, PolicyStore, PolicyStoreError, ScopeRecipient,
+    ScopeRecipientsRecord, SecretScopeRecord,
 };
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -1242,6 +1242,47 @@ async fn administers_member_public_keys_and_secret_scopes() {
             .resolve_secret_scope_recipients("missing.git", "dev")
             .await,
     );
+
+    match store.resolve_group_recipients("core").await {
+        Ok(resolved) => assert_eq!(
+            resolved,
+            GroupRecipientsRecord {
+                group: "core".to_owned(),
+                recipients: vec![
+                    ScopeRecipient {
+                        member: "alice".to_owned(),
+                        public_key: AGE_KEY_1.to_owned(),
+                    },
+                    ScopeRecipient {
+                        member: "bob".to_owned(),
+                        public_key: AGE_KEY_2.to_owned(),
+                    },
+                ],
+                members_without_key: Vec::new(),
+            }
+        ),
+        Err(error) => panic!("resolve_group_recipients core failed: {error}"),
+    }
+    match store.resolve_group_recipients("security").await {
+        Ok(resolved) => assert_eq!(
+            resolved,
+            GroupRecipientsRecord {
+                group: "security".to_owned(),
+                recipients: vec![ScopeRecipient {
+                    member: "alice".to_owned(),
+                    public_key: AGE_KEY_1.to_owned(),
+                }],
+                members_without_key: vec!["carol".to_owned()],
+            }
+        ),
+        Err(error) => panic!("resolve_group_recipients security failed: {error}"),
+    }
+    assert_not_found(store.resolve_group_recipients("ghosts").await);
+    match store.resolve_group_recipients(".bad").await {
+        Err(PolicyStoreError::InvalidInput(_)) => {}
+        Err(error) => panic!("expected InvalidInput, got: {error}"),
+        Ok(_) => panic!("invalid group name was accepted"),
+    }
 
     match store
         .remove_secret_scope(admin_id, "team/app.git", "prod")

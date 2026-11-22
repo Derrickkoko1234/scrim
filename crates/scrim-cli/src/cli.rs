@@ -52,6 +52,11 @@ pub enum Command {
     Secrets(SecretsArgs),
     /// Run a command with decrypted scope secrets injected into its environment.
     Run(RunArgs),
+    /// Manage encrypted private files and their access groups.
+    Private(PrivateArgs),
+    /// Serve Git's long-running clean/smudge filter protocol (invoked by Git).
+    #[command(name = "filter-process", hide = true)]
+    FilterProcess,
 }
 
 #[derive(Debug, Args)]
@@ -143,7 +148,7 @@ pub enum AccessCommand {
         /// Server repository key (defaults to local git config scrim.repo).
         #[arg(long, value_name = "REPO")]
         repo: Option<String>,
-        /// Skip rotating local .scrim/ secret scopes that include this member.
+        /// Skip rotating local .scrim/ secret scopes and group keys that include this member.
         #[arg(long)]
         no_rotate: bool,
     },
@@ -366,4 +371,40 @@ pub struct RunArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PrivateArgs {
+    #[command(subcommand)]
+    pub command: PrivateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PrivateCommand {
+    /// Encrypt files matching a path glob for members of a group.
+    Add {
+        /// Repo-relative .gitattributes-style glob (for example, config/billing/**).
+        glob: String,
+        /// Group whose members may read matching files.
+        #[arg(long, value_name = "GROUP")]
+        group: String,
+        /// Create a new group key locally for only the caller's own public key without contacting the server.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Stop encrypting files matching a path glob (they are stored as plaintext again).
+    Rm {
+        /// Path glob previously passed to 'scrim private add'.
+        glob: String,
+    },
+    /// Show private path rules, group keys and the state of tracked private files.
+    Status,
+    /// Configure the Git filter and decrypt or refresh checked-out private files.
+    Setup,
+    /// Rotate a group's key to match its current members on the server and re-encrypt its files.
+    Sync {
+        /// Group to rotate.
+        #[arg(long, value_name = "GROUP")]
+        group: String,
+    },
 }

@@ -2,9 +2,11 @@
 //!
 //! Requests arrive already authenticated by [`crate::auth::require_auth`].
 //! `GET /api/v1/whoami` and `PUT /api/v1/me/public-key` are open to every
-//! active member, and `GET /api/v1/secret-scopes/recipients` is open to
-//! members belonging to the scope's groups (as well as admins); every other
-//! route requires an admin and answers `403` otherwise. Bodies are JSON (at most
+//! active member, `GET /api/v1/groups/{group}/recipients` is open to members
+//! belonging to that group (as well as admins), and
+//! `GET /api/v1/secret-scopes/recipients` is open to members belonging to the
+//! scope's groups (as well as admins); every other route requires an admin and
+//! answers `403` otherwise. Bodies are JSON (at most
 //! [`MAX_ADMIN_BODY_BYTES`] after decompression), every response carries
 //! `Cache-Control: no-store`, and every error is `{"error": "<message>"}`.
 //! Internal failures are logged and answered with a generic `500` message so
@@ -29,7 +31,7 @@ use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use crate::{
     policy_store::{
         AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, MemberRecord, PolicyStore,
-        PolicyStoreError, SecretScopeRecord, validate_repository_path,
+        PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
     },
     repo_path::{BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo},
 };
@@ -55,6 +57,7 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
             get(list_repositories).post(register_repository),
         )
         .route("/groups", get(list_groups).post(create_group))
+        .route("/groups/{group}/recipients", get(get_group_recipients))
         .route("/groups/{group}/members", post(add_group_member))
         .route(
             "/groups/{group}/members/{member}",
@@ -966,6 +969,15 @@ struct ScopeRecipientResponse {
     public_key: String,
 }
 
+impl From<ScopeRecipient> for ScopeRecipientResponse {
+    fn from(recipient: ScopeRecipient) -> Self {
+        Self {
+            member: recipient.member,
+            public_key: recipient.public_key,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ScopeRecipientsResponse {
     repository: String,
@@ -1017,10 +1029,52 @@ async fn get_secret_scope_recipients(
         recipients: record
             .recipients
             .into_iter()
-            .map(|recipient| ScopeRecipientResponse {
-                member: recipient.member,
-                public_key: recipient.public_key,
-            })
+            .map(ScopeRecipientResponse::from)
+            .collect(),
+        members_without_key: record.members_without_key,
+    })
+}
+
+#[derive(Serialize)]
+struct GroupRecipientsResponse {
+    group: String,
+    recipients: Vec<ScopeRecipientResponse>,
+    members_without_key: Vec<String>,
+}
+
+async fn get_group_recipients(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiPath(group): ApiPath<String>,
+) -> ApiResult<GroupRecipientsResponse> {
+    let record = match state.policy_store.resolve_group_recipients(&group).await {
+        Ok(record) => record,
+        Err(PolicyStoreError::NotFound(_)) if !member.is_admin => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "access to this group is forbidden",
+            ));
+        }
+        Err(error) => return Err(store_error(error)),
+    };
+    if !member.is_admin {
+        let member_groups = match state.policy_store.list_member_groups(member.id).await {
+            Ok(groups) => groups,
+            Err(error) => return Err(store_error(error)),
+        };
+        if !member_groups.contains(&record.group) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "access to this group is forbidden",
+            ));
+        }
+    }
+    ok(GroupRecipientsResponse {
+        group: record.group,
+        recipients: record
+            .recipients
+            .into_iter()
+            .map(ScopeRecipientResponse::from)
             .collect(),
         members_without_key: record.members_without_key,
     })

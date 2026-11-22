@@ -1592,3 +1592,589 @@ fn secret_scopes_set_key_machine_grant_sync_and_revoke_rotation() {
     );
     assert!(stderr_str(&revoke_missing_key).contains("scrim secrets sync"));
 }
+
+/// Environment for private-file tests: puts the built `scrim` on `PATH` so Git
+/// can start `scrim filter-process`, and isolates Git from the developer's
+/// global and system config.
+struct GitHarness {
+    path_env: String,
+    global_config: String,
+}
+
+impl GitHarness {
+    fn new(tmp: &Path) -> Self {
+        let bin_dir = must_some(Path::new(scrim_bin()).parent(), "scrim binary directory");
+        let path_env = match std::env::var("PATH") {
+            Ok(inherited) if !inherited.is_empty() => format!("{}:{inherited}", bin_dir.display()),
+            _ => bin_dir.display().to_string(),
+        };
+        let global_config = tmp.join("empty-gitconfig");
+        must(
+            fs::write(&global_config, ""),
+            "write empty global gitconfig",
+        );
+        Self {
+            path_env,
+            global_config: global_config.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn env<'a>(&'a self, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut vars = vec![
+            ("PATH", self.path_env.as_str()),
+            ("GIT_CONFIG_GLOBAL", self.global_config.as_str()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
+        vars.extend_from_slice(extra);
+        vars
+    }
+
+    fn scrim(&self, args: &[&str], cwd: &Path, config: &Path, extra: &[(&str, &str)]) -> Output {
+        run_bin_with_env(scrim_bin(), args, cwd, config, &self.env(extra), None)
+    }
+
+    fn git(&self, args: &[&str], cwd: &Path, config: &Path, extra: &[(&str, &str)]) -> Output {
+        run_bin_with_env("git", args, cwd, config, &self.env(extra), None)
+    }
+
+    fn git_ok(&self, args: &[&str], cwd: &Path, config: &Path, extra: &[(&str, &str)]) -> Output {
+        let out = self.git(args, cwd, config, extra);
+        assert_success(&out, &format!("git {args:?}"));
+        out
+    }
+
+    fn init_repo(&self, parent: &Path, name: &str, config: &Path) -> PathBuf {
+        let repo = parent.join(name);
+        must(fs::create_dir_all(&repo), "create repo dir");
+        self.git_ok(&["init", "-q", "-b", "main"], &repo, config, &[]);
+        self.configure_identity(&repo, config);
+        repo
+    }
+
+    fn configure_identity(&self, repo: &Path, config: &Path) {
+        self.git_ok(&["config", "user.name", "Test"], repo, config, &[]);
+        self.git_ok(
+            &["config", "user.email", "test@example.com"],
+            repo,
+            config,
+            &[],
+        );
+        self.git_ok(&["config", "commit.gpgsign", "false"], repo, config, &[]);
+    }
+}
+
+fn assert_success(out: &Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} failed\nstdout:\n{}\nstderr:\n{}",
+        stdout_str(out),
+        stderr_str(out)
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn write_identity(path: &Path, identity: &scrim_crypto::MemberIdentity) {
+    use scrim_crypto::ExposeSecret;
+    let secret = identity.to_secret_string();
+    must(
+        fs::write(path, format!("{}\n", secret.expose_secret())),
+        "write identity file",
+    );
+}
+
+const PRIVATE_SECRET: &str = "billing_api_key_top_secret_value";
+
+/// Creates a repository whose `config/billing/**` and `.billing/**` paths are
+/// encrypted offline for the identity in `config`'s directory, and commits it.
+fn committed_private_repo(harness: &GitHarness, tmp: &Path, config: &Path) -> PathBuf {
+    let repo = harness.init_repo(tmp, "origin-repo", config);
+    must(
+        fs::write(repo.join("README.md"), "public\n"),
+        "write README",
+    );
+    must(
+        fs::create_dir_all(repo.join("config/billing")),
+        "mkdir billing",
+    );
+    must(fs::create_dir_all(repo.join(".billing")), "mkdir .billing");
+    must(
+        fs::write(repo.join("config/billing/old.json"), "{\"legacy\":true}\n"),
+        "write old.json",
+    );
+    harness.git_ok(&["add", "-A"], &repo, config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "initial"], &repo, config, &[]);
+
+    must(
+        fs::write(
+            repo.join("config/billing/secret.json"),
+            format!("{{\"stripe\":\"{PRIVATE_SECRET}\"}}\n"),
+        ),
+        "write secret.json",
+    );
+    must(
+        fs::write(repo.join(".billing/key.txt"), format!("{PRIVATE_SECRET}\n")),
+        "write .billing/key.txt",
+    );
+
+    let add = harness.scrim(
+        &[
+            "private",
+            "add",
+            "config/billing/**",
+            "--group",
+            "finance",
+            "--offline",
+        ],
+        &repo,
+        config,
+        &[],
+    );
+    assert_success(&add, "scrim private add");
+    let add_stdout = stdout_str(&add);
+    assert!(add_stdout.contains("Protected 'config/billing/**' with group 'finance'"));
+    assert!(add_stdout.contains("Created group key 'finance' (generation 1, 1 recipient(s))"));
+    assert!(add_stdout.contains("Encrypted tracked file(s):"));
+    assert!(add_stdout.contains("config/billing/old.json"));
+
+    let add_dot = harness.scrim(
+        &[
+            "private",
+            "add",
+            ".billing/**",
+            "--group",
+            "finance",
+            "--offline",
+        ],
+        &repo,
+        config,
+        &[],
+    );
+    assert_success(&add_dot, "scrim private add .billing/**");
+    assert!(!stdout_str(&add_dot).contains("Created group key"));
+
+    harness.git_ok(&["add", "-A"], &repo, config, &[]);
+    harness.git_ok(
+        &["commit", "-q", "-m", "protect billing"],
+        &repo,
+        config,
+        &[],
+    );
+    repo
+}
+
+#[test]
+fn offline_private_add_commit_status_and_rm() {
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let cfg = tmp.path().join("alice-cfg");
+    must(fs::create_dir_all(&cfg), "mkdir cfg");
+    let config = cfg.join("config.toml");
+    write_identity(
+        &cfg.join("identity.age"),
+        &scrim_crypto::MemberIdentity::generate(),
+    );
+
+    let repo = committed_private_repo(&harness, tmp.path(), &config);
+
+    for path in [
+        "config/billing/secret.json",
+        ".billing/key.txt",
+        "config/billing/old.json",
+    ] {
+        let blob = harness.git_ok(
+            &["cat-file", "blob", &format!("HEAD:{path}")],
+            &repo,
+            &config,
+            &[],
+        );
+        assert!(
+            blob.stdout.starts_with(b"SCRIMFILE\0"),
+            "{path} not encrypted"
+        );
+        assert!(!contains_bytes(&blob.stdout, PRIVATE_SECRET.as_bytes()));
+        assert!(!contains_bytes(&blob.stdout, b"legacy"));
+    }
+    // The working tree keeps plaintext and Git sees no changes.
+    let on_disk = must(
+        fs::read_to_string(repo.join("config/billing/secret.json")),
+        "read secret",
+    );
+    assert!(on_disk.contains(PRIVATE_SECRET));
+    let status = harness.git_ok(&["status", "--porcelain"], &repo, &config, &[]);
+    assert_eq!(stdout_str(&status), "");
+
+    let attributes = must(
+        fs::read_to_string(repo.join(".gitattributes")),
+        "read .gitattributes",
+    );
+    assert!(attributes.contains("config/billing/** filter=scrim"));
+    assert!(attributes.contains(".billing/** filter=scrim"));
+
+    let private_status = harness.scrim(&["private", "status"], &repo, &config, &[]);
+    assert_success(&private_status, "scrim private status");
+    let status_out = stdout_str(&private_status);
+    assert!(status_out.contains("Filter: configured"));
+    assert!(status_out.contains("config/billing/** -> finance"));
+    assert!(status_out.contains("finance: generation 1, 1 recipient(s), access: yes"));
+    assert!(status_out.contains("config/billing/secret.json [finance]: decrypted"));
+
+    // Unprotecting stores plaintext again and drops the rule.
+    let rm = harness.scrim(&["private", "rm", "config/billing/**"], &repo, &config, &[]);
+    assert_success(&rm, "scrim private rm");
+    assert!(stdout_str(&rm).contains("Stored as plaintext again:"));
+    harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "unprotect"], &repo, &config, &[]);
+    let plain = harness.git_ok(
+        &["cat-file", "blob", "HEAD:config/billing/secret.json"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert!(contains_bytes(&plain.stdout, PRIVATE_SECRET.as_bytes()));
+    let still_private = harness.git_ok(
+        &["cat-file", "blob", "HEAD:.billing/key.txt"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert!(still_private.stdout.starts_with(b"SCRIMFILE\0"));
+    let attributes = must(
+        fs::read_to_string(repo.join(".gitattributes")),
+        "read .gitattributes",
+    );
+    assert!(!attributes.contains("config/billing/**"));
+    let status = harness.git_ok(&["status", "--porcelain"], &repo, &config, &[]);
+    assert_eq!(stdout_str(&status), "");
+
+    let missing_rule = harness.scrim(&["private", "rm", "config/billing/**"], &repo, &config, &[]);
+    assert!(!missing_rule.status.success());
+}
+
+#[test]
+fn clones_show_placeholders_to_non_members_and_plaintext_to_members() {
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let alice_cfg = tmp.path().join("alice-cfg");
+    must(fs::create_dir_all(&alice_cfg), "mkdir alice cfg");
+    let alice_config = alice_cfg.join("config.toml");
+    write_identity(
+        &alice_cfg.join("identity.age"),
+        &scrim_crypto::MemberIdentity::generate(),
+    );
+    let origin = committed_private_repo(&harness, tmp.path(), &alice_config);
+    let origin_str = origin.to_string_lossy().into_owned();
+    let secret_path = "config/billing/secret.json";
+
+    // A non-member (no identity at all) clones without the filter, then runs setup.
+    let nobody_cfg = tmp.path().join("nobody-cfg");
+    must(fs::create_dir_all(&nobody_cfg), "mkdir nobody cfg");
+    let nobody_config = nobody_cfg.join("config.toml");
+    harness.git_ok(
+        &["clone", "-q", &origin_str, "nobody-clone"],
+        tmp.path(),
+        &nobody_config,
+        &[],
+    );
+    let clone = tmp.path().join("nobody-clone");
+    harness.configure_identity(&clone, &nobody_config);
+    let raw = must(fs::read(clone.join(secret_path)), "read raw clone file");
+    assert!(raw.starts_with(b"SCRIMFILE\0"));
+
+    let setup = harness.scrim(&["private", "setup"], &clone, &nobody_config, &[]);
+    assert_success(&setup, "scrim private setup");
+    assert!(stdout_str(&setup).contains("Refreshed 3 private file(s)"));
+    for path in [secret_path, ".billing/key.txt"] {
+        let shown = must(fs::read_to_string(clone.join(path)), "read placeholder");
+        assert!(
+            shown.starts_with("# scrim: encrypted private file"),
+            "{path}: {shown}"
+        );
+        assert!(!shown.contains(PRIVATE_SECRET));
+    }
+    let status = harness.git_ok(&["status", "--porcelain"], &clone, &nobody_config, &[]);
+    assert_eq!(stdout_str(&status), "");
+    let private_status = harness.scrim(&["private", "status"], &clone, &nobody_config, &[]);
+    assert_success(&private_status, "scrim private status (non-member)");
+    assert!(stdout_str(&private_status).contains("access: unknown (no identity)"));
+    assert!(stdout_str(&private_status).contains("placeholder (no access)"));
+
+    // Committing unrelated work leaves the encrypted blob untouched.
+    let original_blob = harness.git_ok(
+        &["rev-parse", &format!("HEAD:{secret_path}")],
+        &clone,
+        &nobody_config,
+        &[],
+    );
+    must(
+        fs::write(clone.join("notes.txt"), "unrelated\n"),
+        "write notes",
+    );
+    harness.git_ok(&["add", "-A"], &clone, &nobody_config, &[]);
+    harness.git_ok(
+        &["commit", "-q", "-m", "notes"],
+        &clone,
+        &nobody_config,
+        &[],
+    );
+    let after_blob = harness.git_ok(
+        &["rev-parse", &format!("HEAD:{secret_path}")],
+        &clone,
+        &nobody_config,
+        &[],
+    );
+    assert_eq!(stdout_str(&original_blob), stdout_str(&after_blob));
+
+    // Editing the placeholder, or replacing it with plaintext, is refused.
+    let placeholder = must(
+        fs::read_to_string(clone.join(secret_path)),
+        "read placeholder",
+    );
+    must(
+        fs::write(clone.join(secret_path), format!("{placeholder}edited\n")),
+        "edit placeholder",
+    );
+    let edited_add = harness.git(&["add", secret_path], &clone, &nobody_config, &[]);
+    assert!(!edited_add.status.success());
+    assert!(
+        stderr_str(&edited_add).contains("edited or corrupted"),
+        "{}",
+        stderr_str(&edited_add)
+    );
+
+    must(
+        fs::write(clone.join(secret_path), "{\"stripe\":\"replaced\"}\n"),
+        "overwrite placeholder",
+    );
+    let bob_secret = {
+        use scrim_crypto::ExposeSecret;
+        scrim_crypto::MemberIdentity::generate()
+            .to_secret_string()
+            .expose_secret()
+            .to_owned()
+    };
+    let overwrite_add = harness.git(
+        &["add", secret_path],
+        &clone,
+        &nobody_config,
+        &[("SCRIM_KEY", &bob_secret)],
+    );
+    assert!(!overwrite_add.status.success());
+    assert!(
+        stderr_str(&overwrite_add).contains("not a member"),
+        "{}",
+        stderr_str(&overwrite_add)
+    );
+    let no_identity_add = harness.git(&["add", secret_path], &clone, &nobody_config, &[]);
+    assert!(!no_identity_add.status.success());
+    assert!(stderr_str(&no_identity_add).contains("no Scrim identity"));
+
+    // A member cloning with the filter configured gets plaintext immediately,
+    // even for private dotfiles checked out before `.scrim/` exists.
+    harness.git_ok(
+        &[
+            "clone",
+            "-q",
+            "-c",
+            "filter.scrim.process=scrim filter-process",
+            "-c",
+            "filter.scrim.required=true",
+            &origin_str,
+            "member-clone",
+        ],
+        tmp.path(),
+        &alice_config,
+        &[],
+    );
+    let member_clone = tmp.path().join("member-clone");
+    for path in [secret_path, ".billing/key.txt"] {
+        let shown = must(
+            fs::read_to_string(member_clone.join(path)),
+            "read member file",
+        );
+        assert!(shown.contains(PRIVATE_SECRET), "{path}: {shown}");
+    }
+    let status = harness.git_ok(
+        &["status", "--porcelain"],
+        &member_clone,
+        &alice_config,
+        &[],
+    );
+    assert_eq!(stdout_str(&status), "");
+}
+
+#[test]
+fn online_private_add_sync_and_revoke_rotate_group_keys() {
+    use scrim_crypto::{ExposeSecret, MemberIdentity, parse_encrypted_file_header};
+
+    let alice = MemberIdentity::generate();
+    let bob = MemberIdentity::generate();
+    let alice_pk = alice.public_key().as_str().to_owned();
+    let bob_pk = bob.public_key().as_str().to_owned();
+    let bob_secret = bob.to_secret_string().expose_secret().to_owned();
+    let alice_secret = alice.to_secret_string().expose_secret().to_owned();
+
+    let bob_active = Arc::new(AtomicBool::new(true));
+    let bob_active_srv = Arc::clone(&bob_active);
+    let server = MockServer::start(
+        move |req| match (req.method.as_str(), req.target.as_str()) {
+            ("GET", "/api/v1/groups/finance/recipients") => {
+                let bob_entry = if bob_active_srv.load(Ordering::Relaxed) {
+                    format!(r#",{{"member":"bob","public_key":"{bob_pk}"}}"#)
+                } else {
+                    String::new()
+                };
+                (
+                    200,
+                    format!(
+                        r#"{{"group":"finance","recipients":[{{"member":"alice","public_key":"{alice_pk}"}}{bob_entry}],"members_without_key":["carol"]}}"#
+                    ),
+                )
+            }
+            ("DELETE", "/api/v1/members/bob") => {
+                bob_active_srv.store(false, Ordering::Relaxed);
+                (200, r#"{"name":"bob","revoked":true}"#.to_owned())
+            }
+            _ => (
+                404,
+                format!(r#"{{"error":"unexpected {} {}"}}"#, req.method, req.target),
+            ),
+        },
+    );
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let cfg = tmp.path().join("cfg");
+    must(fs::create_dir_all(&cfg), "mkdir cfg");
+    let config = cfg.join("config.toml");
+    must(
+        fs::write(
+            &config,
+            format!("server = \"{}\"\ntoken = \"scrim_admin\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+    write_identity(&cfg.join("identity.age"), &alice);
+
+    let repo = harness.init_repo(tmp.path(), "online-repo", &config);
+    must(fs::create_dir_all(repo.join("config")), "mkdir config");
+    must(
+        fs::write(
+            repo.join("config/app.env"),
+            format!("KEY={PRIVATE_SECRET}\n"),
+        ),
+        "write app.env",
+    );
+
+    let add = harness.scrim(
+        &["private", "add", "config/**", "--group", "finance"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&add, "scrim private add (online)");
+    assert!(stdout_str(&add).contains("generation 1, 2 recipient(s)"));
+    assert!(stderr_str(&add).contains("carol"));
+    harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "gen1"], &repo, &config, &[]);
+
+    let read_as = |secret: &str| -> Vec<u8> {
+        let out = harness.git_ok(
+            &["cat-file", "--filters", "HEAD:config/app.env"],
+            &repo,
+            &config,
+            &[("SCRIM_KEY", secret)],
+        );
+        out.stdout
+    };
+    let generation = || -> u64 {
+        let out = harness.git_ok(
+            &["cat-file", "blob", "HEAD:config/app.env"],
+            &repo,
+            &config,
+            &[],
+        );
+        must(parse_encrypted_file_header(&out.stdout), "parse header").generation
+    };
+    let commit_all = |message: &str| {
+        harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+        harness.git_ok(&["commit", "-q", "-m", message], &repo, &config, &[]);
+        let status = harness.git_ok(&["status", "--porcelain"], &repo, &config, &[]);
+        assert_eq!(stdout_str(&status), "");
+    };
+    assert_eq!(generation(), 1);
+    assert!(contains_bytes(
+        &read_as(&bob_secret),
+        PRIVATE_SECRET.as_bytes()
+    ));
+
+    // Removing bob on the server and syncing rotates to generation 2.
+    bob_active.store(false, Ordering::Relaxed);
+    let sync = harness.scrim(
+        &["private", "sync", "--group", "finance"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&sync, "scrim private sync");
+    let sync_out = stdout_str(&sync);
+    assert!(sync_out.contains("Synced group 'finance' to generation 2 (1 recipient(s))"));
+    assert!(sync_out.contains("Removed recipient(s): bob"));
+    assert!(sync_out.contains("config/app.env"));
+    commit_all("gen2");
+    assert_eq!(generation(), 2);
+    let bob_view = read_as(&bob_secret);
+    assert!(!contains_bytes(&bob_view, PRIVATE_SECRET.as_bytes()));
+    assert!(bob_view.starts_with(b"# scrim: encrypted private file"));
+    assert!(contains_bytes(
+        &read_as(&alice_secret),
+        PRIVATE_SECRET.as_bytes()
+    ));
+
+    // Bob returns (generation 3), then `scrim access revoke bob` rotates again.
+    bob_active.store(true, Ordering::Relaxed);
+    let sync_back = harness.scrim(
+        &["private", "sync", "--group", "finance"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&sync_back, "scrim private sync (bob back)");
+    commit_all("gen3");
+    assert!(contains_bytes(
+        &read_as(&bob_secret),
+        PRIVATE_SECRET.as_bytes()
+    ));
+
+    let revoke = harness.scrim(&["access", "revoke", "bob"], &repo, &config, &[]);
+    assert_success(&revoke, "scrim access revoke bob");
+    let revoke_out = stdout_str(&revoke);
+    assert!(revoke_out.contains("Revoked access for bob"));
+    assert!(revoke_out.contains("Rotated group key 'finance' to generation 4"));
+    assert!(
+        revoke_out.contains("Private files re-encrypted (review/rotate any embedded credentials):")
+    );
+    assert!(revoke_out.contains("config/app.env"));
+    assert!(revoke_out.contains("Remember to commit and push the updated .scrim/ files."));
+    commit_all("gen4");
+    assert_eq!(generation(), 4);
+    assert!(!contains_bytes(
+        &read_as(&bob_secret),
+        PRIVATE_SECRET.as_bytes()
+    ));
+    assert!(contains_bytes(
+        &read_as(&alice_secret),
+        PRIVATE_SECRET.as_bytes()
+    ));
+
+    let requests = server.take_requests();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.authorization.as_deref() == Some("Bearer scrim_admin"))
+    );
+}
