@@ -25,6 +25,11 @@ use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef";
 const DEV_TOKEN: &str = "dev-token-0123456789abcdef";
+const TEST_AGE_KEY_1: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+const TEST_AGE_KEY_2: &str = "age1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqerzwta";
+const TEST_AGE_KEY_3: &str = "age1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqxpnvqe";
+const TEST_AGE_KEY_ALL_ZERO: &str =
+    "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5cu47z";
 
 /// A router over a [`MemoryPolicyStore`] holding the admin `root` (ID 1) and
 /// the non-admin `dev` (ID 2), with a handle on the shared store.
@@ -255,6 +260,26 @@ fn admin_routes() -> Vec<(Method, &'static str, Option<Value>)> {
             "/api/v1/branch-rules?repo=new.git&pattern=refs%2Fheads%2Fprivate%2F*",
             None,
         ),
+        (
+            Method::PUT,
+            "/api/v1/members/dev/public-key",
+            Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({
+                "repository": "new.git",
+                "scope": "dev",
+                "groups": ["core"],
+            })),
+        ),
+        (Method::GET, "/api/v1/secret-scopes?repo=new.git", None),
+        (
+            Method::DELETE,
+            "/api/v1/secret-scopes?repo=new.git&scope=dev",
+            None,
+        ),
     ]
 }
 
@@ -269,7 +294,7 @@ async fn whoami_reports_the_authenticated_member() {
     assert_no_store(&admin);
     assert_eq!(
         admin.json,
-        json!({ "id": 1, "name": "root", "is_admin": true, "groups": [] })
+        json!({ "id": 1, "name": "root", "is_admin": true, "groups": [], "public_key": null })
     );
 
     let dev = api
@@ -278,7 +303,7 @@ async fn whoami_reports_the_authenticated_member() {
     assert_eq!(dev.status, StatusCode::OK);
     assert_eq!(
         dev.json,
-        json!({ "id": 2, "name": "dev", "is_admin": false, "groups": ["core"] })
+        json!({ "id": 2, "name": "dev", "is_admin": false, "groups": ["core"], "public_key": null })
     );
 }
 
@@ -300,7 +325,7 @@ async fn whoami_works_with_the_static_token() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
         reply.json,
-        json!({ "id": 0, "name": "static-token", "is_admin": true, "groups": [] })
+        json!({ "id": 0, "name": "static-token", "is_admin": true, "groups": [], "public_key": null })
     );
 }
 
@@ -311,7 +336,18 @@ async fn static_store_answers_administration_with_not_implemented() {
         Err(error) => panic!("failed to create repo root: {error}"),
     };
     let router = scrim_server::router(root.path().to_path_buf(), test_auth());
-    for (method, uri, body) in admin_routes() {
+    let mut routes = admin_routes();
+    routes.push((
+        Method::PUT,
+        "/api/v1/me/public-key",
+        Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+    ));
+    routes.push((
+        Method::GET,
+        "/api/v1/secret-scopes/recipients?repo=new.git&scope=dev",
+        None,
+    ));
+    for (method, uri, body) in routes {
         let reply = send(&router, method.clone(), uri, Some(TEST_TOKEN), body).await;
         assert_eq!(
             reply.status,
@@ -1141,6 +1177,7 @@ async fn every_change_is_audited_without_tokens() {
         json!({
             "is_admin": false,
             "is_machine": false,
+            "has_public_key": false,
             "groups": ["core"],
             "token_label": "",
         })
@@ -1446,4 +1483,490 @@ fn bootstrap_admin_is_listed_and_serving_still_needs_its_arguments() {
 
     let stderr = run_failing(scrim_server_command().args(["--listen", "127.0.0.1:0"]));
     assert!(stderr.contains("--repo-root"), "{stderr}");
+}
+
+#[tokio::test]
+async fn member_public_key_lifecycle() {
+    let api = Api::new();
+    api.create_group("core").await;
+
+    let dev_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(DEV_TOKEN), None)
+        .await;
+    assert_eq!(dev_whoami.status, StatusCode::OK);
+    assert_eq!(dev_whoami.json.get("public_key"), Some(&json!(null)));
+
+    // Non-admin can update their own public key.
+    let updated_own = api
+        .call(
+            Method::PUT,
+            "/api/v1/me/public-key",
+            Some(DEV_TOKEN),
+            Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        )
+        .await;
+    assert_eq!(updated_own.status, StatusCode::OK);
+    assert_no_store(&updated_own);
+    assert_eq!(
+        updated_own.json,
+        json!({ "name": "dev", "public_key": TEST_AGE_KEY_1 })
+    );
+
+    let dev_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(DEV_TOKEN), None)
+        .await;
+    assert_eq!(dev_whoami.status, StatusCode::OK);
+    assert_eq!(
+        dev_whoami.json.get("public_key"),
+        Some(&json!(TEST_AGE_KEY_1))
+    );
+
+    // Non-admin cannot set another member's public key.
+    let forbidden = api
+        .call(
+            Method::PUT,
+            "/api/v1/members/root/public-key",
+            Some(DEV_TOKEN),
+            Some(json!({ "public_key": TEST_AGE_KEY_2 })),
+        )
+        .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden.error(), "admin privileges required");
+
+    // Admin can set public_key at member creation and update it later.
+    let alice = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members",
+            Some(json!({
+                "name": "alice",
+                "groups": ["core"],
+                "public_key": TEST_AGE_KEY_2,
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let alice_token = string_field(&alice, "token");
+    assert_eq!(
+        alice.pointer("/member/public_key"),
+        Some(&json!(TEST_AGE_KEY_2))
+    );
+
+    let alice_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(&alice_token), None)
+        .await;
+    assert_eq!(alice_whoami.status, StatusCode::OK);
+    assert_eq!(
+        alice_whoami.json.get("public_key"),
+        Some(&json!(TEST_AGE_KEY_2))
+    );
+
+    let updated_alice = api
+        .admin_expect(
+            Method::PUT,
+            "/api/v1/members/alice/public-key",
+            Some(json!({ "public_key": TEST_AGE_KEY_3 })),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        updated_alice,
+        json!({ "name": "alice", "public_key": TEST_AGE_KEY_3 })
+    );
+
+    let members = api
+        .admin_expect(Method::GET, "/api/v1/members", None, StatusCode::OK)
+        .await;
+    let Some(member_list) = members.get("members").and_then(Value::as_array) else {
+        panic!("missing members in {members}");
+    };
+    let alice_entry = member_list
+        .iter()
+        .find(|entry| entry.get("name") == Some(&json!("alice")));
+    assert_eq!(
+        alice_entry.and_then(|entry| entry.get("public_key")),
+        Some(&json!(TEST_AGE_KEY_3))
+    );
+
+    // Invalid age public keys fail with 400 Bad Request everywhere.
+    let mut bad_checksum = TEST_AGE_KEY_1.to_owned();
+    bad_checksum.pop();
+    bad_checksum.push('q');
+    for invalid_key in [
+        "not-a-key",
+        bad_checksum.as_str(),
+        TEST_AGE_KEY_ALL_ZERO,
+        "",
+    ] {
+        let create_bad = api
+            .admin(
+                Method::POST,
+                "/api/v1/members",
+                Some(json!({ "name": "badkey", "public_key": invalid_key })),
+            )
+            .await;
+        assert_eq!(
+            create_bad.status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_key:?}"
+        );
+
+        let own_bad = api
+            .call(
+                Method::PUT,
+                "/api/v1/me/public-key",
+                Some(DEV_TOKEN),
+                Some(json!({ "public_key": invalid_key })),
+            )
+            .await;
+        assert_eq!(own_bad.status, StatusCode::BAD_REQUEST, "{invalid_key:?}");
+
+        let admin_bad = api
+            .admin(
+                Method::PUT,
+                "/api/v1/members/alice/public-key",
+                Some(json!({ "public_key": invalid_key })),
+            )
+            .await;
+        assert_eq!(admin_bad.status, StatusCode::BAD_REQUEST, "{invalid_key:?}");
+    }
+
+    // Unknown and revoked members return 404 Not Found.
+    let missing_member = api
+        .admin(
+            Method::PUT,
+            "/api/v1/members/nobody/public-key",
+            Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        )
+        .await;
+    assert_eq!(missing_member.status, StatusCode::NOT_FOUND);
+
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/members/alice",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let revoked_member = api
+        .admin(
+            Method::PUT,
+            "/api/v1/members/alice/public-key",
+            Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        )
+        .await;
+    assert_eq!(revoked_member.status, StatusCode::NOT_FOUND);
+
+    // Audit log records member.public_key_set and has_public_key.
+    let entries = api.store.audit_entries();
+    assert!(entries.iter().any(|entry| {
+        entry.action == "member.public_key_set"
+            && entry.actor_member_id == Some(2)
+            && entry.target_type == "member"
+            && entry.target_name == "dev"
+            && entry.details == json!({ "public_key": TEST_AGE_KEY_1 })
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.action == "member.public_key_set"
+            && entry.actor_member_id == Some(1)
+            && entry.target_type == "member"
+            && entry.target_name == "alice"
+            && entry.details == json!({ "public_key": TEST_AGE_KEY_3 })
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.action == "member.grant"
+            && entry.target_name == "alice"
+            && entry.details.get("has_public_key") == Some(&json!(true))
+    }));
+}
+
+#[tokio::test]
+async fn secret_scopes_and_recipients_lifecycle() {
+    let api = Api::new();
+    api.create_group("core").await;
+    api.create_group("security").await;
+    api.create_group("ops").await;
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/repositories",
+        Some(json!({ "path": "team/app.git" })),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    let alice_created = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members",
+            Some(json!({
+                "name": "alice",
+                "groups": ["core", "security"],
+                "public_key": TEST_AGE_KEY_1,
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let alice_token = string_field(&alice_created, "token");
+
+    let _bob_token = api.create_member("bob", &["core"]).await;
+
+    let charlie_created = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members",
+            Some(json!({
+                "name": "charlie",
+                "groups": ["ops"],
+                "public_key": TEST_AGE_KEY_2,
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let charlie_token = string_field(&charlie_created, "token");
+
+    let _revoked_token = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members",
+            Some(json!({
+                "name": "revoked_user",
+                "groups": ["core"],
+                "public_key": TEST_AGE_KEY_3,
+            })),
+            StatusCode::CREATED,
+        )
+        .await;
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/members/revoked_user",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // Validation and missing-target errors on secret scope admin endpoints.
+    let invalid_cases = vec![
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({ "repository": "team/app.git", "scope": "-bad", "groups": ["core"] })),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({ "repository": "team/app.git", "scope": "dev", "groups": [] })),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({ "repository": "../bad.git", "scope": "dev", "groups": ["core"] })),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({ "repository": "missing.git", "scope": "dev", "groups": ["core"] })),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({ "repository": "team/app.git", "scope": "dev", "groups": ["ghosts"] })),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/api/v1/secret-scopes?repo=missing.git",
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/secret-scopes?repo=team/app.git&scope=missing",
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (method, uri, body, expected_status) in invalid_cases {
+        let reply = api.admin(method.clone(), uri, body).await;
+        assert_eq!(
+            reply.status, expected_status,
+            "{method} {uri}: {}",
+            reply.json
+        );
+    }
+
+    // Create scopes: `prod` then `dev`, then update `dev` groups.
+    let prod = api
+        .admin_expect(
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({
+                "repository": "team/app.git",
+                "scope": "prod",
+                "groups": ["ops"],
+            })),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        prod,
+        json!({ "repository": "team/app.git", "scope": "prod", "groups": ["ops"] })
+    );
+
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/secret-scopes",
+        Some(json!({
+            "repository": "team/app.git",
+            "scope": "dev",
+            "groups": ["core"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let dev_updated = api
+        .admin_expect(
+            Method::PUT,
+            "/api/v1/secret-scopes",
+            Some(json!({
+                "repository": "team/app.git",
+                "scope": "dev",
+                "groups": ["security", "core"],
+            })),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        dev_updated,
+        json!({ "repository": "team/app.git", "scope": "dev", "groups": ["core", "security"] })
+    );
+
+    let listed = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/secret-scopes?repo=team%2Fapp.git",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        listed,
+        json!({
+            "repository": "team/app.git",
+            "scopes": [
+                { "scope": "dev", "groups": ["core", "security"] },
+                { "scope": "prod", "groups": ["ops"] },
+            ],
+        })
+    );
+
+    // Authorized non-admin (alice) can resolve `dev` recipients; `alice` is deduplicated
+    // across `core` and `security`, `bob` is in `members_without_key`, and `revoked_user` is excluded.
+    let alice_recipients = api
+        .call(
+            Method::GET,
+            "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=dev",
+            Some(&alice_token),
+            None,
+        )
+        .await;
+    assert_eq!(alice_recipients.status, StatusCode::OK);
+    assert_no_store(&alice_recipients);
+    assert_eq!(
+        alice_recipients.json,
+        json!({
+            "repository": "team/app.git",
+            "scope": "dev",
+            "groups": ["core", "security"],
+            "recipients": [{ "member": "alice", "public_key": TEST_AGE_KEY_1 }],
+            "members_without_key": ["bob"],
+        })
+    );
+
+    // Unauthorized non-admin (charlie, only in `ops`) gets 403 for `dev`,
+    // AND 403 (not 404) for non-existent scopes / unregistered repos to prevent enumeration.
+    for uri in [
+        "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=dev",
+        "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=nonexistent",
+        "/api/v1/secret-scopes/recipients?repo=unknown.git&scope=dev",
+    ] {
+        let forbidden = api.call(Method::GET, uri, Some(&charlie_token), None).await;
+        assert_eq!(forbidden.status, StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(
+            forbidden.error(),
+            "access to this secret scope is forbidden"
+        );
+    }
+
+    // Admins can resolve any scope and get 404 for unknown scopes/repos.
+    let admin_prod = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=prod",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        admin_prod,
+        json!({
+            "repository": "team/app.git",
+            "scope": "prod",
+            "groups": ["ops"],
+            "recipients": [{ "member": "charlie", "public_key": TEST_AGE_KEY_2 }],
+            "members_without_key": [],
+        })
+    );
+    let admin_missing = api
+        .admin(
+            Method::GET,
+            "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=nonexistent",
+            None,
+        )
+        .await;
+    assert_eq!(admin_missing.status, StatusCode::NOT_FOUND);
+
+    // Delete `prod` scope and verify it's removed and audited.
+    let removed = api
+        .admin_expect(
+            Method::DELETE,
+            "/api/v1/secret-scopes?repo=team%2Fapp.git&scope=prod",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        removed,
+        json!({ "repository": "team/app.git", "scope": "prod", "removed": true })
+    );
+    let after_delete = api
+        .admin(
+            Method::GET,
+            "/api/v1/secret-scopes/recipients?repo=team%2Fapp.git&scope=prod",
+            None,
+        )
+        .await;
+    assert_eq!(after_delete.status, StatusCode::NOT_FOUND);
+
+    let entries = api.store.audit_entries();
+    assert!(entries.iter().any(|entry| {
+        entry.action == "secret_scope.set"
+            && entry.target_type == "secret_scope"
+            && entry.target_name == "team/app.git:dev"
+            && entry.details
+                == json!({
+                    "repository": "team/app.git",
+                    "scope": "dev",
+                    "groups": ["core", "security"],
+                })
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.action == "secret_scope.remove"
+            && entry.target_type == "secret_scope"
+            && entry.target_name == "team/app.git:prod"
+            && entry.details == json!({ "repository": "team/app.git", "scope": "prod" })
+    }));
 }

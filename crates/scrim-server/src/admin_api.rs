@@ -1,8 +1,10 @@
 //! The admin HTTP API served under `/api/v1`, which the `scrim` CLI talks to.
 //!
 //! Requests arrive already authenticated by [`crate::auth::require_auth`].
-//! `GET /api/v1/whoami` is open to every active member; every other route
-//! requires an admin and answers `403` otherwise. Bodies are JSON (at most
+//! `GET /api/v1/whoami` and `PUT /api/v1/me/public-key` are open to every
+//! active member, and `GET /api/v1/secret-scopes/recipients` is open to
+//! members belonging to the scope's groups (as well as admins); every other
+//! route requires an admin and answers `403` otherwise. Bodies are JSON (at most
 //! [`MAX_ADMIN_BODY_BYTES`] after decompression), every response carries
 //! `Cache-Control: no-store`, and every error is `{"error": "<message>"}`.
 //! Internal failures are logged and answered with a generic `500` message so
@@ -19,7 +21,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header, request::Parts},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
@@ -27,7 +29,7 @@ use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use crate::{
     policy_store::{
         AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, MemberRecord, PolicyStore,
-        PolicyStoreError, validate_repository_path,
+        PolicyStoreError, SecretScopeRecord, validate_repository_path,
     },
     repo_path::{BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo},
 };
@@ -47,6 +49,7 @@ struct AdminState {
 pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> Router {
     Router::new()
         .route("/whoami", get(whoami))
+        .route("/me/public-key", put(set_own_public_key))
         .route(
             "/repositories",
             get(list_repositories).post(register_repository),
@@ -60,11 +63,22 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
         .route("/members", get(list_members).post(create_member))
         .route("/members/{name}", delete(revoke_member))
         .route("/members/{name}/tokens", post(issue_member_token))
+        .route("/members/{name}/public-key", put(set_member_public_key))
         .route(
             "/branch-rules",
             get(list_branch_rules)
                 .put(set_branch_rule)
                 .delete(remove_branch_rule),
+        )
+        .route(
+            "/secret-scopes",
+            get(list_secret_scopes)
+                .put(set_secret_scope)
+                .delete(remove_secret_scope),
+        )
+        .route(
+            "/secret-scopes/recipients",
+            get(get_secret_scope_recipients),
         )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -263,21 +277,28 @@ struct WhoamiResponse {
     name: String,
     is_admin: bool,
     groups: Vec<String>,
+    public_key: Option<String>,
 }
 
 async fn whoami(
     State(state): State<AdminState>,
     CurrentMember(member): CurrentMember,
 ) -> ApiResult<WhoamiResponse> {
-    match state.policy_store.list_member_groups(member.id).await {
-        Ok(groups) => ok(WhoamiResponse {
-            id: member.id,
-            name: member.name,
-            is_admin: member.is_admin,
-            groups: groups.into_iter().collect(),
-        }),
-        Err(error) => Err(store_error(error)),
-    }
+    let groups = match state.policy_store.list_member_groups(member.id).await {
+        Ok(groups) => groups,
+        Err(error) => return Err(store_error(error)),
+    };
+    let public_key = match state.policy_store.get_member_public_key(member.id).await {
+        Ok(public_key) => public_key,
+        Err(error) => return Err(store_error(error)),
+    };
+    ok(WhoamiResponse {
+        id: member.id,
+        name: member.name,
+        is_admin: member.is_admin,
+        groups: groups.into_iter().collect(),
+        public_key,
+    })
 }
 
 fn default_true() -> bool {
@@ -529,6 +550,8 @@ struct CreateMemberBody {
     #[serde(default)]
     is_machine: bool,
     #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
     groups: Vec<String>,
     #[serde(default)]
     token_label: String,
@@ -540,6 +563,7 @@ struct MemberResponse {
     name: String,
     is_admin: bool,
     is_machine: bool,
+    public_key: Option<String>,
     groups: Vec<String>,
     revoked: bool,
 }
@@ -551,6 +575,7 @@ impl From<MemberRecord> for MemberResponse {
             name: member.name,
             is_admin: member.is_admin,
             is_machine: member.is_machine,
+            public_key: member.public_key,
             groups: member.groups,
             revoked: member.revoked,
         }
@@ -573,6 +598,7 @@ async fn create_member(
         name: body.name,
         is_admin: body.is_admin,
         is_machine: body.is_machine,
+        public_key: body.public_key,
         groups: body.groups.into_iter().collect(),
         token_label: body.token_label,
     };
@@ -777,4 +803,225 @@ async fn remove_branch_rule(
         }),
         Err(error) => Err(store_error(error)),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPublicKeyBody {
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct MemberPublicKeyResponse {
+    name: String,
+    public_key: String,
+}
+
+async fn set_own_public_key(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiJson(body): ApiJson<SetPublicKeyBody>,
+) -> ApiResult<MemberPublicKeyResponse> {
+    match state
+        .policy_store
+        .set_member_public_key(Some(member.id), &member.name, &body.public_key)
+        .await
+    {
+        Ok(record) => ok(MemberPublicKeyResponse {
+            name: record.name,
+            public_key: record.public_key,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+async fn set_member_public_key(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<SetPublicKeyBody>,
+) -> ApiResult<MemberPublicKeyResponse> {
+    match state
+        .policy_store
+        .set_member_public_key(Some(actor.id), &name, &body.public_key)
+        .await
+    {
+        Ok(record) => ok(MemberPublicKeyResponse {
+            name: record.name,
+            public_key: record.public_key,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSecretScopeBody {
+    repository: String,
+    scope: String,
+    groups: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SecretScopeResponse {
+    repository: String,
+    scope: String,
+    groups: Vec<String>,
+}
+
+async fn set_secret_scope(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiJson(body): ApiJson<SetSecretScopeBody>,
+) -> ApiResult<SecretScopeResponse> {
+    let groups: BTreeSet<String> = body.groups.into_iter().collect();
+    match state
+        .policy_store
+        .set_secret_scope(Some(actor.id), &body.repository, &body.scope, groups)
+        .await
+    {
+        Ok(record) => ok(SecretScopeResponse {
+            repository: record.repository,
+            scope: record.scope,
+            groups: record.groups,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSecretScopesQuery {
+    repo: String,
+}
+
+#[derive(Serialize)]
+struct SecretScopeSummary {
+    scope: String,
+    groups: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SecretScopesResponse {
+    repository: String,
+    scopes: Vec<SecretScopeSummary>,
+}
+
+async fn list_secret_scopes(
+    State(state): State<AdminState>,
+    AdminMember(_actor): AdminMember,
+    ApiQuery(query): ApiQuery<ListSecretScopesQuery>,
+) -> ApiResult<SecretScopesResponse> {
+    match state.policy_store.list_secret_scopes(&query.repo).await {
+        Ok(scopes) => ok(SecretScopesResponse {
+            repository: query.repo,
+            scopes: scopes
+                .into_iter()
+                .map(|record: SecretScopeRecord| SecretScopeSummary {
+                    scope: record.scope,
+                    groups: record.groups,
+                })
+                .collect(),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretScopeQuery {
+    repo: String,
+    scope: String,
+}
+
+#[derive(Serialize)]
+struct SecretScopeRemovedResponse {
+    repository: String,
+    scope: String,
+    removed: bool,
+}
+
+async fn remove_secret_scope(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiQuery(query): ApiQuery<SecretScopeQuery>,
+) -> ApiResult<SecretScopeRemovedResponse> {
+    match state
+        .policy_store
+        .remove_secret_scope(Some(actor.id), &query.repo, &query.scope)
+        .await
+    {
+        Ok(removed) => ok(SecretScopeRemovedResponse {
+            repository: query.repo,
+            scope: query.scope,
+            removed,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Serialize)]
+struct ScopeRecipientResponse {
+    member: String,
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct ScopeRecipientsResponse {
+    repository: String,
+    scope: String,
+    groups: Vec<String>,
+    recipients: Vec<ScopeRecipientResponse>,
+    members_without_key: Vec<String>,
+}
+
+async fn get_secret_scope_recipients(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiQuery(query): ApiQuery<SecretScopeQuery>,
+) -> ApiResult<ScopeRecipientsResponse> {
+    let record = match state
+        .policy_store
+        .resolve_secret_scope_recipients(&query.repo, &query.scope)
+        .await
+    {
+        Ok(record) => record,
+        Err(PolicyStoreError::NotFound(_)) if !member.is_admin => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "access to this secret scope is forbidden",
+            ));
+        }
+        Err(error) => return Err(store_error(error)),
+    };
+    if !member.is_admin {
+        let member_groups = match state.policy_store.list_member_groups(member.id).await {
+            Ok(groups) => groups,
+            Err(error) => return Err(store_error(error)),
+        };
+        let is_authorized = record
+            .groups
+            .iter()
+            .any(|group| member_groups.contains(group));
+        if !is_authorized {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "access to this secret scope is forbidden",
+            ));
+        }
+    }
+    ok(ScopeRecipientsResponse {
+        repository: record.repository,
+        scope: record.scope,
+        groups: record.groups,
+        recipients: record
+            .recipients
+            .into_iter()
+            .map(|recipient| ScopeRecipientResponse {
+                member: recipient.member,
+                public_key: recipient.public_key,
+            })
+            .collect(),
+        members_without_key: record.members_without_key,
+    })
 }

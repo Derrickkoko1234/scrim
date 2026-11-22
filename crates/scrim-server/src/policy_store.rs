@@ -36,6 +36,9 @@ use crate::{
 /// Maximum byte length of a member or group name.
 pub const MAX_NAME_BYTES: usize = 64;
 
+/// Maximum byte length of a secret scope name.
+pub const MAX_SCOPE_NAME_BYTES: usize = 64;
+
 /// Maximum byte length of a token label.
 pub const MAX_TOKEN_LABEL_BYTES: usize = 128;
 
@@ -172,6 +175,8 @@ pub struct MemberRecord {
     pub is_admin: bool,
     /// Whether the member is a machine account (CI, bots).
     pub is_machine: bool,
+    /// Optional `age` public key registered for the member.
+    pub public_key: Option<String>,
     /// Names of the member's groups, sorted ascending.
     pub groups: Vec<String>,
     /// Whether the member has been revoked.
@@ -187,10 +192,21 @@ pub struct CreateMemberRequest {
     pub is_admin: bool,
     /// Whether the member is a machine account.
     pub is_machine: bool,
+    /// Optional `age` public key to attach to the member at creation.
+    pub public_key: Option<String>,
     /// Existing groups to add the member to.
     pub groups: BTreeSet<String>,
     /// Label of the member's first token; see [`MAX_TOKEN_LABEL_BYTES`].
     pub token_label: String,
+}
+
+/// Outcome of [`PolicyStore::set_member_public_key`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberPublicKeyRecord {
+    /// Name of the member.
+    pub name: String,
+    /// Validated `age` public key stored for the member.
+    pub public_key: String,
 }
 
 /// A newly created member and their first token.
@@ -232,6 +248,41 @@ pub struct BranchRuleRecord {
     pub pattern: String,
     /// Groups allowed to see matching refs, sorted ascending.
     pub groups: Vec<String>,
+}
+
+/// One secret scope of a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretScopeRecord {
+    /// Canonical key of the repository the scope belongs to.
+    pub repository: String,
+    /// Name of the secret scope (e.g. `dev`, `staging`, `prod`).
+    pub scope: String,
+    /// Groups allowed to access secrets in this scope, sorted ascending.
+    pub groups: Vec<String>,
+}
+
+/// An active member and their registered `age` public key for a secret scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeRecipient {
+    /// Unique member name.
+    pub member: String,
+    /// Validated `age` public key.
+    pub public_key: String,
+}
+
+/// Resolved recipients and missing-key members for a repository secret scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeRecipientsRecord {
+    /// Canonical key of the repository the scope belongs to.
+    pub repository: String,
+    /// Name of the secret scope.
+    pub scope: String,
+    /// Groups authorized for this scope, sorted ascending.
+    pub groups: Vec<String>,
+    /// Active members in those groups who have a public key, sorted by member name ascending.
+    pub recipients: Vec<ScopeRecipient>,
+    /// Active members in those groups without a public key, sorted ascending.
+    pub members_without_key: Vec<String>,
 }
 
 /// Errors a [`PolicyStore`] reports. Callers must treat every error as "deny".
@@ -509,6 +560,83 @@ pub trait PolicyStore: Send + Sync + 'static {
         let _ = (name, token_label);
         unsupported()
     }
+
+    /// Returns the `age` public key of the active member `member_id`, or `None`
+    /// if none is registered.
+    fn get_member_public_key<'a>(
+        &'a self,
+        member_id: i64,
+    ) -> PolicyStoreFuture<'a, Option<String>> {
+        let _ = member_id;
+        unsupported()
+    }
+
+    /// Sets `member_name`'s `age` public key to `public_key`.
+    ///
+    /// Requires an active (non-revoked) member (`PolicyStoreError::NotFound` if
+    /// missing or revoked).
+    fn set_member_public_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberPublicKeyRecord> {
+        let _ = (actor_member_id, member_name, public_key);
+        unsupported()
+    }
+
+    /// Creates or replaces the secret scope `scope` in `repository`, granting
+    /// access to the (non-empty) `groups`.
+    ///
+    /// [`PolicyStoreError::NotFound`] if the repository is not registered or
+    /// any group does not exist.
+    fn set_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, SecretScopeRecord> {
+        let _ = (actor_member_id, repository, scope, groups);
+        unsupported()
+    }
+
+    /// Lists `repository`'s secret scopes sorted by scope name ascending;
+    /// [`PolicyStoreError::NotFound`] if the repository is not registered.
+    fn list_secret_scopes<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<SecretScopeRecord>> {
+        let _ = repository;
+        unsupported()
+    }
+
+    /// Removes the secret scope `scope` from `repository`, returning `true`;
+    /// [`PolicyStoreError::NotFound`] if either does not exist.
+    fn remove_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        let _ = (actor_member_id, repository, scope);
+        unsupported()
+    }
+
+    /// Resolves the authorized groups and active member recipients (split into
+    /// keyed `recipients` and `members_without_key`) for `scope` in
+    /// `repository`.
+    ///
+    /// [`PolicyStoreError::NotFound`] if the repository is not registered or
+    /// the scope does not exist.
+    fn resolve_secret_scope_recipients<'a>(
+        &'a self,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, ScopeRecipientsRecord> {
+        let _ = (repository, scope);
+        unsupported()
+    }
 }
 
 /// Compiles `rules` for `repo_key`, mapping a rejected rule to
@@ -526,44 +654,131 @@ fn compile_branch_policy(
     }
 }
 
-/// Returns whether `name` is 1 to [`MAX_NAME_BYTES`] ASCII bytes, starting
-/// with a letter or digit, followed by letters, digits, `.`, `_` or `-`.
-fn is_valid_name(name: &str) -> bool {
+/// Returns whether `name` is 1 to `max_bytes` ASCII bytes, starting with a
+/// letter or digit, followed by letters, digits, `.`, `_` or `-`.
+fn is_valid_identifier(name: &str, max_bytes: usize) -> bool {
     let Some((first, rest)) = name.as_bytes().split_first() else {
         return false;
     };
-    name.len() <= MAX_NAME_BYTES
+    name.len() <= max_bytes
         && first.is_ascii_alphanumeric()
         && rest
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-/// Explains the name rules of [`is_valid_name`] for `kind` ("member" or
-/// "group").
-fn invalid_name_error(kind: &str) -> PolicyStoreError {
+/// Explains the identifier rules of [`is_valid_identifier`] for `kind`.
+fn invalid_name_error(kind: &str, max_bytes: usize) -> PolicyStoreError {
     PolicyStoreError::InvalidInput(format!(
-        "invalid {kind} name: use 1 to {MAX_NAME_BYTES} ASCII letters, digits, '.', '_' or '-', \
+        "invalid {kind} name: use 1 to {max_bytes} ASCII letters, digits, '.', '_' or '-', \
          starting with a letter or digit"
     ))
 }
 
-/// Validates a member name (see [`is_valid_name`]).
+/// Validates a member name (see [`is_valid_identifier`]).
 pub(crate) fn validate_member_name(name: &str) -> Result<(), PolicyStoreError> {
-    if is_valid_name(name) {
+    if is_valid_identifier(name, MAX_NAME_BYTES) {
         Ok(())
     } else {
-        Err(invalid_name_error("member"))
+        Err(invalid_name_error("member", MAX_NAME_BYTES))
     }
 }
 
-/// Validates a group name (see [`is_valid_name`]).
+/// Validates a group name (see [`is_valid_identifier`]).
 pub(crate) fn validate_group_name(name: &str) -> Result<(), PolicyStoreError> {
-    if is_valid_name(name) {
+    if is_valid_identifier(name, MAX_NAME_BYTES) {
         Ok(())
     } else {
-        Err(invalid_name_error("group"))
+        Err(invalid_name_error("group", MAX_NAME_BYTES))
     }
+}
+
+/// Validates a secret scope name (see [`is_valid_identifier`]).
+pub(crate) fn validate_scope_name(scope: &str) -> Result<(), PolicyStoreError> {
+    if is_valid_identifier(scope, MAX_SCOPE_NAME_BYTES) {
+        Ok(())
+    } else {
+        Err(invalid_name_error("secret scope", MAX_SCOPE_NAME_BYTES))
+    }
+}
+
+const AGE_PUBLIC_KEY_PREFIX: &str = "age1";
+const AGE_PUBLIC_KEY_LEN: usize = 62;
+const BECH32_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+/// BIP-173 HRP expansion of `"age"`: `[c >> 5 for c in b"age"] ++ [0] ++ [c & 31 for c in b"age"]`.
+const AGE_HRP_EXPANDED: [u8; 7] = [3, 3, 3, 0, 1, 7, 5];
+
+fn bech32_decode_char(byte: u8) -> Option<u8> {
+    for (idx, candidate) in BECH32_CHARSET.iter().enumerate() {
+        if *candidate == byte {
+            return u8::try_from(idx).ok();
+        }
+    }
+    None
+}
+
+fn bech32_polymod(values: impl Iterator<Item = u8>) -> u32 {
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
+    let mut chk: u32 = 1;
+    for value in values {
+        let top = chk >> 25;
+        chk = ((chk & 0x01ff_ffff) << 5) ^ u32::from(value);
+        for (i, generator) in GEN.iter().enumerate() {
+            if (top >> i) & 1 != 0 {
+                chk ^= *generator;
+            }
+        }
+    }
+    chk
+}
+
+/// Validates an `age` X25519 Bech32 public key (`age1...`, 62 lowercase chars,
+/// zero padding bits in the final 5-bit group, and valid BIP-173 checksum).
+pub(crate) fn validate_age_public_key(key: &str) -> Result<(), PolicyStoreError> {
+    let invalid = || {
+        PolicyStoreError::InvalidInput(
+            "invalid age public key: expected a 62-character lowercase Bech32 'age1...' X25519 \
+             public key"
+                .to_owned(),
+        )
+    };
+    if key.len() != AGE_PUBLIC_KEY_LEN {
+        return Err(invalid());
+    }
+    let Some(encoded) = key.strip_prefix(AGE_PUBLIC_KEY_PREFIX) else {
+        return Err(invalid());
+    };
+    let mut values = [0u8; 58];
+    let bytes = encoded.as_bytes();
+    if bytes.len() != values.len() {
+        return Err(invalid());
+    }
+    for (slot, byte) in values.iter_mut().zip(bytes.iter()) {
+        let Some(val) = bech32_decode_char(*byte) else {
+            return Err(invalid());
+        };
+        *slot = val;
+    }
+    // 32 raw bytes = 256 bits; 52 5-bit groups = 260 bits, so the final data
+    // group (index 51) has 4 low padding bits that must all be zero.
+    if values[51] & 0x0f != 0 {
+        return Err(invalid());
+    }
+    // Reject the degenerate all-zero X25519 public key (small-order point).
+    if values[..52].iter().all(|&val| val == 0) {
+        return Err(invalid());
+    }
+    let checksum = bech32_polymod(AGE_HRP_EXPANDED.into_iter().chain(values));
+    if checksum != 1 {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Validates a token label: at most [`MAX_TOKEN_LABEL_BYTES`] printable ASCII
@@ -625,12 +840,35 @@ fn validate_branch_rule(
     Ok(rule)
 }
 
+/// Validates `scope` and `groups` for a secret scope.
+fn validate_secret_scope(scope: &str, groups: &BTreeSet<String>) -> Result<(), PolicyStoreError> {
+    if let Err(error) = validate_scope_name(scope) {
+        return Err(error);
+    }
+    if groups.is_empty() {
+        return Err(PolicyStoreError::InvalidInput(
+            "a secret scope needs at least one group".to_owned(),
+        ));
+    }
+    for group in groups {
+        if let Err(error) = validate_group_name(group) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Validates everything [`PolicyStore::create_member`] receives.
 fn validate_create_member_request(request: &CreateMemberRequest) -> Result<(), PolicyStoreError> {
     if let Err(error) = validate_member_name(&request.name) {
         return Err(error);
     }
     if let Err(error) = validate_token_label(&request.token_label) {
+        return Err(error);
+    }
+    if let Some(public_key) = &request.public_key
+        && let Err(error) = validate_age_public_key(public_key)
+    {
         return Err(error);
     }
     for group in &request.groups {
@@ -741,6 +979,14 @@ impl PolicyStore for StaticPolicyStore {
         // The shared-token member belongs to no group.
         ready(Ok(BTreeSet::new()))
     }
+
+    fn get_member_public_key<'a>(
+        &'a self,
+        _member_id: i64,
+    ) -> PolicyStoreFuture<'a, Option<String>> {
+        // The shared-token member has no stored public key.
+        ready(Ok(None))
+    }
 }
 
 /// One member of a [`MemoryPolicyStore`].
@@ -750,6 +996,7 @@ struct MemoryMember {
     name: String,
     is_admin: bool,
     is_machine: bool,
+    public_key: Option<String>,
     is_revoked: bool,
 }
 
@@ -771,6 +1018,7 @@ struct MemoryState {
     groups_by_member: BTreeMap<i64, BTreeSet<String>>,
     repository_ids: BTreeMap<String, i64>,
     rules_by_repository: BTreeMap<String, Vec<BranchRule>>,
+    secret_scopes_by_repository: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     audit_log: Vec<AuditLogEntry>,
     /// Highest ID handed out (or inserted), shared by all kinds of rows.
     last_id: i64,
@@ -804,6 +1052,7 @@ impl MemoryState {
             name: member.name.clone(),
             is_admin: member.is_admin,
             is_machine: member.is_machine,
+            public_key: member.public_key.clone(),
             groups: self.member_groups(member.id).into_iter().collect(),
             revoked: member.is_revoked,
         }
@@ -863,6 +1112,7 @@ impl MemoryState {
             name: request.name.clone(),
             is_admin: request.is_admin,
             is_machine: request.is_machine,
+            public_key: request.public_key.clone(),
             is_revoked: false,
         };
         let token = match self.issue_token(member.id) {
@@ -949,6 +1199,7 @@ impl MemoryPolicyStore {
             name: member.name,
             is_admin: member.is_admin,
             is_machine: false,
+            public_key: None,
             is_revoked: false,
         });
     }
@@ -1482,6 +1733,203 @@ impl PolicyStore for MemoryPolicyStore {
             Ok(created)
         }))
     }
+
+    fn get_member_public_key<'a>(
+        &'a self,
+        member_id: i64,
+    ) -> PolicyStoreFuture<'a, Option<String>> {
+        ready(self.with_state(|state| {
+            Ok(state
+                .members
+                .iter()
+                .find(|member| member.id == member_id && !member.is_revoked)
+                .and_then(|member| member.public_key.clone()))
+        }))
+    }
+
+    fn set_member_public_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberPublicKeyRecord> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_age_public_key(public_key) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let Some(member) = state
+                .members
+                .iter_mut()
+                .find(|member| member.name == member_name && !member.is_revoked)
+            else {
+                return Err(member_not_found_error());
+            };
+            member.public_key = Some(public_key.to_owned());
+            state.audit_log.push(set_member_public_key_audit(
+                actor_member_id,
+                member_name,
+                public_key,
+            ));
+            Ok(MemberPublicKeyRecord {
+                name: member_name.to_owned(),
+                public_key: public_key.to_owned(),
+            })
+        }))
+    }
+
+    fn set_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, SecretScopeRecord> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_secret_scope(scope, &groups) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            if let Err(error) = state.require_groups(&groups) {
+                return Err(error);
+            }
+            state
+                .secret_scopes_by_repository
+                .entry(repository.to_owned())
+                .or_default()
+                .insert(scope.to_owned(), groups.clone());
+            let record = SecretScopeRecord {
+                repository: repository.to_owned(),
+                scope: scope.to_owned(),
+                groups: groups.into_iter().collect(),
+            };
+            state
+                .audit_log
+                .push(set_secret_scope_audit(actor_member_id, &record));
+            Ok(record)
+        }))
+    }
+
+    fn list_secret_scopes<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<SecretScopeRecord>> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            let scopes = match state.secret_scopes_by_repository.get(repository) {
+                Some(scopes) => scopes
+                    .iter()
+                    .map(|(scope, groups)| SecretScopeRecord {
+                        repository: repository.to_owned(),
+                        scope: scope.clone(),
+                        groups: groups.iter().cloned().collect(),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            Ok(scopes)
+        }))
+    }
+
+    fn remove_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_scope_name(scope) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            let removed = match state.secret_scopes_by_repository.get_mut(repository) {
+                Some(scopes) => scopes.remove(scope).is_some(),
+                None => false,
+            };
+            if !removed {
+                return Err(secret_scope_not_found_error());
+            }
+            state.audit_log.push(remove_secret_scope_audit(
+                actor_member_id,
+                repository,
+                scope,
+            ));
+            Ok(true)
+        }))
+    }
+
+    fn resolve_secret_scope_recipients<'a>(
+        &'a self,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, ScopeRecipientsRecord> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_scope_name(scope) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            let Some(scope_groups) = state
+                .secret_scopes_by_repository
+                .get(repository)
+                .and_then(|scopes| scopes.get(scope))
+            else {
+                return Err(secret_scope_not_found_error());
+            };
+            let groups: Vec<String> = scope_groups.iter().cloned().collect();
+            let mut matching_members: Vec<&MemoryMember> = state
+                .members
+                .iter()
+                .filter(|member| {
+                    !member.is_revoked
+                        && state
+                            .groups_by_member
+                            .get(&member.id)
+                            .is_some_and(|member_groups| !member_groups.is_disjoint(scope_groups))
+                })
+                .collect();
+            matching_members.sort_by(|left, right| left.name.cmp(&right.name));
+            let mut recipients = Vec::new();
+            let mut members_without_key = Vec::new();
+            for member in matching_members {
+                match &member.public_key {
+                    Some(public_key) => recipients.push(ScopeRecipient {
+                        member: member.name.clone(),
+                        public_key: public_key.clone(),
+                    }),
+                    None => members_without_key.push(member.name.clone()),
+                }
+            }
+            Ok(ScopeRecipientsRecord {
+                repository: repository.to_owned(),
+                scope: scope.to_owned(),
+                groups,
+                recipients,
+                members_without_key,
+            })
+        }))
+    }
 }
 
 /// The request [`PolicyStore::bootstrap_admin`] turns into a member.
@@ -1490,6 +1938,7 @@ fn bootstrap_admin_request(name: &str, token_label: &str) -> CreateMemberRequest
         name: name.to_owned(),
         is_admin: true,
         is_machine: false,
+        public_key: None,
         groups: BTreeSet::new(),
         token_label: token_label.to_owned(),
     }
@@ -1514,6 +1963,10 @@ fn repository_not_registered_error() -> PolicyStoreError {
 
 fn branch_rule_not_found_error() -> PolicyStoreError {
     PolicyStoreError::NotFound("branch rule not found".to_owned())
+}
+
+fn secret_scope_not_found_error() -> PolicyStoreError {
+    PolicyStoreError::NotFound("secret scope not found".to_owned())
 }
 
 fn member_exists_error() -> PolicyStoreError {
@@ -1579,9 +2032,24 @@ fn create_member_audit(
         serde_json::json!({
             "is_admin": request.is_admin,
             "is_machine": request.is_machine,
+            "has_public_key": request.public_key.is_some(),
             "groups": request.groups,
             "token_label": request.token_label,
         }),
+    )
+}
+
+fn set_member_public_key_audit(
+    actor_member_id: Option<i64>,
+    member_name: &str,
+    public_key: &str,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "member.public_key_set",
+        "member",
+        member_name.to_owned(),
+        serde_json::json!({ "public_key": public_key }),
     )
 }
 
@@ -1638,6 +2106,37 @@ fn remove_branch_rule_audit(
         "branch_rule",
         format!("{repository}:{pattern}"),
         serde_json::json!({ "repository": repository, "pattern": pattern }),
+    )
+}
+
+fn set_secret_scope_audit(
+    actor_member_id: Option<i64>,
+    record: &SecretScopeRecord,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "secret_scope.set",
+        "secret_scope",
+        format!("{}:{}", record.repository, record.scope),
+        serde_json::json!({
+            "repository": record.repository,
+            "scope": record.scope,
+            "groups": record.groups,
+        }),
+    )
+}
+
+fn remove_secret_scope_audit(
+    actor_member_id: Option<i64>,
+    repository: &str,
+    scope: &str,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "secret_scope.remove",
+        "secret_scope",
+        format!("{repository}:{scope}"),
+        serde_json::json!({ "repository": repository, "scope": scope }),
     )
 }
 
@@ -1848,12 +2347,13 @@ async fn insert_member_with_token(
     // `ON CONFLICT DO NOTHING` turns a concurrent duplicate into a clean
     // conflict instead of a unique-violation error.
     let inserted = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO members (name, is_admin, is_machine) VALUES ($1, $2, $3) \
+        "INSERT INTO members (name, is_admin, is_machine, public_key) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (name) DO NOTHING RETURNING id",
     )
     .bind(&request.name)
     .bind(request.is_admin)
     .bind(request.is_machine)
+    .bind(request.public_key.as_deref())
     .fetch_optional(&mut *connection)
     .await;
     let member_id = match inserted {
@@ -1885,6 +2385,7 @@ async fn insert_member_with_token(
             name: request.name.clone(),
             is_admin: request.is_admin,
             is_machine: request.is_machine,
+            public_key: request.public_key.clone(),
             groups: request.groups.iter().cloned().collect(),
             revoked: false,
         },
@@ -2457,8 +2958,20 @@ impl PolicyStore for PgPolicyStore {
         include_revoked: bool,
     ) -> PolicyStoreFuture<'a, Vec<MemberRecord>> {
         Box::pin(async move {
-            let rows = sqlx::query_as::<_, (i64, String, bool, bool, bool, Option<String>)>(
-                "SELECT m.id, m.name, m.is_admin, m.is_machine, m.revoked_at IS NOT NULL, g.name \
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    i64,
+                    String,
+                    bool,
+                    bool,
+                    Option<String>,
+                    bool,
+                    Option<String>,
+                ),
+            >(
+                "SELECT m.id, m.name, m.is_admin, m.is_machine, m.public_key, \
+                        m.revoked_at IS NOT NULL, g.name \
                  FROM members m \
                  LEFT JOIN group_memberships gm ON gm.member_id = m.id \
                  LEFT JOIN groups g ON g.id = gm.group_id \
@@ -2473,7 +2986,7 @@ impl PolicyStore for PgPolicyStore {
                 Err(error) => return Err(PolicyStoreError::Database(error)),
             };
             let mut members: Vec<MemberRecord> = Vec::new();
-            for (id, name, is_admin, is_machine, revoked, group) in rows {
+            for (id, name, is_admin, is_machine, public_key, revoked, group) in rows {
                 let is_same_member = members.last().is_some_and(|member| member.id == id);
                 if !is_same_member {
                     members.push(MemberRecord {
@@ -2481,6 +2994,7 @@ impl PolicyStore for PgPolicyStore {
                         name,
                         is_admin,
                         is_machine,
+                        public_key,
                         groups: Vec::new(),
                         revoked,
                     });
@@ -2714,6 +3228,348 @@ impl PolicyStore for PgPolicyStore {
             Ok(created)
         })
     }
+
+    fn get_member_public_key<'a>(
+        &'a self,
+        member_id: i64,
+    ) -> PolicyStoreFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let row = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT public_key FROM members WHERE id = $1 AND revoked_at IS NULL",
+            )
+            .bind(member_id)
+            .fetch_optional(&self.pool)
+            .await;
+            match row {
+                Ok(Some(public_key)) => Ok(public_key),
+                Ok(None) => Ok(None),
+                Err(error) => Err(PolicyStoreError::Database(error)),
+            }
+        })
+    }
+
+    fn set_member_public_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberPublicKeyRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            if let Err(error) = validate_age_public_key(public_key) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let updated = sqlx::query_scalar::<_, i64>(
+                "UPDATE members SET public_key = $1 \
+                 WHERE name = $2 AND revoked_at IS NULL \
+                 RETURNING id",
+            )
+            .bind(public_key)
+            .bind(member_name)
+            .fetch_optional(&mut *transaction)
+            .await;
+            match updated {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(member_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            }
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                set_member_public_key_audit(actor_member_id, member_name, public_key),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(MemberPublicKeyRecord {
+                name: member_name.to_owned(),
+                public_key: public_key.to_owned(),
+            })
+        })
+    }
+
+    fn set_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, SecretScopeRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            if let Err(error) = validate_secret_scope(scope, &groups) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let repository_id = match find_repository_id(&mut transaction, repository).await {
+                Ok(repository_id) => repository_id,
+                Err(error) => return Err(error),
+            };
+            let group_ids = match find_group_ids(&mut transaction, &groups).await {
+                Ok(group_ids) => group_ids,
+                Err(error) => return Err(error),
+            };
+            // The no-op update makes `RETURNING` yield the existing row's ID.
+            let scope_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO secret_scopes (repository_id, scope_name) VALUES ($1, $2) \
+                 ON CONFLICT (repository_id, scope_name) DO UPDATE SET scope_name = EXCLUDED.scope_name \
+                 RETURNING id",
+            )
+            .bind(repository_id)
+            .bind(scope)
+            .fetch_one(&mut *transaction)
+            .await;
+            let scope_id = match scope_id {
+                Ok(scope_id) => scope_id,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if let Err(error) =
+                sqlx::query("DELETE FROM secret_scope_groups WHERE secret_scope_id = $1")
+                    .bind(scope_id)
+                    .execute(&mut *transaction)
+                    .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            if let Err(error) = sqlx::query(
+                "INSERT INTO secret_scope_groups (secret_scope_id, group_id) \
+                 SELECT $1, UNNEST($2::BIGINT[])",
+            )
+            .bind(scope_id)
+            .bind(group_ids)
+            .execute(&mut *transaction)
+            .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            let record = SecretScopeRecord {
+                repository: repository.to_owned(),
+                scope: scope.to_owned(),
+                groups: groups.into_iter().collect(),
+            };
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                set_secret_scope_audit(actor_member_id, &record),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(record)
+        })
+    }
+
+    fn list_secret_scopes<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<SecretScopeRecord>> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT ss.scope_name, g.name \
+                 FROM repositories r \
+                 LEFT JOIN secret_scopes ss ON ss.repository_id = r.id \
+                 LEFT JOIN secret_scope_groups ssg ON ssg.secret_scope_id = ss.id \
+                 LEFT JOIN groups g ON g.id = ssg.group_id \
+                 WHERE r.path = $1 \
+                 ORDER BY ss.scope_name COLLATE \"C\", g.name COLLATE \"C\"",
+            )
+            .bind(repository)
+            .fetch_all(&self.pool)
+            .await;
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if rows.is_empty() {
+                return Err(repository_not_registered_error());
+            }
+            let mut scopes: Vec<SecretScopeRecord> = Vec::new();
+            for (scope, group) in rows {
+                let Some(scope) = scope else {
+                    continue;
+                };
+                let is_same_scope = scopes.last().is_some_and(|record| record.scope == scope);
+                if !is_same_scope {
+                    scopes.push(SecretScopeRecord {
+                        repository: repository.to_owned(),
+                        scope,
+                        groups: Vec::new(),
+                    });
+                }
+                if let (Some(group), Some(record)) = (group, scopes.last_mut()) {
+                    record.groups.push(group);
+                }
+            }
+            Ok(scopes)
+        })
+    }
+
+    fn remove_secret_scope<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            if let Err(error) = validate_scope_name(scope) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let repository_id = match find_repository_id(&mut transaction, repository).await {
+                Ok(repository_id) => repository_id,
+                Err(error) => return Err(error),
+            };
+            let deleted = sqlx::query(
+                "DELETE FROM secret_scopes WHERE repository_id = $1 AND scope_name = $2",
+            )
+            .bind(repository_id)
+            .bind(scope)
+            .execute(&mut *transaction)
+            .await;
+            match deleted {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => return Err(secret_scope_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            }
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                remove_secret_scope_audit(actor_member_id, repository, scope),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(true)
+        })
+    }
+
+    fn resolve_secret_scope_recipients<'a>(
+        &'a self,
+        repository: &'a str,
+        scope: &'a str,
+    ) -> PolicyStoreFuture<'a, ScopeRecipientsRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            if let Err(error) = validate_scope_name(scope) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) =
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .execute(&mut *transaction)
+                    .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+
+            let scope_row = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT ss.id \
+                 FROM repositories r \
+                 LEFT JOIN secret_scopes ss ON ss.repository_id = r.id AND ss.scope_name = $2 \
+                 WHERE r.path = $1",
+            )
+            .bind(repository)
+            .bind(scope)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let scope_id = match scope_row {
+                Ok(Some(Some(scope_id))) => scope_id,
+                Ok(Some(None)) => return Err(secret_scope_not_found_error()),
+                Ok(None) => return Err(repository_not_registered_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            let groups = sqlx::query_scalar::<_, String>(
+                "SELECT g.name \
+                 FROM secret_scope_groups ssg \
+                 JOIN groups g ON g.id = ssg.group_id \
+                 WHERE ssg.secret_scope_id = $1 \
+                 ORDER BY g.name COLLATE \"C\"",
+            )
+            .bind(scope_id)
+            .fetch_all(&mut *transaction)
+            .await;
+            let groups = match groups {
+                Ok(groups) => groups,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            let member_rows = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT m.name, m.public_key \
+                 FROM secret_scope_groups ssg \
+                 JOIN group_memberships gm ON gm.group_id = ssg.group_id \
+                 JOIN members m ON m.id = gm.member_id \
+                 WHERE ssg.secret_scope_id = $1 \
+                   AND m.revoked_at IS NULL \
+                 GROUP BY m.id, m.name, m.public_key \
+                 ORDER BY m.name COLLATE \"C\"",
+            )
+            .bind(scope_id)
+            .fetch_all(&mut *transaction)
+            .await;
+            let member_rows = match member_rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+
+            let mut recipients = Vec::new();
+            let mut members_without_key = Vec::new();
+            for (member_name, public_key) in member_rows {
+                match public_key {
+                    Some(public_key) => recipients.push(ScopeRecipient {
+                        member: member_name,
+                        public_key,
+                    }),
+                    None => members_without_key.push(member_name),
+                }
+            }
+            Ok(ScopeRecipientsRecord {
+                repository: repository.to_owned(),
+                scope: scope.to_owned(),
+                groups,
+                recipients,
+                members_without_key,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2721,9 +3577,10 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{
-        API_TOKEN_PREFIX, AuditLogEntry, MemoryPolicyStore, PolicyStore, PolicyStoreError,
-        generate_api_token, validate_branch_rule, validate_group_name, validate_member_name,
-        validate_repository_path, validate_token_label,
+        AGE_HRP_EXPANDED, API_TOKEN_PREFIX, AuditLogEntry, BECH32_CHARSET, MemoryPolicyStore,
+        PolicyStore, PolicyStoreError, bech32_decode_char, bech32_polymod, generate_api_token,
+        validate_age_public_key, validate_branch_rule, validate_group_name, validate_member_name,
+        validate_repository_path, validate_scope_name, validate_token_label,
     };
     use crate::auth::sha256_zeroizing;
 
@@ -2871,5 +3728,95 @@ mod tests {
         );
         assert_ne!(first_token, second.token.expose_secret());
         assert_eq!(*first.hash, *sha256_zeroizing(first_token.as_bytes()));
+    }
+
+    #[test]
+    fn scope_names_follow_identifier_rules() {
+        for valid in ["dev", "staging", "prod", "us-east_1.prod", &"s".repeat(64)] {
+            assert!(validate_scope_name(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            "",
+            "-dev",
+            ".dev",
+            "_dev",
+            "dev prod",
+            "dev/prod",
+            "dev:prod",
+            "dév",
+            &"s".repeat(65),
+        ] {
+            assert!(
+                is_invalid_input(validate_scope_name(invalid)),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    fn encode_age_key_from_data(data: &str) -> String {
+        assert_eq!(data.len(), 52);
+        let mut values = Vec::with_capacity(58);
+        for byte in data.bytes() {
+            let Some(val) = bech32_decode_char(byte) else {
+                panic!("non-bech32 test char: {byte}");
+            };
+            values.push(val);
+        }
+        values.extend([0u8; 6]);
+        let polymod =
+            bech32_polymod(AGE_HRP_EXPANDED.into_iter().chain(values.iter().copied())) ^ 1;
+        let mut out = String::from("age1");
+        out.push_str(data);
+        for i in 0..6 {
+            let idx = ((polymod >> (5 * (5 - i))) & 31) as usize;
+            out.push(char::from(BECH32_CHARSET[idx]));
+        }
+        out
+    }
+
+    #[test]
+    fn age_public_keys_are_validated_strictly() {
+        let valid_spec_vector = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+        assert!(validate_age_public_key(valid_spec_vector).is_ok());
+
+        // Degenerate all-zero 32-byte key must be rejected even with a valid checksum.
+        let all_zero_key = encode_age_key_from_data(&"q".repeat(52));
+        assert!(is_invalid_input(validate_age_public_key(&all_zero_key)));
+
+        // Corrupted checksum (flip last character).
+        let mut bad_checksum = valid_spec_vector.to_owned();
+        bad_checksum.pop();
+        bad_checksum.push('q');
+        assert!(is_invalid_input(validate_age_public_key(&bad_checksum)));
+
+        // Non-zero padding bits in 52nd data character even with a valid checksum.
+        let non_zero_padding_data = format!("{}p", &valid_spec_vector[4..55]);
+        let non_zero_padding_key = encode_age_key_from_data(&non_zero_padding_data);
+        assert!(is_invalid_input(validate_age_public_key(
+            &non_zero_padding_key
+        )));
+
+        // Wrong HRP, wrong length, uppercase, whitespace, non-bech32 characters.
+        let uppercase = valid_spec_vector.to_ascii_uppercase();
+        let with_leading_ws = format!(" {valid_spec_vector}");
+        let with_trailing_ws = format!("{valid_spec_vector}\n");
+        let too_long = format!("{valid_spec_vector}q");
+        let too_short = &valid_spec_vector[..61];
+        for invalid in [
+            "",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA",
+            "bob1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+            too_short,
+            too_long.as_str(),
+            uppercase.as_str(),
+            with_leading_ws.as_str(),
+            with_trailing_ws.as_str(),
+            "age1bl3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+        ] {
+            assert!(
+                is_invalid_input(validate_age_public_key(invalid)),
+                "{invalid:?}"
+            );
+        }
     }
 }

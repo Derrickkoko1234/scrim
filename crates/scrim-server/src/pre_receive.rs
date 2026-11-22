@@ -23,7 +23,7 @@
 //! # Checks
 //!
 //! The server decides with full knowledge of the member and the branch rules
-//! ([`evaluate_pre_receive`]), in four checks:
+//! ([`evaluate_pre_receive`]), in five checks:
 //!
 //! 1. every update line is well formed and names a UTF-8 `refs/...` ref, and
 //!    a push updates at most [`MAX_REF_UPDATES_PER_PUSH`] refs;
@@ -46,7 +46,16 @@
 //!    tree or blob (for example a tag), or a squash of restricted content, is
 //!    not a merge leak. For members who cannot see the restricted refs, check
 //!    3 already refuses every object they could not otherwise read; members
-//!    who can see them may squash by design.
+//!    who can see them may squash by design;
+//! 5. no commit new to the repository (and no blob or tree a ref is pointed
+//!    at directly) adds a plaintext dotenv file or a file containing a
+//!    high-confidence credential (see [`crate::secret_scan`]), and a push
+//!    introduces at most [`MAX_SCANNED_COMMITS`] new commits, unless the
+//!    pusher passes [`ALLOW_SECRET_SCAN_PUSH_OPTION`], which is recorded in the
+//!    audit log. This applies to every member, admins included; only what
+//!    changed in each new commit is scanned (merges by combined diff, so a
+//!    file taken unchanged from a parent is not rescanned), so content
+//!    already accepted never has to be overridden again.
 //!
 //! Every failure (bad framing, an unreachable server, a git error, a failed
 //! audit write) rejects the push.
@@ -68,6 +77,7 @@ use std::{
     io::{self, Read, Write},
     net::Shutdown,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -76,7 +86,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_util::task::AbortOnDropHandle;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -84,6 +94,7 @@ use crate::{
     auth::sha256_zeroizing,
     git_service::{RepoRefEntry, list_repo_refs, run_isolated_git},
     policy_store::{AuditLogEntry, AuthenticatedMember, MemberRepoPolicy, PolicyStore},
+    secret_scan::{MAX_SCANNED_BLOB_BYTES, check_blocked_path_bytes, scan_blob_bytes},
 };
 
 /// The hook's end of the callback connection.
@@ -113,6 +124,12 @@ pub const PRE_RECEIVE_HOOK_MODE: &str = "pre-receive";
 /// authorized member land commits from more restricted refs in a wider ref.
 /// Each use is written to the audit log. It never bypasses checks 1-3.
 pub const ALLOW_MERGE_LEAK_PUSH_OPTION: &str = "scrim.allow-merge-leak=true";
+
+/// Push option (`git push -o scrim.allow-secret-scan=true`) that lets a
+/// member land content check 5 flagged as a plaintext secret, for confirmed
+/// false positives. Each use is written to the audit log, naming the findings
+/// but never their content. It never bypasses checks 1-4.
+pub const ALLOW_SECRET_SCAN_PUSH_OPTION: &str = "scrim.allow-secret-scan=true";
 
 /// Address of the request's callback listener: the socket path on Unix, a
 /// loopback `127.0.0.1:<port>` elsewhere.
@@ -199,6 +216,16 @@ const MAX_UNIX_SOCKET_PARENT_BYTES: usize = 68;
 
 /// Most leaked commit IDs stored in one audit entry.
 const MAX_AUDITED_LEAKED_COMMITS: usize = 10;
+
+/// Most new commits check 5 scans in one push; a push introducing more is
+/// refused (unless overridden) rather than partly scanned.
+const MAX_SCANNED_COMMITS: usize = 4096;
+
+/// Most check-5 findings listed in a rejection message or an audit entry.
+const MAX_REPORTED_FINDINGS: usize = 10;
+
+/// Longest path, in characters, shown for a check-5 finding.
+const MAX_DISPLAYED_PATH_CHARS: usize = 200;
 
 /// Object types `git cat-file --batch-check` reports for an existing object.
 const OBJECT_TYPES: [&str; 4] = ["commit", "tree", "blob", "tag"];
@@ -950,7 +977,7 @@ async fn evaluate_pre_receive(context: &PreReceiveContext, request: &HookRequest
     }
 }
 
-/// Runs the four checks described in the module documentation, then writes
+/// Runs the five checks described in the module documentation, then writes
 /// any override audit entries. Returns the rejection message on failure.
 async fn check_push(context: &PreReceiveContext, request: &HookRequest) -> Result<(), String> {
     let policy = &context.policy;
@@ -1088,7 +1115,7 @@ async fn check_push(context: &PreReceiveContext, request: &HookRequest) -> Resul
         return Err(message);
     }
 
-    let audit_entries = match check_merge_leaks(
+    let mut audit_entries = match check_merge_leaks(
         context,
         &updates,
         &repo_refs,
@@ -1101,6 +1128,22 @@ async fn check_push(context: &PreReceiveContext, request: &HookRequest) -> Resul
         Ok(audit_entries) => audit_entries,
         Err(message) => return Err(message),
     };
+
+    // Check 5: plaintext secrets in new content, for every member.
+    let secret_scan = match scan_pushed_content(context, &updates, &repo_refs, &walk_env).await {
+        Ok(report) => report,
+        Err(message) => return Err(message),
+    };
+    if !secret_scan.is_clean() {
+        let has_override = request
+            .push_options
+            .iter()
+            .any(|push_option| push_option == ALLOW_SECRET_SCAN_PUSH_OPTION);
+        if !has_override {
+            return Err(secret_scan.rejection_message());
+        }
+        audit_entries.push(secret_scan.override_audit_entry(context));
+    }
 
     // Written only once every update passed every check, so a rejected push
     // never leaves an override entry behind. An override that cannot be
@@ -1469,6 +1512,619 @@ async fn list_commits(
     }
 }
 
+/// Where check 5 found content: a path in a new commit, or a blob or tree a
+/// ref is pointed at directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContentLocation {
+    /// The new commit that adds or changes the file.
+    commit: Option<String>,
+    /// The ref pointed straight at the blob or tree, for content outside any
+    /// commit.
+    ref_name: Option<String>,
+    /// Path inside the commit or tree; `None` for a ref pointed at a blob.
+    path: Option<Vec<u8>>,
+}
+
+impl ContentLocation {
+    /// `<short commit or ref> <path>`, with the path lossily decoded,
+    /// escaped (so a newline in a file name cannot forge a message line) and
+    /// shortened to [`MAX_DISPLAYED_PATH_CHARS`].
+    fn describe(&self) -> String {
+        let mut text = match (&self.commit, &self.ref_name) {
+            (Some(commit), _) => match commit.get(..12) {
+                Some(short) => short.to_owned(),
+                None => commit.clone(),
+            },
+            (None, Some(ref_name)) => ref_name.clone(),
+            (None, None) => String::new(),
+        };
+        if let Some(path) = &self.path {
+            text.push(' ');
+            text.push_str(&display_path(path));
+        }
+        text
+    }
+}
+
+/// See [`ContentLocation::describe`].
+fn display_path(path: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(path);
+    let mut text: String = decoded
+        .chars()
+        .take(MAX_DISPLAYED_PATH_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if decoded.chars().nth(MAX_DISPLAYED_PATH_CHARS).is_some() {
+        text.push_str("...");
+    }
+    text
+}
+
+/// One check-5 finding. Never holds any part of the secret.
+#[derive(Debug)]
+struct SecretFinding {
+    location: ContentLocation,
+    rule: &'static str,
+    /// 1-based line of a content match; `None` for a file-name match.
+    line: Option<usize>,
+}
+
+/// The outcome of [`scan_pushed_content`].
+#[derive(Debug, Default)]
+struct SecretScanReport {
+    /// The first [`MAX_REPORTED_FINDINGS`] findings.
+    findings: Vec<SecretFinding>,
+    /// Number of findings, including those not kept.
+    total_findings: usize,
+    /// The push introduces more than [`MAX_SCANNED_COMMITS`] new commits, so
+    /// nothing was scanned.
+    commit_limit_exceeded: bool,
+}
+
+impl SecretScanReport {
+    fn record(&mut self, location: ContentLocation, rule: &'static str, line: Option<usize>) {
+        self.total_findings += 1;
+        if self.findings.len() < MAX_REPORTED_FINDINGS {
+            self.findings.push(SecretFinding {
+                location,
+                rule,
+                line,
+            });
+        }
+    }
+
+    fn is_clean(&self) -> bool {
+        self.total_findings == 0 && !self.commit_limit_exceeded
+    }
+
+    /// The message for the pusher: where and which rule, never the content.
+    fn rejection_message(&self) -> String {
+        let advice = format!(
+            "scrim: remove them from the pushed commits and store secrets with \
+             `scrim secrets set`, or, for a confirmed false positive, re-push with \
+             `-o {ALLOW_SECRET_SCAN_PUSH_OPTION}` (recorded in the audit log)."
+        );
+        if self.commit_limit_exceeded {
+            return format!(
+                "scrim: push rejected: introduces more than {MAX_SCANNED_COMMITS} new commits, \
+                 too many to scan for plaintext secrets.\n\
+                 scrim: push the history in smaller batches, or re-push with \
+                 `-o {ALLOW_SECRET_SCAN_PUSH_OPTION}` (recorded in the audit log)."
+            );
+        }
+        let mut message =
+            "scrim: push rejected: plaintext secrets found in pushed content:\n".to_owned();
+        for finding in &self.findings {
+            message.push_str(&format!(
+                "scrim:   {}: {}",
+                finding.location.describe(),
+                finding.rule
+            ));
+            if let Some(line) = finding.line {
+                message.push_str(&format!(" (line {line})"));
+            }
+            message.push('\n');
+        }
+        if self.total_findings > self.findings.len() {
+            message.push_str(&format!(
+                "scrim:   ... and {} more\n",
+                self.total_findings - self.findings.len()
+            ));
+        }
+        message.push_str(&advice);
+        message
+    }
+
+    /// The audit entry recording an override of this report.
+    fn override_audit_entry(&self, context: &PreReceiveContext) -> AuditLogEntry {
+        let findings: Vec<serde_json::Value> = self
+            .findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({
+                    "commit": finding.location.commit,
+                    "ref_name": finding.location.ref_name,
+                    "path": finding.location.path.as_deref().map(display_path),
+                    "rule": finding.rule,
+                    "line": finding.line,
+                })
+            })
+            .collect();
+        AuditLogEntry {
+            actor_member_id: Some(context.member.id),
+            action: "secret_scan.override".to_owned(),
+            target_type: "repository".to_owned(),
+            target_name: context.canonical_key.clone(),
+            details: serde_json::json!({
+                "repository": context.canonical_key,
+                "findings": findings,
+                "total_findings": self.total_findings,
+                "commit_limit_exceeded": self.commit_limit_exceeded,
+            }),
+        }
+    }
+}
+
+/// A file a new commit (or a pushed tree) adds or changes.
+#[derive(Debug, PartialEq, Eq)]
+struct ChangedFile {
+    location: ContentLocation,
+    /// git file mode, e.g. `100644`.
+    mode: String,
+    blob_id: String,
+}
+
+impl ChangedFile {
+    /// Whether the entry is a regular or executable file, whose blob holds
+    /// file content (not a symbolic link target or a submodule commit).
+    fn is_regular_file(&self) -> bool {
+        self.mode == "100644" || self.mode == "100755"
+    }
+}
+
+/// Check 5: finds plaintext dotenv files and known credential formats in
+/// content this push introduces.
+///
+/// "New" means commits not reachable from any existing ref (at most
+/// [`MAX_SCANNED_COMMITS`]), plus blobs and trees a ref is pointed at
+/// directly (also through annotated tags). Of each new commit, only the files
+/// it adds or changes are examined (a merge by combined diff, so files taken
+/// unchanged from a parent are skipped); every blob is read once, up to
+/// [`MAX_SCANNED_BLOB_BYTES`].
+async fn scan_pushed_content(
+    context: &PreReceiveContext,
+    updates: &[RefUpdate],
+    repo_refs: &[RepoRefEntry],
+    walk_env: &[(&str, &OsStr)],
+) -> Result<SecretScanReport, String> {
+    let mut report = SecretScanReport::default();
+    let pushed: Vec<&RefUpdate> = updates
+        .iter()
+        .filter(|update| !update.is_delete())
+        .collect();
+    if pushed.is_empty() {
+        return Ok(report);
+    }
+
+    // Peel every new value (through annotated tags) to find what it is.
+    let mut peel_input = String::new();
+    for update in &pushed {
+        peel_input.push_str(&update.new_oid);
+        peel_input.push_str("^{}\n");
+    }
+    let peel_output = match run_isolated_git(
+        &context.repo_dir,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        walk_env,
+        peel_input.into_bytes(),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return Err(internal_error("cannot peel the pushed objects", &error)),
+    };
+    let peeled = match parse_peeled_objects(&peel_output, pushed.len()) {
+        Ok(peeled) => peeled,
+        Err(error) => return Err(internal_error("unexpected cat-file output", &error)),
+    };
+
+    let mut changed_files = Vec::new();
+    let mut commit_tips = String::new();
+    let mut pushed_blobs = Vec::new();
+    for (update, (object_id, object_type)) in pushed.iter().zip(peeled) {
+        let ref_location = ContentLocation {
+            commit: None,
+            ref_name: Some(update.ref_name.clone()),
+            path: None,
+        };
+        match object_type.as_str() {
+            "commit" => {
+                commit_tips.push_str(&object_id);
+                commit_tips.push('\n');
+            }
+            "blob" => pushed_blobs.push((ref_location, object_id)),
+            "tree" => {
+                let output = match run_isolated_git(
+                    &context.repo_dir,
+                    &["ls-tree", "-r", "-z", &object_id],
+                    walk_env,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(error) => return Err(internal_error("cannot list a pushed tree", &error)),
+                };
+                match parse_ls_tree_entries(&output, &ref_location) {
+                    Ok(files) => changed_files.extend(files),
+                    Err(error) => return Err(internal_error("unexpected ls-tree output", &error)),
+                }
+            }
+            _ => {
+                return Err(internal_error(
+                    "unexpected peeled object type",
+                    &object_type,
+                ));
+            }
+        }
+    }
+
+    if !commit_tips.is_empty() {
+        // Symbolic refs are skipped: their targets are listed themselves, and
+        // a dangling one would make rev-list fail.
+        for entry in repo_refs
+            .iter()
+            .filter(|entry| entry.symref_target.is_none())
+        {
+            commit_tips.push('^');
+            commit_tips.push_str(&entry.name);
+            commit_tips.push('\n');
+        }
+        let max_count = format!("--max-count={}", MAX_SCANNED_COMMITS + 1);
+        let walk_output = match run_isolated_git(
+            &context.repo_dir,
+            &["rev-list", "--reverse", &max_count, "--stdin"],
+            walk_env,
+            commit_tips.into_bytes(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => return Err(internal_error("cannot walk the new commits", &error)),
+        };
+        let new_commits = match parse_object_ids(&walk_output) {
+            Ok(commits) => commits,
+            Err(error) => return Err(internal_error("unexpected rev-list output", &error)),
+        };
+        if new_commits.len() > MAX_SCANNED_COMMITS {
+            report.commit_limit_exceeded = true;
+            return Ok(report);
+        }
+        if !new_commits.is_empty() {
+            let mut diff_input = new_commits.join("\n");
+            diff_input.push('\n');
+            let diff_output = match run_isolated_git(
+                &context.repo_dir,
+                &["diff-tree", "--stdin", "-r", "--root", "-c", "--raw", "-z"],
+                walk_env,
+                diff_input.into_bytes(),
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => return Err(internal_error("cannot diff the new commits", &error)),
+            };
+            match parse_diff_tree_entries(&diff_output) {
+                Ok(files) => changed_files.extend(files),
+                Err(error) => return Err(internal_error("unexpected diff-tree output", &error)),
+            }
+        }
+    }
+
+    // File names first; then each distinct blob once, remembering where it
+    // first appeared. A blocked file's content is not scanned again.
+    let mut seen_blobs = BTreeSet::new();
+    let mut blobs_to_scan: Vec<(ContentLocation, String)> = Vec::new();
+    for (location, blob_id) in pushed_blobs {
+        if seen_blobs.insert(blob_id.clone()) {
+            blobs_to_scan.push((location, blob_id));
+        }
+    }
+    for file in changed_files {
+        let path = match &file.location.path {
+            Some(path) => path.as_slice(),
+            None => &[],
+        };
+        if let Some(rule) = check_blocked_path_bytes(path) {
+            report.record(file.location, rule, None);
+            continue;
+        }
+        if file.is_regular_file() && seen_blobs.insert(file.blob_id.clone()) {
+            blobs_to_scan.push((file.location, file.blob_id));
+        }
+    }
+
+    let blob_ids: Vec<String> = blobs_to_scan
+        .iter()
+        .map(|(_, blob_id)| blob_id.clone())
+        .collect();
+    let mut content_matches = Vec::new();
+    let read_result =
+        read_blob_prefixes(&context.repo_dir, walk_env, &blob_ids, |index, prefix| {
+            if let Some(found) = scan_blob_bytes(prefix) {
+                content_matches.push((index, found));
+            }
+        })
+        .await;
+    if let Err(error) = read_result {
+        return Err(internal_error("cannot read the pushed files", &error));
+    }
+    for (index, found) in content_matches {
+        if let Some((location, _)) = blobs_to_scan.get(index) {
+            report.record(location.clone(), found.rule, Some(found.line));
+        }
+    }
+    Ok(report)
+}
+
+/// Parses `git cat-file --batch-check=%(objectname) %(objecttype)` output for
+/// `expected_count` peeled (`<id>^{}`) inputs into `(id, type)` pairs. A
+/// missing object or any other unexpected output is an error.
+fn parse_peeled_objects(output: &[u8], expected_count: usize) -> io::Result<Vec<(String, String)>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "unexpected peeled object");
+    let Ok(text) = std::str::from_utf8(output) else {
+        return Err(invalid());
+    };
+    let mut peeled = Vec::with_capacity(expected_count);
+    for line in text.split_terminator('\n') {
+        let Some((object_id, object_type)) = line.split_once(' ') else {
+            return Err(invalid());
+        };
+        let Some(object_id) = parse_oid(object_id.as_bytes()) else {
+            return Err(invalid());
+        };
+        if !OBJECT_TYPES.contains(&object_type) {
+            return Err(invalid());
+        }
+        peeled.push((object_id, object_type.to_owned()));
+    }
+    if peeled.len() == expected_count {
+        Ok(peeled)
+    } else {
+        Err(invalid())
+    }
+}
+
+/// Parses `git diff-tree --stdin -r --root -c --raw -z` output: each commit
+/// ID (NUL-terminated) is followed by its entries, each a raw header
+/// (`:<modes> <ids> <status>`, with one leading `:` per parent) and a path.
+///
+/// Returns the entries whose resulting file exists (not deletions), with the
+/// resulting mode and blob ID.
+fn parse_diff_tree_entries(output: &[u8]) -> io::Result<Vec<ChangedFile>> {
+    let invalid = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected diff-tree output: {reason}"),
+        )
+    };
+    let mut files = Vec::new();
+    let mut current_commit: Option<String> = None;
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let parent_count = token.iter().take_while(|byte| **byte == b':').count();
+        if parent_count == 0 {
+            match parse_oid(token) {
+                Some(commit) => current_commit = Some(commit),
+                None => return Err(invalid("expected a commit ID")),
+            }
+            continue;
+        }
+        let Some(path) = tokens.next() else {
+            return Err(invalid("entry without a path"));
+        };
+        if path.is_empty() || current_commit.is_none() {
+            return Err(invalid("entry without a path or commit"));
+        }
+        // `<parent modes..> <result mode> <parent ids..> <result id> <status>`
+        let Ok(header) = std::str::from_utf8(&token[parent_count..]) else {
+            return Err(invalid("non-UTF-8 entry header"));
+        };
+        let fields: Vec<&str> = header.split(' ').collect();
+        if fields.len() != 2 * (parent_count + 1) + 1 {
+            return Err(invalid("wrong number of entry fields"));
+        }
+        let (Some(result_mode), Some(result_id)) =
+            (fields.get(parent_count), fields.get(2 * parent_count + 1))
+        else {
+            return Err(invalid("missing entry fields"));
+        };
+        let Some(result_id) = parse_oid(result_id.as_bytes()) else {
+            return Err(invalid("bad object ID"));
+        };
+        if *result_mode == "000000" || is_zero_oid(&result_id) {
+            continue;
+        }
+        files.push(ChangedFile {
+            location: ContentLocation {
+                commit: current_commit.clone(),
+                ref_name: None,
+                path: Some(path.to_vec()),
+            },
+            mode: (*result_mode).to_owned(),
+            blob_id: result_id,
+        });
+    }
+    Ok(files)
+}
+
+/// Parses `git ls-tree -r -z` output (`<mode> <type> <id>\t<path>`, each
+/// NUL-terminated) into files located under `tree_location`.
+fn parse_ls_tree_entries(
+    output: &[u8],
+    tree_location: &ContentLocation,
+) -> io::Result<Vec<ChangedFile>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "unexpected ls-tree entry");
+    let mut files = Vec::new();
+    for entry in output.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            return Err(invalid());
+        };
+        let Ok(header) = std::str::from_utf8(&entry[..tab]) else {
+            return Err(invalid());
+        };
+        let fields: Vec<&str> = header.split(' ').collect();
+        let [mode, _object_type, object_id] = fields.as_slice() else {
+            return Err(invalid());
+        };
+        let Some(object_id) = parse_oid(object_id.as_bytes()) else {
+            return Err(invalid());
+        };
+        files.push(ChangedFile {
+            location: ContentLocation {
+                commit: None,
+                ref_name: tree_location.ref_name.clone(),
+                path: Some(entry[tab + 1..].to_vec()),
+            },
+            mode: (*mode).to_owned(),
+            blob_id: object_id,
+        });
+    }
+    Ok(files)
+}
+
+/// Streams every blob in `blob_ids` through one `git cat-file --batch` and
+/// calls `inspect(index, prefix)` with at most the first
+/// [`MAX_SCANNED_BLOB_BYTES`] of each; the rest of a larger blob is read and
+/// discarded, never buffered.
+///
+/// git runs with the same isolated environment as
+/// [`run_isolated_git`] (which buffers whole outputs, so cannot be used for
+/// arbitrarily large blobs), plus `extra_env`.
+async fn read_blob_prefixes(
+    repo_dir: &Path,
+    extra_env: &[(&str, &OsStr)],
+    blob_ids: &[String],
+    mut inspect: impl FnMut(usize, &[u8]),
+) -> io::Result<()> {
+    if blob_ids.is_empty() {
+        return Ok(());
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(repo_dir)
+        .args(["cat-file", "--batch"]);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(error),
+    };
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Err(io::Error::other("git pipes were not set up"));
+    };
+
+    let mut input = Vec::with_capacity(blob_ids.len() * 65);
+    for blob_id in blob_ids {
+        input.extend_from_slice(blob_id.as_bytes());
+        input.push(b'\n');
+    }
+    // Written from its own task so git never blocks on a full stdout pipe
+    // while this side is still writing; dropped (and git killed) on error.
+    let writer = AbortOnDropHandle::new(tokio::spawn(async move {
+        let result = stdin.write_all(&input).await;
+        drop(stdin);
+        result
+    }));
+
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut header = Vec::new();
+    let mut prefix = Vec::new();
+    for (index, blob_id) in blob_ids.iter().enumerate() {
+        header.clear();
+        // A header is `<id> blob <size>\n`; the limit only guards the buffer.
+        let mut limited_reader = (&mut reader).take(256);
+        if let Err(error) = limited_reader.read_until(b'\n', &mut header).await {
+            return Err(error);
+        }
+        let Some(size) = parse_blob_header(&header, blob_id) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected cat-file header",
+            ));
+        };
+        let kept = size.min(MAX_SCANNED_BLOB_BYTES);
+        prefix.clear();
+        prefix.resize(kept, 0);
+        if let Err(error) = reader.read_exact(&mut prefix).await {
+            return Err(error);
+        }
+        // The rest of the blob, then the newline git prints after it.
+        let skipped = (size - kept) as u64 + 1;
+        let mut remainder = (&mut reader).take(skipped);
+        match tokio::io::copy(&mut remainder, &mut tokio::io::sink()).await {
+            Ok(copied) if copied == skipped => {}
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Err(error) => return Err(error),
+        }
+        inspect(index, &prefix);
+    }
+
+    match writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(io::Error::other(error)),
+    }
+    match child.wait().await {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(io::Error::other(format!(
+            "git cat-file exited with {status}"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// Parses a `git cat-file --batch` header, `<expected_id> blob <size>\n`,
+/// into the size.
+fn parse_blob_header(header: &[u8], expected_id: &str) -> Option<usize> {
+    let Some(line) = header.strip_suffix(b"\n") else {
+        return None;
+    };
+    let Ok(text) = std::str::from_utf8(line) else {
+        return None;
+    };
+    let mut fields = text.split(' ');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(object_id), Some("blob"), Some(size), None) if object_id == expected_id => {
+            size.parse::<usize>().ok()
+        }
+        _ => None,
+    }
+}
+
 /// Canonicalizes an object path from the hook and requires it to lie inside
 /// `objects_dir` (or, with `may_equal_objects_dir`, to be `objects_dir`).
 ///
@@ -1631,6 +2287,10 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use super::{
+        ALLOW_SECRET_SCAN_PUSH_OPTION, ContentLocation, MAX_REPORTED_FINDINGS, SecretScanReport,
+        parse_blob_header, parse_diff_tree_entries, parse_ls_tree_entries, parse_peeled_objects,
+    };
     use super::{
         CallbackListener, HookRequest, HookResponse, INVALID_REF_MESSAGE, MALFORMED_UPDATE_MESSAGE,
         MAX_REF_UPDATES_PER_PUSH, NON_UTF8_REF_MESSAGE, REQUEST_PROOF_DOMAIN,
@@ -2010,5 +2670,135 @@ mod tests {
             "expected short fallback parent, got {}",
             chosen.display()
         );
+    }
+
+    #[test]
+    fn parses_diff_tree_entries_of_plain_root_and_merge_commits() {
+        const SHA1_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        let mut output = Vec::new();
+        // A commit adding a file whose name contains a space and a newline,
+        // and deleting another.
+        output.extend_from_slice(format!("{SHA1_A}\0").as_bytes());
+        output.extend_from_slice(format!(":000000 100644 {SHA1_ZERO} {SHA1_B} A\0").as_bytes());
+        output.extend_from_slice(b"dir/a b\nc\0");
+        output.extend_from_slice(format!(":100644 000000 {SHA1_B} {SHA1_ZERO} D\0").as_bytes());
+        output.extend_from_slice(b"gone.txt\0");
+        // A merge whose result differs from both parents.
+        output.extend_from_slice(format!("{SHA1_B}\0").as_bytes());
+        output.extend_from_slice(
+            format!("::100644 000000 100755 {SHA1_A} {SHA1_ZERO} {SHA1_B} MA\0").as_bytes(),
+        );
+        output.extend_from_slice(b".env\0");
+        let files = match parse_diff_tree_entries(&output) {
+            Ok(files) => files,
+            Err(error) => panic!("valid diff-tree output rejected: {error}"),
+        };
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files[0].location.commit.as_deref(), Some(SHA1_A));
+        assert_eq!(files[0].location.path.as_deref(), Some(&b"dir/a b\nc"[..]));
+        assert_eq!(files[0].blob_id, SHA1_B);
+        assert!(files[0].is_regular_file());
+        assert_eq!(files[1].location.commit.as_deref(), Some(SHA1_B));
+        assert_eq!(files[1].location.path.as_deref(), Some(&b".env"[..]));
+        assert_eq!(files[1].mode, "100755");
+
+        for malformed in [
+            format!(":000000 100644 {SHA1_ZERO} {SHA1_B} A\0x\0"),
+            format!("{SHA1_A}\0:000000 100644 {SHA1_ZERO} A\0x\0"),
+            format!("{SHA1_A}\0:000000 100644 {SHA1_ZERO} {SHA1_B} A\0"),
+            "not-a-commit\0".to_owned(),
+        ] {
+            assert!(
+                parse_diff_tree_entries(malformed.as_bytes()).is_err(),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_ls_tree_peeled_objects_and_blob_headers() {
+        let tree = ContentLocation {
+            commit: None,
+            ref_name: Some("refs/tags/tree".to_owned()),
+            path: None,
+        };
+        let output = format!("100644 blob {SHA1_A}\tdeploy/.env\0120000 blob {SHA1_A}\tlink\0");
+        match parse_ls_tree_entries(output.as_bytes(), &tree) {
+            Ok(files) => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].location.path.as_deref(), Some(&b"deploy/.env"[..]));
+                assert_eq!(
+                    files[0].location.ref_name.as_deref(),
+                    Some("refs/tags/tree")
+                );
+                assert!(!files[1].is_regular_file());
+            }
+            Err(error) => panic!("valid ls-tree output rejected: {error}"),
+        }
+        assert!(parse_ls_tree_entries(b"100644 blob nothex\tx\0", &tree).is_err());
+
+        let peeled = format!("{SHA1_A} commit\n{SHA256_A} blob\n");
+        match parse_peeled_objects(peeled.as_bytes(), 2) {
+            Ok(objects) => {
+                assert_eq!(objects[0], (SHA1_A.to_owned(), "commit".to_owned()));
+                assert_eq!(objects[1], (SHA256_A.to_owned(), "blob".to_owned()));
+            }
+            Err(error) => panic!("valid peel output rejected: {error}"),
+        }
+        assert!(parse_peeled_objects(peeled.as_bytes(), 3).is_err());
+        assert!(parse_peeled_objects(format!("{SHA1_A}^{{}} missing\n").as_bytes(), 1).is_err());
+
+        let header = format!("{SHA1_A} blob 1234\n");
+        assert_eq!(parse_blob_header(header.as_bytes(), SHA1_A), Some(1234));
+        assert_eq!(parse_blob_header(header.as_bytes(), SHA256_A), None);
+        assert_eq!(
+            parse_blob_header(format!("{SHA1_A} tree 12\n").as_bytes(), SHA1_A),
+            None
+        );
+        assert_eq!(
+            parse_blob_header(format!("{SHA1_A} blob 12").as_bytes(), SHA1_A),
+            None
+        );
+    }
+
+    #[test]
+    fn secret_scan_report_names_locations_and_caps_findings() {
+        let mut report = SecretScanReport::default();
+        assert!(report.is_clean());
+        for index in 0..MAX_REPORTED_FINDINGS + 2 {
+            report.record(
+                ContentLocation {
+                    commit: Some(SHA1_A.to_owned()),
+                    ref_name: None,
+                    path: Some(format!("dir/evil\nscrim: ok {index}").into_bytes()),
+                },
+                "aws-access-key-id",
+                Some(index + 1),
+            );
+        }
+        assert!(!report.is_clean());
+        assert_eq!(report.findings.len(), MAX_REPORTED_FINDINGS);
+        let message = report.rejection_message();
+        assert!(
+            message.contains(
+                "scrim:   0123456789ab dir/evil\\nscrim: ok 0: aws-access-key-id (line 1)"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("... and 2 more"), "{message}");
+        assert!(message.contains(ALLOW_SECRET_SCAN_PUSH_OPTION), "{message}");
+        assert!(message.contains("scrim secrets set"), "{message}");
+        // Every line is a `scrim:` line: a file name cannot forge another.
+        assert!(
+            message.lines().all(|line| line.starts_with("scrim:")),
+            "{message}"
+        );
+
+        let limited = SecretScanReport {
+            commit_limit_exceeded: true,
+            ..SecretScanReport::default()
+        };
+        assert!(!limited.is_clean());
+        assert!(limited.rejection_message().contains("too many to scan"));
     }
 }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, anyhow, bail};
+use scrim_crypto::MemberIdentity;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -226,6 +227,115 @@ pub fn save_config(path: &Path, server: &str, token: &SecretString) -> anyhow::R
     write_secret_file_atomic(path, parent, toml_text.as_bytes())
 }
 
+/// Resolves the path to `identity.age` according to CLI flags, environment
+/// variables, and the resolved `config.toml` path.
+///
+/// Precedence (first non-empty match wins):
+/// 1. `--key-file <PATH>`
+/// 2. `SCRIM_KEY_FILE`
+/// 3. `<config_path.parent()>/identity.age`
+pub fn resolve_identity_path(
+    cli_key_file: Option<&Path>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    config_path: &Path,
+) -> PathBuf {
+    if let Some(path) = cli_key_file
+        && !path.as_os_str().is_empty()
+    {
+        return path.to_path_buf();
+    }
+
+    if let Some(path) = non_empty_env(env_lookup, "SCRIM_KEY_FILE") {
+        return PathBuf::from(path);
+    }
+
+    let parent = match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    parent.join("identity.age")
+}
+
+/// Loads the caller's [`MemberIdentity`] according to standard CLI precedence:
+///
+/// 1. Explicit `--key-file <PATH>` on the command line
+/// 2. `SCRIM_KEY` environment variable (zero disk access)
+/// 3. `SCRIM_KEY_FILE` environment variable
+/// 4. `<config_path.parent()>/identity.age` when `config_path` is available
+pub fn load_member_identity(
+    cli_key_file: Option<&Path>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<MemberIdentity> {
+    if let Some(path) = cli_key_file
+        && !path.as_os_str().is_empty()
+    {
+        return read_member_identity_file(path);
+    }
+
+    if let Some(raw) = env_lookup("SCRIM_KEY") {
+        let raw = Zeroizing::new(raw);
+        if !raw.is_empty() {
+            return match MemberIdentity::parse(&raw) {
+                Ok(identity) => Ok(identity),
+                Err(err) => Err(anyhow!(err)).context("invalid age identity in SCRIM_KEY"),
+            };
+        }
+    }
+
+    if let Some(path) = non_empty_env(env_lookup, "SCRIM_KEY_FILE") {
+        return read_member_identity_file(Path::new(&path));
+    }
+
+    let Some(cfg_path) = config_path else {
+        bail!(
+            "cannot determine identity file path: set --key-file, SCRIM_KEY, SCRIM_KEY_FILE, or HOME/SCRIM_CONFIG"
+        );
+    };
+    let identity_path = resolve_identity_path(None, env_lookup, cfg_path);
+    read_member_identity_file(&identity_path)
+}
+
+fn read_member_identity_file(identity_path: &Path) -> anyhow::Result<MemberIdentity> {
+    let contents = match fs::read_to_string(identity_path) {
+        Ok(text) => Zeroizing::new(text),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!(
+                "identity file {} not found; run 'scrim keygen' or set SCRIM_KEY",
+                identity_path.display()
+            );
+        }
+        Err(err) => {
+            return Err(anyhow!(err)).with_context(|| {
+                format!("failed to read identity file {}", identity_path.display())
+            });
+        }
+    };
+
+    match MemberIdentity::parse(&contents) {
+        Ok(identity) => Ok(identity),
+        Err(err) => Err(anyhow!(err))
+            .with_context(|| format!("invalid age identity in {}", identity_path.display())),
+    }
+}
+
+/// Saves `identity` to `path` with restricted permissions (`0o700` for newly
+/// created directories, `0o600` for the file on Unix).
+pub fn save_member_identity(path: &Path, identity: &MemberIdentity) -> anyhow::Result<()> {
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+
+    if let Err(err) = create_restricted_dir_all(parent) {
+        return Err(err);
+    }
+
+    let secret = identity.to_secret_string();
+    let payload = Zeroizing::new(format!("{}\n", secret.expose_secret()));
+    write_secret_file_atomic(path, parent, payload.as_bytes())
+}
+
 fn create_restricted_dir_all(dir: &Path) -> anyhow::Result<()> {
     if dir.exists() {
         return Ok(());
@@ -294,7 +404,7 @@ fn write_secret_file_atomic(path: &Path, parent: &Path, contents: &[u8]) -> anyh
 
     for _ in 0..16 {
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_name = format!(".config.toml.tmp.{pid}.{seq}");
+        let tmp_name = format!(".scrim.tmp.{pid}.{seq}");
         let tmp_path = parent.join(tmp_name);
 
         let mut options = OpenOptions::new();
@@ -314,7 +424,7 @@ fn write_secret_file_atomic(path: &Path, parent: &Path, contents: &[u8]) -> anyh
             Err(err) => {
                 return Err(anyhow!(err)).with_context(|| {
                     format!(
-                        "failed to create temporary config file {}",
+                        "failed to create temporary secret file {}",
                         tmp_path.display()
                     )
                 });
@@ -329,8 +439,8 @@ fn write_secret_file_atomic(path: &Path, parent: &Path, contents: &[u8]) -> anyh
     }
 
     match last_err {
-        Some(err) => Err(anyhow!(err)).context("failed to allocate temporary config file"),
-        None => Err(anyhow!("failed to allocate temporary config file")),
+        Some(err) => Err(anyhow!(err)).context("failed to allocate temporary secret file"),
+        None => Err(anyhow!("failed to allocate temporary secret file")),
     }
 }
 
@@ -342,11 +452,11 @@ fn write_and_rename(
 ) -> anyhow::Result<()> {
     if let Err(err) = file.write_all(contents) {
         return Err(anyhow!(err))
-            .with_context(|| format!("failed to write config file {}", tmp_path.display()));
+            .with_context(|| format!("failed to write secret file {}", tmp_path.display()));
     }
     if let Err(err) = file.flush() {
         return Err(anyhow!(err))
-            .with_context(|| format!("failed to flush config file {}", tmp_path.display()));
+            .with_context(|| format!("failed to flush secret file {}", tmp_path.display()));
     }
     #[cfg(unix)]
     {
@@ -359,13 +469,13 @@ fn write_and_rename(
     }
     if let Err(err) = file.sync_all() {
         return Err(anyhow!(err))
-            .with_context(|| format!("failed to sync config file {}", tmp_path.display()));
+            .with_context(|| format!("failed to sync secret file {}", tmp_path.display()));
     }
     drop(file);
 
     if let Err(err) = fs::rename(tmp_path, dest_path) {
         return Err(anyhow!(err))
-            .with_context(|| format!("failed to replace config file {}", dest_path.display()));
+            .with_context(|| format!("failed to replace file {}", dest_path.display()));
     }
 
     Ok(())
@@ -510,5 +620,83 @@ mod tests {
             "Debug output leaked secret: {debug_output}"
         );
         assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn identity_path_resolution_save_load_and_scrim_key_override() {
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(err) => panic!("failed to create tempdir: {err}"),
+        };
+        let config_path = dir.path().join("cfg").join("config.toml");
+
+        let env_none = env_from_pairs(&[]);
+        assert_eq!(
+            resolve_identity_path(None, &env_none, &config_path),
+            dir.path().join("cfg").join("identity.age")
+        );
+
+        let env_file = env_from_pairs(&[("SCRIM_KEY_FILE", "/custom/env.age")]);
+        assert_eq!(
+            resolve_identity_path(None, &env_file, &config_path),
+            PathBuf::from("/custom/env.age")
+        );
+        assert_eq!(
+            resolve_identity_path(Some(Path::new("/cli/key.age")), &env_file, &config_path),
+            PathBuf::from("/cli/key.age")
+        );
+
+        let id_path = dir.path().join("keys").join("identity.age");
+        let generated = MemberIdentity::generate();
+        if let Err(err) = save_member_identity(&id_path, &generated) {
+            panic!("save_member_identity failed: {err}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_meta = match fs::metadata(&id_path) {
+                Ok(m) => m,
+                Err(err) => panic!("metadata failed: {err}"),
+            };
+            assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        let loaded = match load_member_identity(Some(&id_path), &env_none, Some(&config_path)) {
+            Ok(id) => id,
+            Err(err) => panic!("load_member_identity failed: {err}"),
+        };
+        assert_eq!(loaded.public_key(), generated.public_key());
+
+        // SCRIM_KEY takes precedence over SCRIM_KEY_FILE and works with no config path (CI).
+        let env_identity = MemberIdentity::generate();
+        let env_secret = env_identity.to_secret_string();
+        let env_pairs = [
+            ("SCRIM_KEY", env_secret.expose_secret()),
+            ("SCRIM_KEY_FILE", "/nonexistent/does-not-exist.age"),
+        ];
+        let env_key_override = env_from_pairs(&env_pairs);
+        let loaded_from_env = match load_member_identity(None, &env_key_override, None) {
+            Ok(id) => id,
+            Err(err) => panic!("load_member_identity from SCRIM_KEY failed: {err}"),
+        };
+        assert_eq!(loaded_from_env.public_key(), env_identity.public_key());
+
+        // Explicit --key-file CLI flag overrides ambient SCRIM_KEY.
+        let loaded_from_flag = match load_member_identity(Some(&id_path), &env_key_override, None) {
+            Ok(id) => id,
+            Err(err) => panic!("load_member_identity from --key-file failed: {err}"),
+        };
+        assert_eq!(loaded_from_flag.public_key(), generated.public_key());
+
+        // Invalid SCRIM_KEY must not leak the secret value in its error message.
+        let env_bad_key = env_from_pairs(&[("SCRIM_KEY", "AGE-SECRET-KEY-1BADSECRETVALUE")]);
+        match load_member_identity(None, &env_bad_key, Some(&config_path)) {
+            Ok(_) => panic!("expected invalid SCRIM_KEY to fail"),
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(!msg.contains("BADSECRETVALUE"), "error leaked key: {msg}");
+            }
+        }
     }
 }

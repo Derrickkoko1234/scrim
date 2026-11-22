@@ -61,6 +61,8 @@ pub struct WhoamiResponse {
     pub name: String,
     pub is_admin: bool,
     pub groups: Vec<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +137,8 @@ struct CreateMemberRequest<'a> {
     name: &'a str,
     is_admin: bool,
     is_machine: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_key: Option<&'a str>,
     groups: &'a [String],
     token_label: &'a str,
 }
@@ -145,6 +149,8 @@ pub struct MemberInfo {
     pub name: String,
     pub is_admin: bool,
     pub is_machine: bool,
+    #[serde(default)]
+    pub public_key: Option<String>,
     pub groups: Vec<String>,
     pub revoked: bool,
 }
@@ -230,6 +236,65 @@ pub struct DeleteBranchRuleResponse {
     pub repository: String,
     pub pattern: String,
     pub removed: bool,
+}
+
+#[derive(Serialize)]
+struct SetPublicKeyRequest<'a> {
+    public_key: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemberPublicKeyResponse {
+    pub name: String,
+    pub public_key: String,
+}
+
+#[derive(Serialize)]
+struct PutSecretScopeRequest<'a> {
+    repository: &'a str,
+    scope: &'a str,
+    groups: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutSecretScopeResponse {
+    pub repository: String,
+    pub scope: String,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SecretScopeInfo {
+    pub scope: String,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListSecretScopesResponse {
+    pub repository: String,
+    pub scopes: Vec<SecretScopeInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteSecretScopeResponse {
+    pub repository: String,
+    pub scope: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScopeRecipientInfo {
+    pub member: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScopeRecipientsResponse {
+    pub repository: String,
+    pub scope: String,
+    pub groups: Vec<String>,
+    pub recipients: Vec<ScopeRecipientInfo>,
+    pub members_without_key: Vec<String>,
 }
 
 /// Blocking HTTP client for talking to a Scrim server's `/api/v1` endpoints.
@@ -330,6 +395,7 @@ impl ScrimClient {
         name: &str,
         is_admin: bool,
         is_machine: bool,
+        public_key: Option<&str>,
         groups: &[String],
         token_label: &str,
     ) -> anyhow::Result<CreateMemberResponse> {
@@ -337,10 +403,26 @@ impl ScrimClient {
             name,
             is_admin,
             is_machine,
+            public_key,
             groups,
             token_label,
         };
         self.send_json(Method::POST, "/api/v1/members", &[], &body)
+    }
+
+    pub fn set_own_public_key(&self, public_key: &str) -> anyhow::Result<MemberPublicKeyResponse> {
+        let body = SetPublicKeyRequest { public_key };
+        self.send_json(Method::PUT, "/api/v1/me/public-key", &[], &body)
+    }
+
+    pub fn set_member_public_key(
+        &self,
+        member: &str,
+        public_key: &str,
+    ) -> anyhow::Result<MemberPublicKeyResponse> {
+        let path = format!("/api/v1/members/{}/public-key", encode_path_segment(member));
+        let body = SetPublicKeyRequest { public_key };
+        self.send_json(Method::PUT, &path, &[], &body)
     }
 
     pub fn issue_token(&self, member: &str, label: &str) -> anyhow::Result<IssueTokenResponse> {
@@ -386,6 +468,52 @@ impl ScrimClient {
             Method::DELETE,
             "/api/v1/branch-rules",
             &[("repo", repository), ("pattern", pattern)],
+        )
+    }
+
+    pub fn put_secret_scope(
+        &self,
+        repository: &str,
+        scope: &str,
+        groups: &[String],
+    ) -> anyhow::Result<PutSecretScopeResponse> {
+        let body = PutSecretScopeRequest {
+            repository,
+            scope,
+            groups,
+        };
+        self.send_json(Method::PUT, "/api/v1/secret-scopes", &[], &body)
+    }
+
+    pub fn list_secret_scopes(&self, repository: &str) -> anyhow::Result<ListSecretScopesResponse> {
+        self.send_empty(
+            Method::GET,
+            "/api/v1/secret-scopes",
+            &[("repo", repository)],
+        )
+    }
+
+    pub fn delete_secret_scope(
+        &self,
+        repository: &str,
+        scope: &str,
+    ) -> anyhow::Result<DeleteSecretScopeResponse> {
+        self.send_empty(
+            Method::DELETE,
+            "/api/v1/secret-scopes",
+            &[("repo", repository), ("scope", scope)],
+        )
+    }
+
+    pub fn get_secret_scope_recipients(
+        &self,
+        repository: &str,
+        scope: &str,
+    ) -> anyhow::Result<ScopeRecipientsResponse> {
+        self.send_empty(
+            Method::GET,
+            "/api/v1/secret-scopes/recipients",
+            &[("repo", repository), ("scope", scope)],
         )
     }
 

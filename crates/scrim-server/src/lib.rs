@@ -8,7 +8,8 @@
 //! fetchable by object ID, nor pushable. Every push additionally passes the
 //! server-owned `pre-receive` guard (see [`run_pre_receive_hook_process`]),
 //! which authorizes each ref write exactly, refuses hidden objects smuggled in
-//! by ID, and blocks merges that would expose private commits.
+//! by ID, blocks merges that would expose private commits, and rejects pushes
+//! introducing plaintext `.env` files or high-confidence credentials.
 //!
 //! The same authenticated router serves the admin API under `/api/v1` (see
 //! [`MAX_ADMIN_BODY_BYTES`]), through which admins manage members, tokens,
@@ -24,6 +25,7 @@ mod git_service;
 mod policy_store;
 mod pre_receive;
 mod repo_path;
+mod secret_scan;
 
 use std::{
     collections::BTreeMap,
@@ -50,14 +52,15 @@ use git_service::{
 pub use policy_store::{
     API_TOKEN_PREFIX, AuditLogEntry, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
     CreatedMember, GroupMembershipChange, GroupRecord, GroupWithMembers, IssuedToken,
-    MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_TOKEN_LABEL_BYTES, MemberRecord,
-    MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore, PolicyStore, PolicyStoreError,
-    PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult,
+    MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_SCOPE_NAME_BYTES, MAX_TOKEN_LABEL_BYTES,
+    MemberPublicKeyRecord, MemberRecord, MemberRepoPolicy, MemoryPolicyStore, PgPolicyStore,
+    PolicyStore, PolicyStoreError, PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord,
+    RevokeMemberResult, ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
     StaticPolicyStore,
 };
 pub use pre_receive::{
-    ALLOW_MERGE_LEAK_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV,
-    run_pre_receive_hook_process,
+    ALLOW_MERGE_LEAK_PUSH_OPTION, ALLOW_SECRET_SCAN_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE,
+    PRE_RECEIVE_HOOK_MODE_ENV, run_pre_receive_hook_process,
 };
 use pre_receive::{HookDir, PreReceiveContext, start_pre_receive_session};
 use repo_path::{RepoHead, read_valid_head, resolve_bare_repo};

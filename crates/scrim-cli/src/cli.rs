@@ -2,19 +2,23 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Scrim for Git command-line client.
 #[derive(Debug, Parser)]
 #[command(
     name = "scrim",
     version,
-    about = "Manage Scrim for Git repositories, groups, access, and branch visibility"
+    about = "Manage Scrim for Git repositories, groups, access, branch visibility, and secrets"
 )]
 pub struct Cli {
     /// Path to config.toml [env: SCRIM_CONFIG].
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Path to the age private identity file [env: SCRIM_KEY_FILE].
+    #[arg(long, global = true, value_name = "PATH")]
+    pub key_file: Option<PathBuf>,
 
     /// Scrim server base URL, overriding saved config [env: SCRIM_SERVER].
     #[arg(long, global = true, value_name = "URL")]
@@ -34,6 +38,8 @@ pub enum Command {
     Login(LoginArgs),
     /// Show the authenticated member and group memberships.
     Whoami,
+    /// Generate a local age identity keypair and register its public key.
+    Keygen(KeygenArgs),
     /// Register a repository on the Scrim server and configure local Git.
     Init(InitArgs),
     /// Manage Scrim groups and group memberships.
@@ -42,6 +48,10 @@ pub enum Command {
     Access(AccessArgs),
     /// Manage private branch visibility rules.
     Branch(BranchArgs),
+    /// Manage encrypted repository secrets and scope permissions.
+    Secrets(SecretsArgs),
+    /// Run a command with decrypted scope secrets injected into its environment.
+    Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -49,6 +59,17 @@ pub struct LoginArgs {
     /// Read the authentication token from standard input without prompting.
     #[arg(long)]
     pub token_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct KeygenArgs {
+    /// Overwrite an existing identity file.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Save the identity locally without uploading the public key to the server.
+    #[arg(long)]
+    pub local_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +140,12 @@ pub enum AccessCommand {
     Revoke {
         /// Member name.
         member: String,
+        /// Server repository key (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+        /// Skip rotating local .scrim/ secret scopes that include this member.
+        #[arg(long)]
+        no_rotate: bool,
     },
     /// List members.
     List {
@@ -133,6 +160,13 @@ pub enum AccessCommand {
         /// Human-readable label for the issued token.
         #[arg(long, default_value = "default", value_name = "LABEL")]
         label: String,
+    },
+    /// Set or replace a member's age public key.
+    SetKey {
+        /// Member name.
+        member: String,
+        /// Canonical age1... X25519 public key.
+        public_key: String,
     },
 }
 
@@ -156,6 +190,14 @@ pub struct GrantArgs {
     /// Label for the initial authentication token.
     #[arg(long, default_value = "default", value_name = "LABEL")]
     pub token_label: String,
+
+    /// Pre-register an existing age1... public key for the member.
+    #[arg(long, value_name = "PUBLIC_KEY", conflicts_with = "generate_key")]
+    pub public_key: Option<String>,
+
+    /// Generate a fresh age identity and register its public key (default for --machine).
+    #[arg(long, conflicts_with = "public_key")]
+    pub generate_key: bool,
 }
 
 #[derive(Debug, Args)]
@@ -192,4 +234,136 @@ pub enum BranchCommand {
         #[arg(long, value_name = "REPO")]
         repo: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsArgs {
+    #[command(subcommand)]
+    pub command: SecretsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsCommand {
+    /// Encrypt and store a secret in a repository scope.
+    Set(SecretsSetArgs),
+    /// Decrypt and print a single secret value.
+    Get {
+        /// Secret key name.
+        key: String,
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+    /// List secret key names in a scope without printing values.
+    List {
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+    /// Remove a secret from a scope.
+    Rm {
+        /// Secret key name.
+        key: String,
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+    /// Export decrypted secrets in a structured format.
+    Export {
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ExportFormat::Dotenv)]
+        format: ExportFormat,
+    },
+    /// Rotate a scope's data key to match current authorized recipients on the server.
+    Sync {
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        /// Server repository key (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+    },
+    /// Manage server-side secret scope group permissions.
+    Scope(SecretsScopeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsSetArgs {
+    /// Secret entry as KEY=VALUE, or bare KEY when --value-stdin is set.
+    pub entry: String,
+
+    /// Secret scope name.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: String,
+
+    /// Read the secret value from standard input instead of KEY=VALUE.
+    #[arg(long)]
+    pub value_stdin: bool,
+
+    /// Server repository key (defaults to local git config scrim.repo).
+    #[arg(long, value_name = "REPO")]
+    pub repo: Option<String>,
+
+    /// Create a new scope locally using only the caller's own public key without contacting the server.
+    #[arg(long)]
+    pub offline: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ExportFormat {
+    Dotenv,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsScopeArgs {
+    #[command(subcommand)]
+    pub command: SecretsScopeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsScopeCommand {
+    /// Configure groups allowed to access a secret scope on the server.
+    Set {
+        /// Secret scope name.
+        scope: String,
+        /// Groups allowed to read secrets in this scope (repeatable, at least one required).
+        #[arg(long = "group", required = true, value_name = "GROUP")]
+        groups: Vec<String>,
+        /// Server repository key (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+    },
+    /// List secret scopes configured for a repository on the server.
+    List {
+        /// Server repository key (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+    },
+    /// Remove a secret scope configuration from the server.
+    Rm {
+        /// Secret scope name.
+        scope: String,
+        /// Server repository key (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Secret scope to decrypt and inject into the child process environment.
+    #[arg(long, value_name = "SCOPE")]
+    pub scope: String,
+
+    /// Command and arguments to execute.
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<String>,
 }

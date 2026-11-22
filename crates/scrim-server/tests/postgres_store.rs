@@ -25,8 +25,9 @@ use axum::{
 use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
 use scrim_server::{
-    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, PgPolicyStore,
-    PolicyStore, PolicyStoreError,
+    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, MemberPublicKeyRecord,
+    PgPolicyStore, PolicyStore, PolicyStoreError, ScopeRecipient, ScopeRecipientsRecord,
+    SecretScopeRecord,
 };
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -590,6 +591,7 @@ fn member_request(name: &str, is_admin: bool, groups: &[&str]) -> CreateMemberRe
         name: name.to_owned(),
         is_admin,
         is_machine: false,
+        public_key: None,
         groups: group_set(groups),
         token_label: format!("{name}-laptop"),
     }
@@ -1050,5 +1052,235 @@ async fn administers_repositories_and_branch_rules() {
             ),
         ]
     );
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn administers_member_public_keys_and_secret_scopes() {
+    const AGE_KEY_1: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+    const AGE_KEY_2: &str = "age1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqerzwta";
+    const AGE_KEY_3: &str = "age1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqxpnvqe";
+
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let admin = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let admin_id = Some(admin.member.id);
+
+    for group in ["core", "security", "ops"] {
+        if let Err(error) = store.create_group(admin_id, group).await {
+            panic!("create_group {group} failed: {error}");
+        }
+    }
+
+    let mut alice_req = member_request("alice", false, &["core", "security"]);
+    alice_req.public_key = Some(AGE_KEY_1.to_owned());
+    let alice = create_member_ok(store, alice_req).await;
+    assert_eq!(alice.member.public_key.as_deref(), Some(AGE_KEY_1));
+
+    let bob = create_member_ok(store, member_request("bob", false, &["core"])).await;
+    assert_eq!(bob.member.public_key, None);
+    let _carol = create_member_ok(store, member_request("carol", false, &["security"])).await;
+
+    let mut revoked_req = member_request("revoked", false, &["core"]);
+    revoked_req.public_key = Some(AGE_KEY_3.to_owned());
+    let _revoked = create_member_ok(store, revoked_req).await;
+    if let Err(error) = store.revoke_member(admin_id, "revoked").await {
+        panic!("revoke_member failed: {error}");
+    }
+
+    match store.get_member_public_key(alice.member.id).await {
+        Ok(key) => assert_eq!(key.as_deref(), Some(AGE_KEY_1)),
+        Err(error) => panic!("get_member_public_key alice failed: {error}"),
+    }
+    match store.get_member_public_key(bob.member.id).await {
+        Ok(key) => assert_eq!(key, None),
+        Err(error) => panic!("get_member_public_key bob failed: {error}"),
+    }
+
+    match store
+        .set_member_public_key(admin_id, "bob", AGE_KEY_2)
+        .await
+    {
+        Ok(record) => assert_eq!(
+            record,
+            MemberPublicKeyRecord {
+                name: "bob".to_owned(),
+                public_key: AGE_KEY_2.to_owned(),
+            }
+        ),
+        Err(error) => panic!("set_member_public_key failed: {error}"),
+    }
+    assert_not_found(
+        store
+            .set_member_public_key(admin_id, "revoked", AGE_KEY_3)
+            .await,
+    );
+    assert_not_found(
+        store
+            .set_member_public_key(admin_id, "nobody", AGE_KEY_3)
+            .await,
+    );
+    match store
+        .set_member_public_key(admin_id, "bob", "not-an-age-key")
+        .await
+    {
+        Err(PolicyStoreError::InvalidInput(_)) => {}
+        Err(error) => panic!("expected InvalidInput, got: {error}"),
+        Ok(_) => panic!("invalid age key was stored"),
+    }
+
+    if let Err(error) = store.register_repository(admin_id, "team/app.git").await {
+        panic!("register team/app.git failed: {error}");
+    }
+    if let Err(error) = store.register_repository(admin_id, "alpha.git").await {
+        panic!("register alpha.git failed: {error}");
+    }
+
+    assert_not_found(
+        store
+            .set_secret_scope(admin_id, "missing.git", "dev", group_set(&["core"]))
+            .await,
+    );
+    assert_not_found(
+        store
+            .set_secret_scope(admin_id, "team/app.git", "dev", group_set(&["ghosts"]))
+            .await,
+    );
+
+    match store
+        .set_secret_scope(admin_id, "team/app.git", "prod", group_set(&["ops"]))
+        .await
+    {
+        Ok(record) => assert_eq!(
+            record,
+            SecretScopeRecord {
+                repository: "team/app.git".to_owned(),
+                scope: "prod".to_owned(),
+                groups: vec!["ops".to_owned()],
+            }
+        ),
+        Err(error) => panic!("set_secret_scope prod failed: {error}"),
+    }
+    if let Err(error) = store
+        .set_secret_scope(admin_id, "team/app.git", "dev", group_set(&["core"]))
+        .await
+    {
+        panic!("set_secret_scope dev failed: {error}");
+    }
+    if let Err(error) = store
+        .set_secret_scope(
+            admin_id,
+            "team/app.git",
+            "dev",
+            group_set(&["security", "core"]),
+        )
+        .await
+    {
+        panic!("update set_secret_scope dev failed: {error}");
+    }
+
+    match store.list_secret_scopes("team/app.git").await {
+        Ok(scopes) => assert_eq!(
+            scopes,
+            vec![
+                SecretScopeRecord {
+                    repository: "team/app.git".to_owned(),
+                    scope: "dev".to_owned(),
+                    groups: vec!["core".to_owned(), "security".to_owned()],
+                },
+                SecretScopeRecord {
+                    repository: "team/app.git".to_owned(),
+                    scope: "prod".to_owned(),
+                    groups: vec!["ops".to_owned()],
+                },
+            ]
+        ),
+        Err(error) => panic!("list_secret_scopes failed: {error}"),
+    }
+    match store.list_secret_scopes("alpha.git").await {
+        Ok(scopes) => assert!(scopes.is_empty()),
+        Err(error) => panic!("list_secret_scopes alpha.git failed: {error}"),
+    }
+    assert_not_found(store.list_secret_scopes("missing.git").await);
+
+    match store
+        .resolve_secret_scope_recipients("team/app.git", "dev")
+        .await
+    {
+        Ok(resolved) => assert_eq!(
+            resolved,
+            ScopeRecipientsRecord {
+                repository: "team/app.git".to_owned(),
+                scope: "dev".to_owned(),
+                groups: vec!["core".to_owned(), "security".to_owned()],
+                recipients: vec![
+                    ScopeRecipient {
+                        member: "alice".to_owned(),
+                        public_key: AGE_KEY_1.to_owned(),
+                    },
+                    ScopeRecipient {
+                        member: "bob".to_owned(),
+                        public_key: AGE_KEY_2.to_owned(),
+                    },
+                ],
+                members_without_key: vec!["carol".to_owned()],
+            }
+        ),
+        Err(error) => panic!("resolve_secret_scope_recipients failed: {error}"),
+    }
+    assert_not_found(
+        store
+            .resolve_secret_scope_recipients("team/app.git", "qa")
+            .await,
+    );
+    assert_not_found(
+        store
+            .resolve_secret_scope_recipients("missing.git", "dev")
+            .await,
+    );
+
+    match store
+        .remove_secret_scope(admin_id, "team/app.git", "prod")
+        .await
+    {
+        Ok(removed) => assert!(removed),
+        Err(error) => panic!("remove_secret_scope failed: {error}"),
+    }
+    assert_not_found(
+        store
+            .remove_secret_scope(admin_id, "team/app.git", "prod")
+            .await,
+    );
+    assert_not_found(
+        store
+            .resolve_secret_scope_recipients("team/app.git", "prod")
+            .await,
+    );
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM secret_scope_groups")
+            .await,
+        2
+    );
+
+    let audit_rows = isolated.audit_rows().await;
+    assert!(audit_rows.iter().any(|(action, target_type, target_name)| {
+        action == "member.public_key_set" && target_type == "member" && target_name == "bob"
+    }));
+    assert!(audit_rows.iter().any(|(action, target_type, target_name)| {
+        action == "secret_scope.set"
+            && target_type == "secret_scope"
+            && target_name == "team/app.git:dev"
+    }));
+    assert!(audit_rows.iter().any(|(action, target_type, target_name)| {
+        action == "secret_scope.remove"
+            && target_type == "secret_scope"
+            && target_name == "team/app.git:prod"
+    }));
+
     isolated.drop_schema().await;
 }

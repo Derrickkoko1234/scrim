@@ -222,6 +222,17 @@ fn run_bin(
     config_path: &Path,
     stdin_data: Option<&str>,
 ) -> Output {
+    run_bin_with_env(bin, args, cwd, config_path, &[], stdin_data)
+}
+
+fn run_bin_with_env(
+    bin: &str,
+    args: &[&str],
+    cwd: &Path,
+    config_path: &Path,
+    extra_env: &[(&str, &str)],
+    stdin_data: Option<&str>,
+) -> Output {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
@@ -230,8 +241,14 @@ fn run_bin(
         .env_remove("SCRIM_TOKEN")
         .env_remove("SCRIM_CONFIG_DIR")
         .env_remove("XDG_CONFIG_HOME")
+        .env_remove("SCRIM_KEY")
+        .env_remove("SCRIM_KEY_FILE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
@@ -903,4 +920,675 @@ fn does_not_follow_redirects_and_validates_init_inputs() {
         git_stdout(&dot_git_dir, &["config", "--local", "--get", "scrim.repo"]).as_deref(),
         Some("service.git")
     );
+}
+
+#[test]
+fn keygen_local_only_permissions_force_and_server_upload() {
+    let uploaded_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let uploaded_key_srv = Arc::clone(&uploaded_key);
+
+    let server = MockServer::start(
+        move |req| match (req.method.as_str(), req.target.as_str()) {
+            ("PUT", "/api/v1/me/public-key") => {
+                let parsed: serde_json::Value =
+                    must(serde_json::from_str(&req.body), "parse public-key body");
+                let pk = must_some(parsed["public_key"].as_str(), "public_key").to_owned();
+                {
+                    let mut guard = match uploaded_key_srv.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    *guard = Some(pk.clone());
+                }
+                (200, format!(r#"{{"name":"alice","public_key":"{pk}"}}"#))
+            }
+            ("GET", "/api/v1/whoami") => {
+                let guard = match uploaded_key_srv.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let pk_json = match guard.as_deref() {
+                    Some(pk) => format!(r#""{pk}""#),
+                    None => "null".to_owned(),
+                };
+                (
+                    200,
+                    format!(
+                        r#"{{"id":1,"name":"alice","is_admin":false,"groups":["core"],"public_key":{pk_json}}}"#
+                    ),
+                )
+            }
+            _ => (404, r#"{"error":"not found"}"#.to_owned()),
+        },
+    );
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config_dir = tmp.path().join("cfg");
+    let config_path = config_dir.join("config.toml");
+    let identity_path = config_dir.join("identity.age");
+
+    // 1. Online keygen without login fails cleanly before generating a key file.
+    let no_auth = run_bin(scrim_bin(), &["keygen"], tmp.path(), &config_path, None);
+    assert!(!no_auth.status.success());
+    assert!(!identity_path.exists());
+
+    // 2. Local-only keygen generates 0600 key file without contacting any server.
+    let local_out = run_bin(
+        scrim_bin(),
+        &["keygen", "--local-only"],
+        tmp.path(),
+        &config_path,
+        None,
+    );
+    assert!(
+        local_out.status.success(),
+        "local keygen failed: {}",
+        stderr_str(&local_out)
+    );
+    let local_stdout = stdout_str(&local_out);
+    assert!(local_stdout.contains("Public key: age1"));
+    assert!(!local_stdout.contains("AGE-SECRET-KEY-1"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = must(fs::metadata(&identity_path), "stat identity.age");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    let first_key = must(fs::read_to_string(&identity_path), "read identity.age");
+    assert!(first_key.trim().starts_with("AGE-SECRET-KEY-1"));
+
+    // 3. Refuses overwrite without --force.
+    let refuse_out = run_bin(
+        scrim_bin(),
+        &["keygen", "--local-only"],
+        tmp.path(),
+        &config_path,
+        None,
+    );
+    assert!(!refuse_out.status.success());
+    assert!(stderr_str(&refuse_out).contains("--force"));
+    assert_eq!(
+        must(fs::read_to_string(&identity_path), "re-read identity.age"),
+        first_key
+    );
+
+    // 4. Online keygen --force saves new key and uploads its public key.
+    must(
+        fs::write(
+            &config_path,
+            format!("server = \"{}\"\ntoken = \"scrim_tok\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+    let online_out = run_bin(
+        scrim_bin(),
+        &["keygen", "--force"],
+        tmp.path(),
+        &config_path,
+        None,
+    );
+    assert!(
+        online_out.status.success(),
+        "online keygen failed: {}",
+        stderr_str(&online_out)
+    );
+    let second_key = must(fs::read_to_string(&identity_path), "read overwritten key");
+    assert_ne!(first_key, second_key);
+
+    let whoami_out = run_bin(scrim_bin(), &["whoami"], tmp.path(), &config_path, None);
+    assert!(whoami_out.status.success(), "{}", stderr_str(&whoami_out));
+    let guard = match uploaded_key.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let expected_pk = must_some(guard.as_deref(), "uploaded public key");
+    assert!(stdout_str(&whoami_out).contains(&format!("Public key: {expected_pk}")));
+}
+
+#[test]
+fn offline_secrets_roundtrip_run_exit_codes_and_scrim_key_env() {
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config_dir = tmp.path().join("cfg");
+    let config_path = config_dir.join("config.toml");
+    let identity_path = config_dir.join("identity.age");
+    let repo_dir = init_temp_git_repo(tmp.path(), "secrets-app");
+
+    // Generate offline keypair.
+    let kg = run_bin(
+        scrim_bin(),
+        &["keygen", "--local-only"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(kg.status.success(), "{}", stderr_str(&kg));
+
+    // Set KEY=VALUE containing `=` offline.
+    let set1 = run_bin(
+        scrim_bin(),
+        &[
+            "secrets",
+            "set",
+            "DATABASE_URL=postgres://user:a=b@localhost/app",
+            "--scope",
+            "dev",
+            "--offline",
+        ],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(set1.status.success(), "{}", stderr_str(&set1));
+    assert!(!stdout_str(&set1).contains("postgres://"));
+    assert!(repo_dir.join(".scrim/keys/dev.toml").exists());
+    assert!(repo_dir.join(".scrim/secrets/dev.enc").exists());
+
+    // Set via --value-stdin (scope already exists -> completely offline even without --offline).
+    let set2 = run_bin(
+        scrim_bin(),
+        &[
+            "secrets",
+            "set",
+            "API_TOKEN",
+            "--scope",
+            "dev",
+            "--value-stdin",
+        ],
+        &repo_dir,
+        &config_path,
+        Some("tok_with_spaces hello\r\n"),
+    );
+    assert!(set2.status.success(), "{}", stderr_str(&set2));
+
+    // Get, list, export.
+    let get1 = run_bin(
+        scrim_bin(),
+        &["secrets", "get", "DATABASE_URL", "--scope", "dev"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(get1.status.success(), "{}", stderr_str(&get1));
+    assert_eq!(stdout_str(&get1), "postgres://user:a=b@localhost/app\n");
+
+    let list_out = run_bin(
+        scrim_bin(),
+        &["secrets", "list", "--scope", "dev"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(list_out.status.success(), "{}", stderr_str(&list_out));
+    assert_eq!(stdout_str(&list_out), "API_TOKEN\nDATABASE_URL\n");
+
+    let export_out = run_bin(
+        scrim_bin(),
+        &["secrets", "export", "--scope", "dev", "--format", "dotenv"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(export_out.status.success(), "{}", stderr_str(&export_out));
+    assert_eq!(
+        stdout_str(&export_out),
+        "API_TOKEN=\"tok_with_spaces hello\"\nDATABASE_URL=postgres://user:a=b@localhost/app\n"
+    );
+
+    // `scrim run` injects env vars and propagates non-zero exit code cleanly without error banner.
+    let run_ok = run_bin(
+        scrim_bin(),
+        &[
+            "run",
+            "--scope",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s|%s' \"$DATABASE_URL\" \"$API_TOKEN\"",
+        ],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(run_ok.status.success(), "{}", stderr_str(&run_ok));
+    assert_eq!(
+        stdout_str(&run_ok),
+        "postgres://user:a=b@localhost/app|tok_with_spaces hello"
+    );
+
+    let run_exit = run_bin(
+        scrim_bin(),
+        &["run", "--scope", "dev", "--", "sh", "-c", "exit 42"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert_eq!(run_exit.status.code(), Some(42));
+    assert!(
+        stderr_str(&run_exit).is_empty(),
+        "unexpected stderr on child non-zero exit: {}",
+        stderr_str(&run_exit)
+    );
+
+    // Remove a key and confirm it is gone.
+    let rm_out = run_bin(
+        scrim_bin(),
+        &["secrets", "rm", "API_TOKEN", "--scope", "dev"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(rm_out.status.success(), "{}", stderr_str(&rm_out));
+    let get_missing = run_bin(
+        scrim_bin(),
+        &["secrets", "get", "API_TOKEN", "--scope", "dev"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(!get_missing.status.success());
+
+    // Delete key file from disk and decrypt solely via SCRIM_KEY env var!
+    let secret_key = must(fs::read_to_string(&identity_path), "read identity.age");
+    must(fs::remove_file(&identity_path), "remove identity.age");
+
+    let run_ci = run_bin_with_env(
+        scrim_bin(),
+        &[
+            "run",
+            "--scope",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$DATABASE_URL\"",
+        ],
+        &repo_dir,
+        &config_path,
+        &[("SCRIM_KEY", secret_key.trim())],
+        None,
+    );
+    assert!(run_ci.status.success(), "{}", stderr_str(&run_ci));
+    assert_eq!(stdout_str(&run_ci), "postgres://user:a=b@localhost/app");
+
+    // Also works in a bare CI container with ONLY PATH + SCRIM_KEY (no HOME or SCRIM_CONFIG).
+    let mut bare_cmd = Command::new(scrim_bin());
+    bare_cmd
+        .args([
+            "run",
+            "--scope",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$DATABASE_URL\"",
+        ])
+        .current_dir(&repo_dir)
+        .env_clear()
+        .env("SCRIM_KEY", secret_key.trim());
+    if let Ok(path_val) = std::env::var("PATH") {
+        bare_cmd.env("PATH", path_val);
+    }
+    let bare_ci = must(bare_cmd.output(), "run bare CI scrim run");
+    assert!(bare_ci.status.success(), "{}", stderr_str(&bare_ci));
+    assert_eq!(stdout_str(&bare_ci), "postgres://user:a=b@localhost/app");
+}
+
+#[test]
+fn secret_scopes_set_key_machine_grant_sync_and_revoke_rotation() {
+    use scrim_crypto::MemberIdentity;
+
+    let alice_id = MemberIdentity::generate();
+    let alice_pk = alice_id.public_key().as_str().to_owned();
+    let bob_id = MemberIdentity::generate();
+    let bob_pk = bob_id.public_key().as_str().to_owned();
+
+    let bob_active = Arc::new(AtomicBool::new(true));
+    let bob_active_srv = Arc::clone(&bob_active);
+
+    let alice_pk_srv = alice_pk.clone();
+    let bob_pk_srv = bob_pk.clone();
+
+    let server = MockServer::start(
+        move |req| match (req.method.as_str(), req.target.as_str()) {
+            ("PUT", "/api/v1/secret-scopes") => {
+                let parsed: serde_json::Value =
+                    must(serde_json::from_str(&req.body), "parse put secret-scope");
+                assert_eq!(parsed["repository"], serde_json::json!("org/app.git"));
+                assert_eq!(parsed["scope"], serde_json::json!("prod"));
+                assert_eq!(parsed["groups"], serde_json::json!(["core"]));
+                (
+                    200,
+                    r#"{"repository":"org/app.git","scope":"prod","groups":["core"]}"#.to_owned(),
+                )
+            }
+            ("GET", "/api/v1/secret-scopes?repo=org%2Fapp.git") => (
+                200,
+                r#"{"repository":"org/app.git","scopes":[{"scope":"prod","groups":["core"]}]}"#
+                    .to_owned(),
+            ),
+            ("DELETE", "/api/v1/secret-scopes?repo=org%2Fapp.git&scope=prod") => (
+                200,
+                r#"{"repository":"org/app.git","scope":"prod","removed":true}"#.to_owned(),
+            ),
+            ("PUT", "/api/v1/members/bob/public-key") => {
+                let parsed: serde_json::Value =
+                    must(serde_json::from_str(&req.body), "parse set-key");
+                let pk = must_some(parsed["public_key"].as_str(), "public_key");
+                (200, format!(r#"{{"name":"bob","public_key":"{pk}"}}"#))
+            }
+            ("POST", "/api/v1/members") => {
+                let parsed: serde_json::Value =
+                    must(serde_json::from_str(&req.body), "parse create-member");
+                let pk = must_some(parsed["public_key"].as_str(), "public_key in create-member");
+                assert!(
+                    pk.starts_with("age1"),
+                    "expected machine public_key in body"
+                );
+                (
+                    201,
+                    format!(
+                        r#"{{"member":{{"id":5,"name":"ci-runner","is_admin":false,"is_machine":true,"public_key":"{pk}","groups":["core"],"revoked":false}},"token":"scrim_ci_tok"}}"#
+                    ),
+                )
+            }
+            ("GET", "/api/v1/secret-scopes/recipients?repo=org%2Fapp.git&scope=prod") => {
+                if bob_active_srv.load(Ordering::Relaxed) {
+                    (
+                        200,
+                        format!(
+                            r#"{{"repository":"org/app.git","scope":"prod","groups":["core"],"recipients":[{{"member":"alice","public_key":"{alice_pk_srv}"}},{{"member":"bob","public_key":"{bob_pk_srv}"}}],"members_without_key":["carol"]}}"#
+                        ),
+                    )
+                } else {
+                    (
+                        200,
+                        format!(
+                            r#"{{"repository":"org/app.git","scope":"prod","groups":["core"],"recipients":[{{"member":"alice","public_key":"{alice_pk_srv}"}}],"members_without_key":[]}}"#
+                        ),
+                    )
+                }
+            }
+            ("DELETE", "/api/v1/members/bob") => {
+                bob_active_srv.store(false, Ordering::Relaxed);
+                (200, r#"{"name":"bob","revoked":true}"#.to_owned())
+            }
+            _ => (
+                404,
+                format!(r#"{{"error":"unexpected {} {}"}}"#, req.method, req.target),
+            ),
+        },
+    );
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config_dir = tmp.path().join("cfg");
+    let config_path = config_dir.join("config.toml");
+    must(fs::create_dir_all(&config_dir), "create cfg dir");
+    must(
+        fs::write(
+            &config_path,
+            format!("server = \"{}\"\ntoken = \"scrim_admin\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+
+    let alice_key_file = config_dir.join("identity.age");
+    must(
+        fs::write(
+            &alice_key_file,
+            format!("{}\n", {
+                use scrim_crypto::ExposeSecret;
+                alice_id.to_secret_string().expose_secret().to_owned()
+            }),
+        ),
+        "write alice identity.age",
+    );
+
+    let repo_dir = init_temp_git_repo(tmp.path(), "prod-repo");
+    let set_repo = must(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["config", "--local", "scrim.repo", "org/app.git"])
+            .output(),
+        "set scrim.repo",
+    );
+    assert!(set_repo.status.success());
+
+    // 1. Secret scope management commands.
+    let scope_set = run_bin(
+        scrim_bin(),
+        &["secrets", "scope", "set", "prod", "--group", "core"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(scope_set.status.success(), "{}", stderr_str(&scope_set));
+
+    let scope_list = run_bin(
+        scrim_bin(),
+        &["secrets", "scope", "list"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(scope_list.status.success(), "{}", stderr_str(&scope_list));
+    assert!(stdout_str(&scope_list).contains("prod: core"));
+
+    let scope_rm = run_bin(
+        scrim_bin(),
+        &["secrets", "scope", "rm", "prod"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(scope_rm.status.success(), "{}", stderr_str(&scope_rm));
+
+    // 2. Access set-key (rejects bad key locally) & machine grant (prints SCRIM_KEY once).
+    let bad_set_key = run_bin(
+        scrim_bin(),
+        &["access", "set-key", "bob", "not-an-age-key"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(!bad_set_key.status.success());
+
+    let ok_set_key = run_bin(
+        scrim_bin(),
+        &["access", "set-key", "bob", &bob_pk],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(ok_set_key.status.success(), "{}", stderr_str(&ok_set_key));
+
+    let grant_machine = run_bin(
+        scrim_bin(),
+        &[
+            "access",
+            "grant",
+            "ci-runner",
+            "--machine",
+            "--group",
+            "core",
+        ],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(
+        grant_machine.status.success(),
+        "{}",
+        stderr_str(&grant_machine)
+    );
+    let grant_stdout = stdout_str(&grant_machine);
+    assert!(grant_stdout.contains("Token (shown only once): scrim_ci_tok"));
+    assert!(grant_stdout.contains("SCRIM_KEY (shown only once): AGE-SECRET-KEY-1"));
+
+    // 3. Create scope `prod` online (wraps for alice and bob, warns about carol).
+    let set_secret = run_bin(
+        scrim_bin(),
+        &[
+            "secrets",
+            "set",
+            "STRIPE_KEY=sk_live_123",
+            "--scope",
+            "prod",
+        ],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(set_secret.status.success(), "{}", stderr_str(&set_secret));
+    assert!(stderr_str(&set_secret).contains("carol"));
+
+    // Bob can decrypt generation 1 via SCRIM_KEY.
+    let bob_secret_str = {
+        use scrim_crypto::ExposeSecret;
+        bob_id.to_secret_string().expose_secret().to_owned()
+    };
+    let bob_get1 = run_bin_with_env(
+        scrim_bin(),
+        &["secrets", "get", "STRIPE_KEY", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        &[("SCRIM_KEY", &bob_secret_str)],
+        None,
+    );
+    assert!(bob_get1.status.success(), "{}", stderr_str(&bob_get1));
+    assert_eq!(stdout_str(&bob_get1), "sk_live_123\n");
+
+    // 4. `scrim secrets sync` rotates generation 1 -> 2 when bob is removed on server.
+    bob_active.store(false, Ordering::Relaxed);
+    let sync_out = run_bin(
+        scrim_bin(),
+        &["secrets", "sync", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(sync_out.status.success(), "{}", stderr_str(&sync_out));
+    let sync_stdout = stdout_str(&sync_out);
+    assert!(sync_stdout.contains("generation 2"));
+    assert!(sync_stdout.contains("Secrets to rotate at their source:"));
+    assert!(sync_stdout.contains("STRIPE_KEY"));
+
+    // Bob can no longer decrypt generation 2.
+    let bob_get2 = run_bin_with_env(
+        scrim_bin(),
+        &["secrets", "get", "STRIPE_KEY", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        &[("SCRIM_KEY", &bob_secret_str)],
+        None,
+    );
+    assert!(!bob_get2.status.success());
+
+    // 5. Re-add bob via offline keys file or re-enable bob, set another secret, and test `scrim access revoke bob` rotation!
+    bob_active.store(true, Ordering::Relaxed);
+    let sync_back = run_bin(
+        scrim_bin(),
+        &["secrets", "sync", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(sync_back.status.success(), "{}", stderr_str(&sync_back));
+
+    let revoke_out = run_bin(
+        scrim_bin(),
+        &["access", "revoke", "bob"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(revoke_out.status.success(), "{}", stderr_str(&revoke_out));
+    let revoke_stdout = stdout_str(&revoke_out);
+    assert!(revoke_stdout.contains("Revoked access for bob"));
+    assert!(revoke_stdout.contains("Rotated scope 'prod' to generation 4"));
+    assert!(revoke_stdout.contains("Secrets to rotate at their source:"));
+    assert!(revoke_stdout.contains("STRIPE_KEY"));
+    assert!(revoke_stdout.contains("Remember to commit and push the updated .scrim/ files."));
+
+    // Bob cannot decrypt generation 4, Alice still can.
+    let bob_get4 = run_bin_with_env(
+        scrim_bin(),
+        &["secrets", "get", "STRIPE_KEY", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        &[("SCRIM_KEY", &bob_secret_str)],
+        None,
+    );
+    assert!(!bob_get4.status.success());
+
+    let alice_get4 = run_bin(
+        scrim_bin(),
+        &["secrets", "get", "STRIPE_KEY", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(alice_get4.status.success(), "{}", stderr_str(&alice_get4));
+    assert_eq!(stdout_str(&alice_get4), "sk_live_123\n");
+
+    // 6. Test --no-rotate and missing identity warning during revoke.
+    bob_active.store(true, Ordering::Relaxed);
+    let sync_5 = run_bin(
+        scrim_bin(),
+        &["secrets", "sync", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(sync_5.status.success(), "{}", stderr_str(&sync_5));
+
+    let revoke_no_rotate = run_bin(
+        scrim_bin(),
+        &["access", "revoke", "bob", "--no-rotate"],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(
+        revoke_no_rotate.status.success(),
+        "{}",
+        stderr_str(&revoke_no_rotate)
+    );
+    assert!(!stdout_str(&revoke_no_rotate).contains("Rotated scope"));
+
+    // Bob can still decrypt generation 5 because --no-rotate skipped rotation.
+    let bob_get5 = run_bin_with_env(
+        scrim_bin(),
+        &["secrets", "get", "STRIPE_KEY", "--scope", "prod"],
+        &repo_dir,
+        &config_path,
+        &[("SCRIM_KEY", &bob_secret_str)],
+        None,
+    );
+    assert!(bob_get5.status.success(), "{}", stderr_str(&bob_get5));
+
+    // Revoking without a local identity warns without failing the server revocation.
+    let missing_key_path = config_dir.join("missing.age");
+    let revoke_missing_key = run_bin(
+        scrim_bin(),
+        &[
+            "--key-file",
+            &missing_key_path.to_string_lossy(),
+            "access",
+            "revoke",
+            "bob",
+        ],
+        &repo_dir,
+        &config_path,
+        None,
+    );
+    assert!(
+        revoke_missing_key.status.success(),
+        "revoke should still succeed when local key is missing: {}",
+        stderr_str(&revoke_missing_key)
+    );
+    assert!(stderr_str(&revoke_missing_key).contains("scrim secrets sync"));
 }
