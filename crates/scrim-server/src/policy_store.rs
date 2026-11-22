@@ -17,8 +17,10 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PublicKey};
 use scrim_policy::{
     BranchPolicy, BranchRule, MAX_PATH_RULES, PolicyError, WithholdPolicy, WithholdRule,
     validate_path_glob,
@@ -36,6 +38,9 @@ use crate::{
     repo_path::is_valid_repo_path,
 };
 
+/// Maximum byte length of an OpenSSH public key line accepted for a member.
+pub const MAX_SSH_PUBLIC_KEY_BYTES: usize = 4096;
+
 /// Maximum byte length of a member or group name.
 pub const MAX_NAME_BYTES: usize = 64;
 
@@ -47,6 +52,12 @@ pub const MAX_TOKEN_LABEL_BYTES: usize = 128;
 
 /// Maximum byte length of a registered repository path.
 pub const MAX_REPOSITORY_PATH_BYTES: usize = 256;
+
+/// Default page size for [`PolicyStore::list_audit_log`].
+pub const DEFAULT_AUDIT_LOG_LIMIT: u32 = 50;
+
+/// Maximum page size for [`PolicyStore::list_audit_log`].
+pub const MAX_AUDIT_LOG_LIMIT: u32 = 500;
 
 /// Prefix of every API token the server issues.
 pub const API_TOKEN_PREFIX: &str = "scrim_";
@@ -116,6 +127,51 @@ impl AuditLogEntry {
             details,
         }
     }
+}
+
+/// Filters and keyset-pagination parameters for [`PolicyStore::list_audit_log`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditLogQuery {
+    /// Optional acting member name filter.
+    pub actor: Option<String>,
+    /// Optional exact action filter (e.g. `path_rule.set`).
+    pub action: Option<String>,
+    /// Optional exact target type filter (e.g. `path_rule`).
+    pub target_type: Option<String>,
+    /// Maximum number of entries to return (`1..=MAX_AUDIT_LOG_LIMIT`).
+    pub limit: u32,
+    /// Optional exclusive keyset cursor: return entries with `id < before_id`.
+    pub before_id: Option<i64>,
+}
+
+/// One stored audit log row as returned by [`PolicyStore::list_audit_log`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditLogRecord {
+    /// Monotonic database ID of the audit entry.
+    pub id: i64,
+    /// RFC 3339 UTC timestamp when the entry was recorded (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub occurred_at: String,
+    /// ID of the acting member (`None` when not tied to a member row).
+    pub actor_member_id: Option<i64>,
+    /// Resolved name of the acting member (`None` when unavailable).
+    pub actor_name: Option<String>,
+    /// Machine-readable action name.
+    pub action: String,
+    /// Kind of target acted on.
+    pub target_type: String,
+    /// Human-readable target identifier.
+    pub target_name: String,
+    /// Structured JSON metadata stored in `audit_log.details`.
+    pub details: serde_json::Value,
+}
+
+/// One page of audit log entries returned by [`PolicyStore::list_audit_log`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditLogPage {
+    /// Matching entries ordered newest-first (`id` descending).
+    pub entries: Vec<AuditLogRecord>,
+    /// Cursor to pass as `before_id` for the next older page, if more entries exist.
+    pub next_before_id: Option<i64>,
 }
 
 /// A registered repository.
@@ -212,6 +268,23 @@ pub struct MemberPublicKeyRecord {
     pub name: String,
     /// Validated `age` public key stored for the member.
     pub public_key: String,
+}
+
+/// One SSH public key a member authenticates Git-over-SSH with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSshKeyRecord {
+    /// Database ID of the key, used to revoke it.
+    pub id: i64,
+    /// Name of the member owning the key.
+    pub member: String,
+    /// SHA-256 fingerprint, e.g. `SHA256:...` (as `ssh-keygen -l` prints it).
+    pub fingerprint: String,
+    /// Canonical `<algorithm> <base64>` form of the key, without comment.
+    pub public_key: String,
+    /// Free-form label; see [`MAX_TOKEN_LABEL_BYTES`].
+    pub label: String,
+    /// Whether the key has been revoked.
+    pub revoked: bool,
 }
 
 /// A newly created member and their first token.
@@ -730,6 +803,68 @@ pub trait PolicyStore: Send + Sync + 'static {
         let _ = group;
         unsupported()
     }
+
+    /// Queries the append-only audit log newest-first (`id` descending) with
+    /// optional filters and keyset pagination (`before_id`).
+    fn list_audit_log<'a>(&'a self, query: AuditLogQuery) -> PolicyStoreFuture<'a, AuditLogPage> {
+        let _ = query;
+        unsupported()
+    }
+
+    /// Returns the active member owning the active SSH key whose SHA-256
+    /// fingerprint is `fingerprint` (see [`MemberSshKeyRecord::fingerprint`]),
+    /// or `None` when no active key of an active member matches.
+    ///
+    /// Defaults to `None`, so a store without SSH keys refuses every key.
+    fn authenticate_ssh_key<'a>(
+        &'a self,
+        fingerprint: &'a str,
+    ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>> {
+        let _ = fingerprint;
+        ready(Ok(None))
+    }
+
+    /// Registers the OpenSSH public key `public_key` (Ed25519 or ECDSA
+    /// P-256/P-384, at most [`MAX_SSH_PUBLIC_KEY_BYTES`]; any comment is
+    /// dropped) for the active member `member_name`.
+    ///
+    /// [`PolicyStoreError::InvalidInput`] for a malformed or weak key or an
+    /// invalid label; [`PolicyStoreError::NotFound`] if the member does not
+    /// exist or is revoked; [`PolicyStoreError::Conflict`] if the key is
+    /// already registered (to anyone, even revoked).
+    fn add_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+        label: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberSshKeyRecord> {
+        let _ = (actor_member_id, member_name, public_key, label);
+        unsupported()
+    }
+
+    /// Lists `member_name`'s active SSH keys by ascending ID;
+    /// [`PolicyStoreError::NotFound`] if the member does not exist.
+    fn list_member_ssh_keys<'a>(
+        &'a self,
+        member_name: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<MemberSshKeyRecord>> {
+        let _ = member_name;
+        unsupported()
+    }
+
+    /// Revokes `member_name`'s active SSH key `key_id`, returning `true`;
+    /// [`PolicyStoreError::NotFound`] if the member does not exist or has no
+    /// active key with that ID.
+    fn revoke_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        key_id: i64,
+    ) -> PolicyStoreFuture<'a, bool> {
+        let _ = (actor_member_id, member_name, key_id);
+        unsupported()
+    }
 }
 
 /// Compiles `rules` for `repo_key`, mapping a rejected rule to
@@ -922,6 +1057,91 @@ pub(crate) fn validate_token_label(label: &str) -> Result<(), PolicyStoreError> 
     }
 }
 
+/// A validated member SSH public key, as [`canonicalize_ssh_public_key`]
+/// returns it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalSshKey {
+    /// `<algorithm> <base64>`, without comment.
+    pub(crate) public_key: String,
+    /// SHA-256 fingerprint, see [`ssh_key_fingerprint`].
+    pub(crate) fingerprint: String,
+}
+
+/// Whether member keys of `algorithm` are accepted: Ed25519 and ECDSA over
+/// P-256 or P-384. DSA and RSA are refused (DSA is broken, and RSA support
+/// would pull in a crate with an unfixed timing side channel), as are
+/// security-key and certificate types.
+pub(crate) fn is_allowed_ssh_key_algorithm(algorithm: &Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::Ed25519
+            | Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256 | EcdsaCurve::NistP384
+            }
+    )
+}
+
+/// The SHA-256 fingerprint of `key` as `ssh-keygen -l` prints it,
+/// e.g. `SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s`.
+pub(crate) fn ssh_key_fingerprint(key: &PublicKey) -> String {
+    key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+/// Parses one OpenSSH public key line (`<algorithm> <base64> [comment]`,
+/// surrounding whitespace ignored) into its canonical form and fingerprint.
+///
+/// Fails with [`PolicyStoreError::InvalidInput`] if the line is empty, longer
+/// than [`MAX_SSH_PUBLIC_KEY_BYTES`], contains a control character (so a
+/// second line cannot be smuggled in), does not parse, or uses an algorithm
+/// refused by [`is_allowed_ssh_key_algorithm`].
+pub(crate) fn canonicalize_ssh_public_key(
+    public_key: &str,
+) -> Result<CanonicalSshKey, PolicyStoreError> {
+    let invalid = || {
+        PolicyStoreError::InvalidInput(format!(
+            "invalid SSH public key: paste one OpenSSH public key line (at most \
+             {MAX_SSH_PUBLIC_KEY_BYTES} bytes), e.g. the contents of ~/.ssh/id_ed25519.pub"
+        ))
+    };
+    let trimmed = public_key.trim_matches(|character: char| character.is_ascii_whitespace());
+    if trimmed.is_empty()
+        || public_key.len() > MAX_SSH_PUBLIC_KEY_BYTES
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(invalid());
+    }
+    let parsed = match PublicKey::from_openssh(trimmed) {
+        Ok(parsed) => parsed,
+        Err(_) => return Err(invalid()),
+    };
+    if !is_allowed_ssh_key_algorithm(&parsed.algorithm()) {
+        return Err(PolicyStoreError::InvalidInput(
+            "unsupported SSH key type: use an Ed25519 or ECDSA (nistp256 or nistp384) key"
+                .to_owned(),
+        ));
+    }
+    // Re-encoding without the comment yields the canonical form, so the same
+    // key always stores (and fingerprints) identically.
+    let canonical = PublicKey::new(parsed.key_data().clone(), "");
+    let encoded = match canonical.to_openssh() {
+        Ok(encoded) => encoded,
+        Err(_) => return Err(invalid()),
+    };
+    Ok(CanonicalSshKey {
+        public_key: encoded.trim_end().to_owned(),
+        fingerprint: ssh_key_fingerprint(&canonical),
+    })
+}
+
+/// Validates an SSH key ID taken from a request path.
+fn validate_ssh_key_id(key_id: i64) -> Result<(), PolicyStoreError> {
+    if key_id > 0 {
+        Ok(())
+    } else {
+        Err(ssh_key_not_found_error())
+    }
+}
+
 /// Validates a repository path: a valid request path (see
 /// [`is_valid_repo_path`]) of at most [`MAX_REPOSITORY_PATH_BYTES`] bytes
 /// that does not shadow the `/api/...` routes.
@@ -1033,6 +1253,93 @@ fn validate_create_member_request(request: &CreateMemberRequest) -> Result<(), P
         }
     }
     Ok(())
+}
+
+/// Validates a non-empty printable ASCII non-whitespace audit filter value
+/// (`action` or `target_type`) bounded by `max_bytes`.
+fn validate_audit_filter_value(
+    value: &str,
+    kind: &str,
+    max_bytes: usize,
+) -> Result<(), PolicyStoreError> {
+    if !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        Ok(())
+    } else {
+        Err(PolicyStoreError::InvalidInput(format!(
+            "invalid {kind}: use 1 to {max_bytes} printable ASCII non-whitespace characters"
+        )))
+    }
+}
+
+/// Validates an [`AuditLogQuery`] before querying any store.
+fn validate_audit_log_query(query: &AuditLogQuery) -> Result<(), PolicyStoreError> {
+    if query.limit == 0 || query.limit > MAX_AUDIT_LOG_LIMIT {
+        return Err(PolicyStoreError::InvalidInput(format!(
+            "invalid limit: expected an integer between 1 and {MAX_AUDIT_LOG_LIMIT}"
+        )));
+    }
+    if let Some(before_id) = query.before_id
+        && before_id <= 0
+    {
+        return Err(PolicyStoreError::InvalidInput(
+            "invalid before_id: expected a positive integer".to_owned(),
+        ));
+    }
+    if let Some(actor) = &query.actor
+        && let Err(error) = validate_member_name(actor)
+    {
+        return Err(error);
+    }
+    if let Some(action) = &query.action
+        && let Err(error) = validate_audit_filter_value(action, "action", 128)
+    {
+        return Err(error);
+    }
+    if let Some(target_type) = &query.target_type
+        && let Err(error) = validate_audit_filter_value(target_type, "target_type", 64)
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Formats `unix_secs` (seconds since 1970-01-01T00:00:00Z) as an RFC 3339 UTC
+/// timestamp (`YYYY-MM-DDTHH:MM:SSZ`) using Howard Hinnant's civil-from-days
+/// algorithm.
+pub(crate) fn format_unix_seconds_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let rem = unix_secs.rem_euclid(86_400);
+    let hour = rem / 3_600;
+    let minute = (rem % 3_600) / 60;
+    let second = rem % 60;
+
+    // Shift epoch from 1970-01-01 to 0000-03-01 so leap days fall at the end of
+    // the year and eras align on 400-year boundaries.
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Returns the current UTC timestamp formatted as `YYYY-MM-DDTHH:MM:SSZ`.
+pub(crate) fn current_utc_timestamp() -> String {
+    if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH)
+        && let Ok(secs) = i64::try_from(elapsed.as_secs())
+    {
+        return format_unix_seconds_utc(secs);
+    }
+    format_unix_seconds_utc(0)
 }
 
 /// A freshly generated API token and the SHA-256 digest stored for it.
@@ -1165,27 +1472,81 @@ struct MemoryToken {
     is_revoked: bool,
 }
 
+/// One SSH key of a [`MemoryPolicyStore`].
+#[derive(Clone, Debug)]
+struct MemorySshKey {
+    id: i64,
+    member_id: i64,
+    fingerprint: String,
+    public_key: String,
+    label: String,
+    is_revoked: bool,
+}
+
+impl MemorySshKey {
+    fn record(&self, member: &str) -> MemberSshKeyRecord {
+        MemberSshKeyRecord {
+            id: self.id,
+            member: member.to_owned(),
+            fingerprint: self.fingerprint.clone(),
+            public_key: self.public_key.clone(),
+            label: self.label.clone(),
+            revoked: self.is_revoked,
+        }
+    }
+}
+
+/// One stored audit record in [`MemoryState`], preserving sequential ID and
+/// UTC timestamp alongside the [`AuditLogEntry`].
+#[derive(Clone, Debug)]
+struct StoredAuditLogEntry {
+    id: i64,
+    occurred_at: String,
+    entry: AuditLogEntry,
+}
+
 /// Everything a [`MemoryPolicyStore`] holds, behind one lock so that each
 /// change and its audit entry happen atomically.
 #[derive(Default)]
 struct MemoryState {
     members: Vec<MemoryMember>,
     tokens: Vec<MemoryToken>,
+    ssh_keys: Vec<MemorySshKey>,
     group_ids: BTreeMap<String, i64>,
     groups_by_member: BTreeMap<i64, BTreeSet<String>>,
     repository_ids: BTreeMap<String, i64>,
     rules_by_repository: BTreeMap<String, Vec<BranchRule>>,
     path_rules_by_repository: BTreeMap<String, Vec<WithholdRule>>,
     secret_scopes_by_repository: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-    audit_log: Vec<AuditLogEntry>,
+    audit_log: Vec<StoredAuditLogEntry>,
     /// Highest ID handed out (or inserted), shared by all kinds of rows.
     last_id: i64,
+    /// Highest ID handed out for [`StoredAuditLogEntry`].
+    last_audit_id: i64,
 }
 
 impl MemoryState {
     fn next_id(&mut self) -> i64 {
         self.last_id = self.last_id.saturating_add(1);
         self.last_id
+    }
+
+    fn push_audit(&mut self, entry: AuditLogEntry) {
+        self.last_audit_id = self.last_audit_id.saturating_add(1);
+        let id = self.last_audit_id;
+        let occurred_at = current_utc_timestamp();
+        self.audit_log.push(StoredAuditLogEntry {
+            id,
+            occurred_at,
+            entry,
+        });
+    }
+
+    fn member_name_by_id(&self, member_id: i64) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .map(|member| member.name.clone())
     }
 
     fn member_by_name(&self, name: &str) -> Option<&MemoryMember> {
@@ -1237,6 +1598,33 @@ impl MemoryState {
         } else {
             Err(repository_not_registered_error())
         }
+    }
+
+    /// Stores the already canonicalized `key` for `member_id`, failing with
+    /// [`PolicyStoreError::Conflict`] if its fingerprint is taken.
+    fn add_ssh_key(
+        &mut self,
+        member_id: i64,
+        key: CanonicalSshKey,
+        label: &str,
+    ) -> Result<MemorySshKey, PolicyStoreError> {
+        if self
+            .ssh_keys
+            .iter()
+            .any(|existing| existing.fingerprint == key.fingerprint)
+        {
+            return Err(ssh_key_exists_error());
+        }
+        let stored = MemorySshKey {
+            id: self.next_id(),
+            member_id,
+            fingerprint: key.fingerprint,
+            public_key: key.public_key,
+            label: label.to_owned(),
+            is_revoked: false,
+        };
+        self.ssh_keys.push(stored.clone());
+        Ok(stored)
     }
 
     /// Generates and stores a token for `member_id`.
@@ -1411,11 +1799,38 @@ impl MemoryPolicyStore {
             .push(rule);
     }
 
+    /// Registers the OpenSSH public key `public_key` for the existing member
+    /// `member_id`, labelled `label`, without auditing it. Fails if the key is
+    /// invalid or already registered.
+    pub fn insert_ssh_key(
+        &mut self,
+        member_id: i64,
+        public_key: &str,
+        label: &str,
+    ) -> Result<MemberSshKeyRecord, PolicyStoreError> {
+        let key = match canonicalize_ssh_public_key(public_key) {
+            Ok(key) => key,
+            Err(error) => return Err(error),
+        };
+        let mut state = self.setup_state();
+        let Some(member_name) = state.member_name_by_id(member_id) else {
+            return Err(member_not_found_error());
+        };
+        match state.add_ssh_key(member_id, key, label) {
+            Ok(stored) => Ok(stored.record(&member_name)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Returns a copy of every audit entry recorded so far (by this store or
     /// any clone of it), oldest first. Reading only copies the log, so a
     /// poisoned lock still returns what was recorded.
     pub fn audit_entries(&self) -> Vec<AuditLogEntry> {
-        self.setup_state().audit_log.clone()
+        self.setup_state()
+            .audit_log
+            .iter()
+            .map(|stored| stored.entry.clone())
+            .collect()
     }
 }
 
@@ -1484,7 +1899,7 @@ impl PolicyStore for MemoryPolicyStore {
 
     fn record_audit_event<'a>(&'a self, entry: AuditLogEntry) -> PolicyStoreFuture<'a, ()> {
         ready(self.with_state(|state| {
-            state.audit_log.push(entry);
+            state.push_audit(entry);
             Ok(())
         }))
     }
@@ -1513,9 +1928,7 @@ impl PolicyStore for MemoryPolicyStore {
             }
             let id = state.next_id();
             state.repository_ids.insert(repo_path.to_owned(), id);
-            state
-                .audit_log
-                .push(register_repository_audit(actor_member_id, repo_path));
+            state.push_audit(register_repository_audit(actor_member_id, repo_path));
             Ok(RegisterRepositoryResult {
                 repository: RepositoryRecord {
                     id,
@@ -1553,9 +1966,7 @@ impl PolicyStore for MemoryPolicyStore {
             }
             let id = state.next_id();
             state.group_ids.insert(name.to_owned(), id);
-            state
-                .audit_log
-                .push(create_group_audit(actor_member_id, name));
+            state.push_audit(create_group_audit(actor_member_id, name));
             Ok(GroupRecord {
                 id,
                 name: name.to_owned(),
@@ -1621,7 +2032,7 @@ impl PolicyStore for MemoryPolicyStore {
                 .or_default()
                 .insert(group_name.to_owned());
             if changed {
-                state.audit_log.push(group_membership_audit(
+                state.push_audit(group_membership_audit(
                     actor_member_id,
                     "group.member_add",
                     group_name,
@@ -1660,7 +2071,7 @@ impl PolicyStore for MemoryPolicyStore {
                 None => false,
             };
             if changed {
-                state.audit_log.push(group_membership_audit(
+                state.push_audit(group_membership_audit(
                     actor_member_id,
                     "group.member_remove",
                     group_name,
@@ -1688,9 +2099,7 @@ impl PolicyStore for MemoryPolicyStore {
                 Ok(created) => created,
                 Err(error) => return Err(error),
             };
-            state
-                .audit_log
-                .push(create_member_audit(actor_member_id, &request));
+            state.push_audit(create_member_audit(actor_member_id, &request));
             Ok(created)
         }))
     }
@@ -1718,9 +2127,7 @@ impl PolicyStore for MemoryPolicyStore {
                 Ok(token) => token,
                 Err(error) => return Err(error),
             };
-            state
-                .audit_log
-                .push(issue_token_audit(actor_member_id, member_name, label));
+            state.push_audit(issue_token_audit(actor_member_id, member_name, label));
             Ok(IssuedToken {
                 member: member_name.to_owned(),
                 label: label.to_owned(),
@@ -1767,7 +2174,7 @@ impl PolicyStore for MemoryPolicyStore {
                     revoked_token_count += 1;
                 }
             }
-            state.audit_log.push(revoke_member_audit(
+            state.push_audit(revoke_member_audit(
                 actor_member_id,
                 member_name,
                 revoked_token_count,
@@ -1827,9 +2234,7 @@ impl PolicyStore for MemoryPolicyStore {
                 pattern: pattern.to_owned(),
                 groups: groups.into_iter().collect(),
             };
-            state
-                .audit_log
-                .push(set_branch_rule_audit(actor_member_id, &record));
+            state.push_audit(set_branch_rule_audit(actor_member_id, &record));
             Ok(record)
         }))
     }
@@ -1885,7 +2290,7 @@ impl PolicyStore for MemoryPolicyStore {
             if !removed {
                 return Err(branch_rule_not_found_error());
             }
-            state.audit_log.push(remove_branch_rule_audit(
+            state.push_audit(remove_branch_rule_audit(
                 actor_member_id,
                 repository,
                 pattern,
@@ -1930,9 +2335,7 @@ impl PolicyStore for MemoryPolicyStore {
                 pattern: pattern.to_owned(),
                 groups: groups.into_iter().collect(),
             };
-            state
-                .audit_log
-                .push(set_path_rule_audit(actor_member_id, &record));
+            state.push_audit(set_path_rule_audit(actor_member_id, &record));
             Ok(record)
         }))
     }
@@ -1989,9 +2392,7 @@ impl PolicyStore for MemoryPolicyStore {
             if !removed {
                 return Err(path_rule_not_found_error());
             }
-            state
-                .audit_log
-                .push(remove_path_rule_audit(actor_member_id, repository, pattern));
+            state.push_audit(remove_path_rule_audit(actor_member_id, repository, pattern));
             Ok(true)
         }))
     }
@@ -2017,9 +2418,7 @@ impl PolicyStore for MemoryPolicyStore {
                 Ok(created) => created,
                 Err(error) => return Err(error),
             };
-            state
-                .audit_log
-                .push(bootstrap_admin_audit(name, token_label));
+            state.push_audit(bootstrap_admin_audit(name, token_label));
             Ok(created)
         }))
     }
@@ -2058,7 +2457,7 @@ impl PolicyStore for MemoryPolicyStore {
                 return Err(member_not_found_error());
             };
             member.public_key = Some(public_key.to_owned());
-            state.audit_log.push(set_member_public_key_audit(
+            state.push_audit(set_member_public_key_audit(
                 actor_member_id,
                 member_name,
                 public_key,
@@ -2100,9 +2499,7 @@ impl PolicyStore for MemoryPolicyStore {
                 scope: scope.to_owned(),
                 groups: groups.into_iter().collect(),
             };
-            state
-                .audit_log
-                .push(set_secret_scope_audit(actor_member_id, &record));
+            state.push_audit(set_secret_scope_audit(actor_member_id, &record));
             Ok(record)
         }))
     }
@@ -2156,7 +2553,7 @@ impl PolicyStore for MemoryPolicyStore {
             if !removed {
                 return Err(secret_scope_not_found_error());
             }
-            state.audit_log.push(remove_secret_scope_audit(
+            state.push_audit(remove_secret_scope_audit(
                 actor_member_id,
                 repository,
                 scope,
@@ -2250,6 +2647,179 @@ impl PolicyStore for MemoryPolicyStore {
             })
         }))
     }
+
+    fn list_audit_log<'a>(&'a self, query: AuditLogQuery) -> PolicyStoreFuture<'a, AuditLogPage> {
+        if let Err(error) = validate_audit_log_query(&query) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let limit = query.limit as usize;
+            let mut entries = Vec::with_capacity(limit.saturating_add(1));
+            for stored in state.audit_log.iter().rev() {
+                if let Some(before_id) = query.before_id
+                    && stored.id >= before_id
+                {
+                    continue;
+                }
+                if let Some(action) = query.action.as_deref()
+                    && stored.entry.action != action
+                {
+                    continue;
+                }
+                if let Some(target_type) = query.target_type.as_deref()
+                    && stored.entry.target_type != target_type
+                {
+                    continue;
+                }
+                let actor_name = stored
+                    .entry
+                    .actor_member_id
+                    .and_then(|id| state.member_name_by_id(id));
+                if let Some(actor) = query.actor.as_deref()
+                    && actor_name.as_deref() != Some(actor)
+                {
+                    continue;
+                }
+                entries.push(AuditLogRecord {
+                    id: stored.id,
+                    occurred_at: stored.occurred_at.clone(),
+                    actor_member_id: stored.entry.actor_member_id,
+                    actor_name,
+                    action: stored.entry.action.clone(),
+                    target_type: stored.entry.target_type.clone(),
+                    target_name: stored.entry.target_name.clone(),
+                    details: stored.entry.details.clone(),
+                });
+                if entries.len() > limit {
+                    break;
+                }
+            }
+            let next_before_id = if entries.len() > limit {
+                entries.truncate(limit);
+                entries.last().map(|record| record.id)
+            } else {
+                None
+            };
+            Ok(AuditLogPage {
+                entries,
+                next_before_id,
+            })
+        }))
+    }
+
+    fn authenticate_ssh_key<'a>(
+        &'a self,
+        fingerprint: &'a str,
+    ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>> {
+        ready(self.with_state(|state| {
+            let member = state
+                .ssh_keys
+                .iter()
+                .find(|key| key.fingerprint == fingerprint && !key.is_revoked)
+                .and_then(|key| {
+                    state
+                        .members
+                        .iter()
+                        .find(|member| member.id == key.member_id && !member.is_revoked)
+                });
+            Ok(member.map(|member| AuthenticatedMember {
+                id: member.id,
+                name: member.name.clone(),
+                is_admin: member.is_admin,
+            }))
+        }))
+    }
+
+    fn add_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+        label: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberSshKeyRecord> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_token_label(label) {
+            return ready(Err(error));
+        }
+        let key = match canonicalize_ssh_public_key(public_key) {
+            Ok(key) => key,
+            Err(error) => return ready(Err(error)),
+        };
+        ready(self.with_state(|state| {
+            let Some(member_id) = state
+                .active_member_by_name(member_name)
+                .map(|member| member.id)
+            else {
+                return Err(member_not_found_error());
+            };
+            let stored = match state.add_ssh_key(member_id, key, label) {
+                Ok(stored) => stored,
+                Err(error) => return Err(error),
+            };
+            let record = stored.record(member_name);
+            state.push_audit(add_ssh_key_audit(actor_member_id, &record));
+            Ok(record)
+        }))
+    }
+
+    fn list_member_ssh_keys<'a>(
+        &'a self,
+        member_name: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<MemberSshKeyRecord>> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let Some(member_id) = state.member_by_name(member_name).map(|member| member.id) else {
+                return Err(member_not_found_error());
+            };
+            let mut keys: Vec<MemberSshKeyRecord> = state
+                .ssh_keys
+                .iter()
+                .filter(|key| key.member_id == member_id && !key.is_revoked)
+                .map(|key| key.record(member_name))
+                .collect();
+            keys.sort_by_key(|key| key.id);
+            Ok(keys)
+        }))
+    }
+
+    fn revoke_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        key_id: i64,
+    ) -> PolicyStoreFuture<'a, bool> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_ssh_key_id(key_id) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let Some(member_id) = state.member_by_name(member_name).map(|member| member.id) else {
+                return Err(member_not_found_error());
+            };
+            let Some(key) = state
+                .ssh_keys
+                .iter_mut()
+                .find(|key| key.id == key_id && key.member_id == member_id && !key.is_revoked)
+            else {
+                return Err(ssh_key_not_found_error());
+            };
+            key.is_revoked = true;
+            let fingerprint = key.fingerprint.clone();
+            state.push_audit(revoke_ssh_key_audit(
+                actor_member_id,
+                member_name,
+                key_id,
+                &fingerprint,
+            ));
+            Ok(true)
+        }))
+    }
 }
 
 /// Splits member `(name, public_key)` pairs (already sorted by name) into
@@ -2316,6 +2886,14 @@ fn too_many_path_rules_error() -> PolicyStoreError {
 
 fn secret_scope_not_found_error() -> PolicyStoreError {
     PolicyStoreError::NotFound("secret scope not found".to_owned())
+}
+
+fn ssh_key_not_found_error() -> PolicyStoreError {
+    PolicyStoreError::NotFound("SSH key not found".to_owned())
+}
+
+fn ssh_key_exists_error() -> PolicyStoreError {
+    PolicyStoreError::Conflict("SSH key is already registered".to_owned())
 }
 
 fn member_exists_error() -> PolicyStoreError {
@@ -2399,6 +2977,35 @@ fn set_member_public_key_audit(
         "member",
         member_name.to_owned(),
         serde_json::json!({ "public_key": public_key }),
+    )
+}
+
+fn add_ssh_key_audit(actor_member_id: Option<i64>, record: &MemberSshKeyRecord) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "member.ssh_key_add",
+        "member",
+        record.member.clone(),
+        serde_json::json!({
+            "key_id": record.id,
+            "fingerprint": record.fingerprint,
+            "label": record.label,
+        }),
+    )
+}
+
+fn revoke_ssh_key_audit(
+    actor_member_id: Option<i64>,
+    member_name: &str,
+    key_id: i64,
+    fingerprint: &str,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "member.ssh_key_revoke",
+        "member",
+        member_name.to_owned(),
+        serde_json::json!({ "key_id": key_id, "fingerprint": fingerprint }),
     )
 }
 
@@ -4237,6 +4844,281 @@ impl PolicyStore for PgPolicyStore {
             })
         })
     }
+
+    fn list_audit_log<'a>(&'a self, query: AuditLogQuery) -> PolicyStoreFuture<'a, AuditLogPage> {
+        if let Err(error) = validate_audit_log_query(&query) {
+            return ready(Err(error));
+        }
+        Box::pin(async move {
+            let limit_usize = query.limit as usize;
+            let fetch_limit = i64::from(query.limit) + 1;
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    i64,
+                    String,
+                    Option<i64>,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                    sqlx::types::Json<serde_json::Value>,
+                ),
+            >(
+                "SELECT \
+                     a.id, \
+                     to_char(a.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                     a.actor_member_id, \
+                     m.name, \
+                     a.action, \
+                     a.target_type, \
+                     a.target_name, \
+                     a.details \
+                 FROM audit_log a \
+                 LEFT JOIN members m ON m.id = a.actor_member_id \
+                 WHERE ($1::TEXT IS NULL OR m.name = $1) \
+                   AND ($2::TEXT IS NULL OR a.action = $2) \
+                   AND ($3::TEXT IS NULL OR a.target_type = $3) \
+                   AND ($4::BIGINT IS NULL OR a.id < $4) \
+                 ORDER BY a.id DESC \
+                 LIMIT $5",
+            )
+            .bind(query.actor)
+            .bind(query.action)
+            .bind(query.target_type)
+            .bind(query.before_id)
+            .bind(fetch_limit)
+            .fetch_all(&self.pool)
+            .await;
+
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
+            let mut entries: Vec<AuditLogRecord> = rows
+                .into_iter()
+                .map(
+                    |(
+                        id,
+                        occurred_at,
+                        actor_member_id,
+                        actor_name,
+                        action,
+                        target_type,
+                        target_name,
+                        details,
+                    )| {
+                        AuditLogRecord {
+                            id,
+                            occurred_at,
+                            actor_member_id,
+                            actor_name,
+                            action,
+                            target_type,
+                            target_name,
+                            details: details.0,
+                        }
+                    },
+                )
+                .collect();
+
+            let next_before_id = if entries.len() > limit_usize {
+                entries.truncate(limit_usize);
+                entries.last().map(|record| record.id)
+            } else {
+                None
+            };
+
+            Ok(AuditLogPage {
+                entries,
+                next_before_id,
+            })
+        })
+    }
+
+    fn authenticate_ssh_key<'a>(
+        &'a self,
+        fingerprint: &'a str,
+    ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>> {
+        Box::pin(async move {
+            let row = sqlx::query_as::<_, (i64, String, bool)>(
+                "SELECT m.id, m.name, m.is_admin \
+                 FROM member_ssh_keys k \
+                 JOIN members m ON m.id = k.member_id \
+                 WHERE k.fingerprint = $1 \
+                   AND k.revoked_at IS NULL \
+                   AND m.revoked_at IS NULL",
+            )
+            .bind(fingerprint)
+            .fetch_optional(&self.pool)
+            .await;
+            match row {
+                Ok(Some((id, name, is_admin))) => {
+                    Ok(Some(AuthenticatedMember { id, name, is_admin }))
+                }
+                Ok(None) => Ok(None),
+                Err(error) => Err(PolicyStoreError::Database(error)),
+            }
+        })
+    }
+
+    fn add_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        public_key: &'a str,
+        label: &'a str,
+    ) -> PolicyStoreFuture<'a, MemberSshKeyRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            if let Err(error) = validate_token_label(label) {
+                return Err(error);
+            }
+            let key = match canonicalize_ssh_public_key(public_key) {
+                Ok(key) => key,
+                Err(error) => return Err(error),
+            };
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let member_id = match find_member_id(&mut transaction, member_name, true).await {
+                Ok(member_id) => member_id,
+                Err(error) => return Err(error),
+            };
+            // `ON CONFLICT DO NOTHING` turns a concurrent duplicate into a
+            // clean conflict instead of a unique-violation error.
+            let inserted = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO member_ssh_keys (member_id, fingerprint, public_key, label) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (fingerprint) DO NOTHING RETURNING id",
+            )
+            .bind(member_id)
+            .bind(&key.fingerprint)
+            .bind(&key.public_key)
+            .bind(label)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let key_id = match inserted {
+                Ok(Some(key_id)) => key_id,
+                Ok(None) => return Err(ssh_key_exists_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let record = MemberSshKeyRecord {
+                id: key_id,
+                member: member_name.to_owned(),
+                fingerprint: key.fingerprint,
+                public_key: key.public_key,
+                label: label.to_owned(),
+                revoked: false,
+            };
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                add_ssh_key_audit(actor_member_id, &record),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(record)
+        })
+    }
+
+    fn list_member_ssh_keys<'a>(
+        &'a self,
+        member_name: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<MemberSshKeyRecord>> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            let mut connection = match self.pool.acquire().await {
+                Ok(connection) => connection,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let member_id = match find_member_id(&mut connection, member_name, false).await {
+                Ok(member_id) => member_id,
+                Err(error) => return Err(error),
+            };
+            let rows = sqlx::query_as::<_, (i64, String, String, String)>(
+                "SELECT id, fingerprint, public_key, label FROM member_ssh_keys \
+                 WHERE member_id = $1 AND revoked_at IS NULL ORDER BY id ASC",
+            )
+            .bind(member_id)
+            .fetch_all(&mut *connection)
+            .await;
+            match rows {
+                Ok(rows) => Ok(rows
+                    .into_iter()
+                    .map(|(id, fingerprint, public_key, label)| MemberSshKeyRecord {
+                        id,
+                        member: member_name.to_owned(),
+                        fingerprint,
+                        public_key,
+                        label,
+                        revoked: false,
+                    })
+                    .collect()),
+                Err(error) => Err(PolicyStoreError::Database(error)),
+            }
+        })
+    }
+
+    fn revoke_member_ssh_key<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        key_id: i64,
+    ) -> PolicyStoreFuture<'a, bool> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            if let Err(error) = validate_ssh_key_id(key_id) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let member_id = match find_member_id(&mut transaction, member_name, false).await {
+                Ok(member_id) => member_id,
+                Err(error) => return Err(error),
+            };
+            let revoked = sqlx::query_scalar::<_, String>(
+                "UPDATE member_ssh_keys SET revoked_at = NOW() \
+                 WHERE id = $1 AND member_id = $2 AND revoked_at IS NULL \
+                 RETURNING fingerprint",
+            )
+            .bind(key_id)
+            .bind(member_id)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let fingerprint = match revoked {
+                Ok(Some(fingerprint)) => fingerprint,
+                Ok(None) => return Err(ssh_key_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                revoke_ssh_key_audit(actor_member_id, member_name, key_id, &fingerprint),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(true)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -4244,13 +5126,15 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{
-        AGE_HRP_EXPANDED, API_TOKEN_PREFIX, AuditLogEntry, BECH32_CHARSET, MAX_PATH_RULES,
-        MemoryPolicyStore, PolicyStore, PolicyStoreError, WithholdRule, bech32_decode_char,
-        bech32_polymod, generate_api_token, validate_age_public_key, validate_branch_rule,
+        AGE_HRP_EXPANDED, API_TOKEN_PREFIX, AuditLogEntry, AuditLogQuery, BECH32_CHARSET,
+        DEFAULT_AUDIT_LOG_LIMIT, MAX_AUDIT_LOG_LIMIT, MAX_PATH_RULES, MemoryPolicyStore,
+        PolicyStore, PolicyStoreError, WithholdRule, bech32_decode_char, bech32_polymod,
+        canonicalize_ssh_public_key, format_unix_seconds_utc, generate_api_token,
+        validate_age_public_key, validate_audit_log_query, validate_branch_rule,
         validate_group_name, validate_member_name, validate_path_rule, validate_repository_path,
         validate_scope_name, validate_token_label,
     };
-    use crate::auth::sha256_zeroizing;
+    use crate::{AuthenticatedMember, auth::sha256_zeroizing};
 
     fn make_entry(action: &str, actor_member_id: Option<i64>) -> AuditLogEntry {
         AuditLogEntry {
@@ -4569,5 +5453,463 @@ mod tests {
             Err(error) => panic!("expected InvalidPathRule, got: {error}"),
             Ok(_) => panic!("corrupt path rule must fail closed"),
         }
+    }
+
+    #[test]
+    fn unix_seconds_format_as_utc_rfc3339() {
+        assert_eq!(format_unix_seconds_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_unix_seconds_utc(951_868_799), "2000-02-29T23:59:59Z");
+        assert_eq!(
+            format_unix_seconds_utc(1_709_210_096),
+            "2024-02-29T12:34:56Z"
+        );
+        assert_eq!(
+            format_unix_seconds_utc(1_795_366_800),
+            "2026-11-22T17:00:00Z"
+        );
+        assert_eq!(
+            format_unix_seconds_utc(4_107_542_400),
+            "2100-03-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn audit_log_query_validation_rejects_bad_inputs() {
+        let valid = AuditLogQuery {
+            actor: Some("root".to_owned()),
+            action: Some("path_rule.set".to_owned()),
+            target_type: Some("path_rule".to_owned()),
+            limit: DEFAULT_AUDIT_LOG_LIMIT,
+            before_id: Some(1),
+        };
+        assert!(validate_audit_log_query(&valid).is_ok());
+
+        let min_limit = AuditLogQuery {
+            limit: 1,
+            ..valid.clone()
+        };
+        assert!(validate_audit_log_query(&min_limit).is_ok());
+
+        let max_limit = AuditLogQuery {
+            limit: MAX_AUDIT_LOG_LIMIT,
+            ..valid.clone()
+        };
+        assert!(validate_audit_log_query(&max_limit).is_ok());
+
+        for bad_limit in [0, MAX_AUDIT_LOG_LIMIT + 1] {
+            let query = AuditLogQuery {
+                limit: bad_limit,
+                ..valid.clone()
+            };
+            assert!(
+                is_invalid_input(validate_audit_log_query(&query)),
+                "limit={bad_limit}"
+            );
+        }
+
+        for bad_before_id in [0, -1] {
+            let query = AuditLogQuery {
+                before_id: Some(bad_before_id),
+                ..valid.clone()
+            };
+            assert!(
+                is_invalid_input(validate_audit_log_query(&query)),
+                "before_id={bad_before_id}"
+            );
+        }
+
+        for bad_actor in ["", "-alice", "al ice", "élise"] {
+            let query = AuditLogQuery {
+                actor: Some(bad_actor.to_owned()),
+                ..valid.clone()
+            };
+            assert!(
+                is_invalid_input(validate_audit_log_query(&query)),
+                "actor={bad_actor:?}"
+            );
+        }
+
+        let long_action = "a".repeat(129);
+        for bad_action in ["", "has space", "ctrl\n", "café", long_action.as_str()] {
+            let query = AuditLogQuery {
+                action: Some(bad_action.to_owned()),
+                ..valid.clone()
+            };
+            assert!(
+                is_invalid_input(validate_audit_log_query(&query)),
+                "action={bad_action:?}"
+            );
+        }
+
+        let long_target_type = "t".repeat(65);
+        for bad_target_type in ["", "has space", "ctrl\t", "tÿpe", long_target_type.as_str()] {
+            let query = AuditLogQuery {
+                target_type: Some(bad_target_type.to_owned()),
+                ..valid.clone()
+            };
+            assert!(
+                is_invalid_input(validate_audit_log_query(&query)),
+                "target_type={bad_target_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_list_audit_log_filters_and_paginates() {
+        let mut store = MemoryPolicyStore::new();
+        store.insert_member(
+            AuthenticatedMember {
+                id: 1,
+                name: "root".to_owned(),
+                is_admin: true,
+            },
+            b"root-token",
+        );
+        store.insert_member(
+            AuthenticatedMember {
+                id: 2,
+                name: "alice".to_owned(),
+                is_admin: false,
+            },
+            b"alice-token",
+        );
+
+        let events = [
+            AuditLogEntry::new(
+                Some(1),
+                "group.create",
+                "group",
+                "core".to_owned(),
+                serde_json::json!({ "name": "core" }),
+            ),
+            AuditLogEntry::new(
+                Some(1),
+                "repository.register",
+                "repository",
+                "team.git".to_owned(),
+                serde_json::json!({ "path": "team.git" }),
+            ),
+            AuditLogEntry::new(
+                Some(2),
+                "path_rule.set",
+                "path_rule",
+                "team.git:*.secret".to_owned(),
+                serde_json::json!({ "pattern": "*.secret" }),
+            ),
+            AuditLogEntry::new(
+                None,
+                "branch.merge_leak_override",
+                "repository_ref",
+                "team.git:refs/heads/main".to_owned(),
+                serde_json::json!({}),
+            ),
+            AuditLogEntry::new(
+                Some(1),
+                "path_rule.set",
+                "path_rule",
+                "team.git:config/**".to_owned(),
+                serde_json::json!({ "pattern": "config/**" }),
+            ),
+        ];
+        for event in events {
+            if let Err(error) = store.record_audit_event(event).await {
+                panic!("record_audit_event failed: {error}");
+            }
+        }
+
+        let page1 = match store
+            .list_audit_log(AuditLogQuery {
+                actor: None,
+                action: None,
+                target_type: None,
+                limit: 2,
+                before_id: None,
+            })
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => panic!("list_audit_log page 1 failed: {error}"),
+        };
+        assert_eq!(page1.entries.len(), 2);
+        assert_eq!(page1.entries[0].id, 5);
+        assert_eq!(page1.entries[0].actor_name.as_deref(), Some("root"));
+        assert_eq!(page1.entries[1].id, 4);
+        assert_eq!(page1.entries[1].actor_name, None);
+        assert_eq!(page1.next_before_id, Some(4));
+        for entry in &page1.entries {
+            assert_eq!(entry.occurred_at.len(), 20);
+            assert!(entry.occurred_at.ends_with('Z'));
+        }
+
+        let page2 = match store
+            .list_audit_log(AuditLogQuery {
+                actor: None,
+                action: None,
+                target_type: None,
+                limit: 2,
+                before_id: page1.next_before_id,
+            })
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => panic!("list_audit_log page 2 failed: {error}"),
+        };
+        assert_eq!(page2.entries.len(), 2);
+        assert_eq!(page2.entries[0].id, 3);
+        assert_eq!(page2.entries[0].actor_name.as_deref(), Some("alice"));
+        assert_eq!(page2.entries[1].id, 2);
+        assert_eq!(page2.next_before_id, Some(2));
+
+        let page3 = match store
+            .list_audit_log(AuditLogQuery {
+                actor: None,
+                action: None,
+                target_type: None,
+                limit: 2,
+                before_id: page2.next_before_id,
+            })
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => panic!("list_audit_log page 3 failed: {error}"),
+        };
+        assert_eq!(page3.entries.len(), 1);
+        assert_eq!(page3.entries[0].id, 1);
+        assert_eq!(page3.next_before_id, None);
+
+        let filtered = match store
+            .list_audit_log(AuditLogQuery {
+                actor: Some("alice".to_owned()),
+                action: Some("path_rule.set".to_owned()),
+                target_type: Some("path_rule".to_owned()),
+                limit: 10,
+                before_id: None,
+            })
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => panic!("filtered list_audit_log failed: {error}"),
+        };
+        assert_eq!(filtered.entries.len(), 1);
+        assert_eq!(filtered.entries[0].id, 3);
+        assert_eq!(filtered.entries[0].target_name, "team.git:*.secret");
+        assert_eq!(filtered.next_before_id, None);
+    }
+
+    const ED25519_KEY: &str = "ssh-ed25519 \
+        AAAAC3NzaC1lZDI1NTE5AAAAIH2ACokL5rFZeMA6cnIFOE6yBk13muMZSo6BO+J/4jM+";
+    const ED25519_FINGERPRINT: &str = "SHA256:Np8Ba0OTNlnS1Ld82GoBXei8fVIP13IJqvG+Xz1KgG0";
+    const ECDSA_P256_KEY: &str = "ecdsa-sha2-nistp256 \
+        AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBP/zY1wvD7iHSKA4X8GQRfS4mjEVQUqnw1Dn\
+        Zut6e7eUQPzXYb8rC84vW2jq/3X2GuHtrN/zqnXaLOALTCcqyPo=";
+    const ECDSA_P384_KEY: &str = "ecdsa-sha2-nistp384 \
+        AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBPZMXoFPbenHbKg1h6SqzrSAyK6eHXrg56MT\
+        4qa15dw6bQuiJjxgnx0O3HtuaLo+Uu81c9iL0ziI7CvAfbHnwDQ6swMPIo/DFZcG+qw0/j/iKLn3eipQVio8Uvcr+\
+        6w9bQ==";
+    const ECDSA_P521_KEY: &str = "ecdsa-sha2-nistp521 \
+        AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBAByYwi+2JMGYIIGLwmTP12G9CvvPNUfoI/J\
+        Tj/cDKyw451lvrm/8jwRjsMwE3YIn0Vy239sA+TLpv1D70uyCeRVqAGM4bBCfS/ti4WULg9awPmzhgQ4joEpjgMrl\
+        xb0VJHL8wwpFV6TwYhoNs+oztoeGkG5bCCsc8KLGeK+5RArPHmc3w==";
+    const RSA_KEY: &str = "ssh-rsa \
+        AAAAB3NzaC1yc2EAAAADAQABAAAAgQCgC/dtvlp1WLBs6x25e4Ole3Gtjog2XzGAZmDqcCy009cvQI681MEm26j0\
+        csHpbBTRJhPnwQQ+5cycqHS0MCgR/+s/b/Cx1oMFT5zgRQUfkLjVUKFRqP3Sx+qD+0xG/flxrJGoX/c5yUV4Kj7VK\
+        +q3CTcZzZA9xgQF++gsveN5xQ==";
+    const SK_ED25519_KEY: &str = "sk-ssh-ed25519@openssh.com \
+        AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fAAA\
+        ABHNzaDo=";
+
+    #[test]
+    fn ssh_public_keys_are_canonicalized_with_fingerprints() {
+        let with_comment = format!("  {ED25519_KEY} alice@laptop\n");
+        match canonicalize_ssh_public_key(&with_comment) {
+            Ok(key) => {
+                assert_eq!(key.public_key, ED25519_KEY);
+                assert_eq!(key.fingerprint, ED25519_FINGERPRINT);
+            }
+            Err(error) => panic!("an Ed25519 key should be accepted: {error}"),
+        }
+        for accepted in [ECDSA_P256_KEY, ECDSA_P384_KEY] {
+            match canonicalize_ssh_public_key(&format!("{accepted} comment with spaces")) {
+                Ok(key) => {
+                    assert_eq!(key.public_key, accepted);
+                    assert!(key.fingerprint.starts_with("SHA256:"));
+                }
+                Err(error) => panic!("{accepted} should be accepted: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn weak_and_malformed_ssh_public_keys_are_refused() {
+        let too_long = format!("{ED25519_KEY} {}", "c".repeat(4096));
+        let two_lines = format!("{ED25519_KEY}\n{ECDSA_P256_KEY}");
+        let with_options = format!("command=\"id\" {ED25519_KEY}");
+        let truncated = &ED25519_KEY[..ED25519_KEY.len() - 4];
+        let with_control = format!("{ED25519_KEY} alice\u{7}");
+        for refused in [
+            "",
+            "   ",
+            "not a key",
+            ECDSA_P521_KEY,
+            RSA_KEY,
+            SK_ED25519_KEY,
+            truncated,
+            too_long.as_str(),
+            two_lines.as_str(),
+            with_options.as_str(),
+            with_control.as_str(),
+            "ssh-ed25519",
+            "ssh-ed25519 !!!!",
+        ] {
+            assert!(
+                is_invalid_input(canonicalize_ssh_public_key(refused)),
+                "{refused:?} should be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_manages_and_authenticates_ssh_keys() {
+        let mut store = MemoryPolicyStore::new();
+        store.insert_member(
+            AuthenticatedMember {
+                id: 1,
+                name: "alice".to_owned(),
+                is_admin: false,
+            },
+            b"alice-token",
+        );
+        store.insert_member(
+            AuthenticatedMember {
+                id: 2,
+                name: "bob".to_owned(),
+                is_admin: false,
+            },
+            b"bob-token",
+        );
+
+        let added = match store
+            .add_member_ssh_key(Some(2), "alice", &format!("{ED25519_KEY} laptop"), "laptop")
+            .await
+        {
+            Ok(added) => added,
+            Err(error) => panic!("adding a key failed: {error}"),
+        };
+        assert_eq!(added.member, "alice");
+        assert_eq!(added.public_key, ED25519_KEY);
+        assert_eq!(added.fingerprint, ED25519_FINGERPRINT);
+        assert_eq!(added.label, "laptop");
+        assert!(!added.revoked);
+
+        // The same key cannot be registered twice, for anyone.
+        assert!(matches!(
+            store.add_member_ssh_key(None, "bob", ED25519_KEY, "").await,
+            Err(PolicyStoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
+                .add_member_ssh_key(None, "nobody", ECDSA_P256_KEY, "")
+                .await,
+            Err(PolicyStoreError::NotFound(_))
+        ));
+        assert!(is_invalid_input(
+            store.add_member_ssh_key(None, "alice", RSA_KEY, "").await
+        ));
+        assert!(is_invalid_input(
+            store
+                .add_member_ssh_key(None, "alice", ECDSA_P256_KEY, "bad\nlabel")
+                .await
+        ));
+        let second = match store
+            .add_member_ssh_key(None, "alice", ECDSA_P384_KEY, "desktop")
+            .await
+        {
+            Ok(second) => second,
+            Err(error) => panic!("adding a second key failed: {error}"),
+        };
+
+        match store.authenticate_ssh_key(ED25519_FINGERPRINT).await {
+            Ok(Some(member)) => assert_eq!(member.name, "alice"),
+            Ok(None) => panic!("the registered key should authenticate"),
+            Err(error) => panic!("authenticating failed: {error}"),
+        }
+        assert!(matches!(
+            store.authenticate_ssh_key("SHA256:unknown").await,
+            Ok(None)
+        ));
+
+        match store.list_member_ssh_keys("alice").await {
+            Ok(keys) => {
+                let ids: Vec<i64> = keys.iter().map(|key| key.id).collect();
+                assert_eq!(ids, vec![added.id, second.id]);
+            }
+            Err(error) => panic!("listing keys failed: {error}"),
+        }
+        assert!(matches!(store.list_member_ssh_keys("bob").await, Ok(keys) if keys.is_empty()));
+        assert!(matches!(
+            store.list_member_ssh_keys("nobody").await,
+            Err(PolicyStoreError::NotFound(_))
+        ));
+
+        // Another member's key ID is not found.
+        assert!(matches!(
+            store.revoke_member_ssh_key(None, "bob", added.id).await,
+            Err(PolicyStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .revoke_member_ssh_key(Some(1), "alice", added.id)
+                .await,
+            Ok(true)
+        ));
+        assert!(matches!(
+            store
+                .revoke_member_ssh_key(Some(1), "alice", added.id)
+                .await,
+            Err(PolicyStoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.authenticate_ssh_key(ED25519_FINGERPRINT).await,
+            Ok(None)
+        ));
+        match store.list_member_ssh_keys("alice").await {
+            Ok(keys) => assert_eq!(keys.len(), 1),
+            Err(error) => panic!("listing keys failed: {error}"),
+        }
+
+        // Revoking the member disables their remaining keys.
+        let second_fingerprint = second.fingerprint.clone();
+        assert!(matches!(
+            store.authenticate_ssh_key(&second_fingerprint).await,
+            Ok(Some(_))
+        ));
+        if let Err(error) = store.revoke_member(None, "alice").await {
+            panic!("revoking the member failed: {error}");
+        }
+        assert!(matches!(
+            store.authenticate_ssh_key(&second_fingerprint).await,
+            Ok(None)
+        ));
+
+        let actions: Vec<String> = store
+            .audit_entries()
+            .into_iter()
+            .map(|entry| entry.action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                "member.ssh_key_add",
+                "member.ssh_key_add",
+                "member.ssh_key_revoke",
+                "member.revoke",
+            ]
+        );
+        let first_entry = &store.audit_entries()[0];
+        assert_eq!(first_entry.actor_member_id, Some(2));
+        assert_eq!(first_entry.target_name, "alice");
+        assert_eq!(first_entry.details["fingerprint"], ED25519_FINGERPRINT);
+        assert_eq!(first_entry.details["label"], "laptop");
+        assert!(first_entry.details.get("public_key").is_none());
     }
 }

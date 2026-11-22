@@ -10,3 +10,10 @@ rust-version.workspace = true
 [dependencies]
 globset = "0.4.21"
 thiserror = "2.0.21"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "policy"
+harness = false

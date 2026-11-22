@@ -295,6 +295,45 @@ pub struct MemberPublicKeyResponse {
 }
 
 #[derive(Serialize)]
+struct AddSshKeyRequest<'a> {
+    public_key: &'a str,
+    label: &'a str,
+}
+
+/// One registered SSH public key returned by `/api/v1/me/ssh-keys` or
+/// `/api/v1/members/{name}/ssh-keys`.
+#[derive(Debug, Deserialize)]
+pub struct SshKeyInfo {
+    pub id: i64,
+    pub fingerprint: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Response from listing a member's SSH public keys.
+#[derive(Debug, Deserialize)]
+pub struct ListSshKeysResponse {
+    pub member: String,
+    pub keys: Vec<SshKeyInfo>,
+}
+
+/// Response from registering a new SSH public key.
+#[derive(Debug, Deserialize)]
+pub struct AddSshKeyResponse {
+    pub member: String,
+    pub key: SshKeyInfo,
+}
+
+/// Response from revoking an SSH public key.
+#[derive(Debug, Deserialize)]
+pub struct RevokeSshKeyResponse {
+    pub member: String,
+    pub id: i64,
+    pub revoked: bool,
+}
+
+#[derive(Serialize)]
 struct PutSecretScopeRequest<'a> {
     repository: &'a str,
     scope: &'a str,
@@ -349,6 +388,45 @@ pub struct GroupRecipientsResponse {
     pub group: String,
     pub recipients: Vec<ScopeRecipientInfo>,
     pub members_without_key: Vec<String>,
+}
+
+/// One audit log record from `GET /api/v1/audit-log`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    /// RFC 3339 UTC timestamp, passed through as the server formatted it.
+    pub occurred_at: String,
+    /// `None` for actions taken by the server itself (for example bootstrap).
+    #[serde(default)]
+    pub actor_member_id: Option<i64>,
+    #[serde(default)]
+    pub actor_name: Option<String>,
+    pub action: String,
+    pub target_type: String,
+    pub target_name: String,
+    /// Action-specific structured details; `null` or `{}` when there are none.
+    #[serde(default)]
+    pub details: serde_json::Value,
+}
+
+/// A page of audit log entries, newest first.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ListAuditLogResponse {
+    pub entries: Vec<AuditLogEntry>,
+    /// Pass as `before_id` to fetch the next (older) page; `None` on the last page.
+    #[serde(default)]
+    pub next_before_id: Option<i64>,
+}
+
+/// Filters for [`ScrimClient::list_audit_log`]; `None` fields are omitted
+/// from the query string.
+#[derive(Debug)]
+pub struct AuditLogQuery<'a> {
+    pub actor: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub target_type: Option<&'a str>,
+    pub limit: Option<u32>,
+    pub before_id: Option<i64>,
 }
 
 /// Blocking HTTP client for talking to a Scrim server's `/api/v1` endpoints.
@@ -479,6 +557,44 @@ impl ScrimClient {
         self.send_json(Method::PUT, &path, &[], &body)
     }
 
+    fn ssh_keys_path(member: Option<&str>) -> String {
+        match member {
+            Some(name) => format!("/api/v1/members/{}/ssh-keys", encode_path_segment(name)),
+            None => "/api/v1/me/ssh-keys".to_owned(),
+        }
+    }
+
+    /// Lists active SSH public keys for the authenticated member (when
+    /// `member` is `None`) or for `member` (admin only).
+    pub fn list_ssh_keys(&self, member: Option<&str>) -> anyhow::Result<ListSshKeysResponse> {
+        let path = Self::ssh_keys_path(member);
+        self.send_empty(Method::GET, &path, &[])
+    }
+
+    /// Registers an SSH public key for the authenticated member (when `member`
+    /// is `None`) or for `member` (admin only).
+    pub fn add_ssh_key(
+        &self,
+        member: Option<&str>,
+        public_key: &str,
+        label: &str,
+    ) -> anyhow::Result<AddSshKeyResponse> {
+        let path = Self::ssh_keys_path(member);
+        let body = AddSshKeyRequest { public_key, label };
+        self.send_json(Method::POST, &path, &[], &body)
+    }
+
+    /// Revokes an SSH public key by `key_id` for the authenticated member (when
+    /// `member` is `None`) or for `member` (admin only).
+    pub fn revoke_ssh_key(
+        &self,
+        member: Option<&str>,
+        key_id: i64,
+    ) -> anyhow::Result<RevokeSshKeyResponse> {
+        let path = format!("{}/{}", Self::ssh_keys_path(member), key_id);
+        self.send_empty(Method::DELETE, &path, &[])
+    }
+
     pub fn issue_token(&self, member: &str, label: &str) -> anyhow::Result<IssueTokenResponse> {
         let path = format!("/api/v1/members/{}/tokens", encode_path_segment(member));
         let body = IssueTokenRequest { label };
@@ -572,6 +688,30 @@ impl ScrimClient {
             "/api/v1/path-rules/me",
             &[("repo", repository)],
         )
+    }
+
+    /// Lists audit log entries matching `query`, newest first
+    /// (`GET /api/v1/audit-log`).
+    pub fn list_audit_log(
+        &self,
+        query: &AuditLogQuery<'_>,
+    ) -> anyhow::Result<ListAuditLogResponse> {
+        let limit_text = query.limit.map(|limit| limit.to_string());
+        let before_id_text = query.before_id.map(|before_id| before_id.to_string());
+        let candidates = [
+            ("actor", query.actor),
+            ("action", query.action),
+            ("target_type", query.target_type),
+            ("limit", limit_text.as_deref()),
+            ("before_id", before_id_text.as_deref()),
+        ];
+        let mut params: Vec<(&str, &str)> = Vec::with_capacity(candidates.len());
+        for (name, value) in candidates {
+            if let Some(value) = value {
+                params.push((name, value));
+            }
+        }
+        self.send_empty(Method::GET, "/api/v1/audit-log", &params)
     }
 
     /// Returns the `Authorization: Bearer <token>` header line for Git's
@@ -750,5 +890,18 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("scrim_secret_xyz"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn ssh_keys_path_selects_self_or_encoded_member_route() {
+        assert_eq!(ScrimClient::ssh_keys_path(None), "/api/v1/me/ssh-keys");
+        assert_eq!(
+            ScrimClient::ssh_keys_path(Some("alice")),
+            "/api/v1/members/alice/ssh-keys"
+        );
+        assert_eq!(
+            ScrimClient::ssh_keys_path(Some("alice smith/dev")),
+            "/api/v1/members/alice%20smith%2Fdev/ssh-keys"
+        );
     }
 }

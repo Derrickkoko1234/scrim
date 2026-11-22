@@ -547,7 +547,7 @@ pub(crate) enum ClientObjectFilter {
 
 /// The parts of the hook's arguments that matter.
 #[derive(Debug, PartialEq, Eq)]
-struct PackObjectsArgs {
+pub(crate) struct PackObjectsArgs {
     /// `--shallow-file <path>` before `pack-objects`, when non-empty.
     shallow_file: Option<String>,
     /// `--include-tag`.
@@ -559,7 +559,7 @@ struct PackObjectsArgs {
 
 /// `git upload-pack`'s object list (`--revs` format).
 #[derive(Debug, Default, PartialEq, Eq)]
-struct PackObjectsInput {
+pub(crate) struct PackObjectsInput {
     wants: Vec<ObjectId>,
     haves: Vec<ObjectId>,
     shallow_commits: HashSet<ObjectId>,
@@ -638,7 +638,7 @@ pub(crate) fn compute_allowed_pack_objects(
 }
 
 /// Parses the hook's arguments (see [`compute_allowed_pack_objects`]).
-fn parse_pack_args(pack_args: &[String]) -> io::Result<PackObjectsArgs> {
+pub(crate) fn parse_pack_args(pack_args: &[String]) -> io::Result<PackObjectsArgs> {
     let mut shallow_file = None;
     let mut index = 0;
     let mut has_subcommand = false;
@@ -750,7 +750,7 @@ fn parse_filter_spec(spec: &str) -> io::Result<ClientObjectFilter> {
 /// Parses `git upload-pack`'s `--revs` object list: wants, `--not`, haves
 /// (also as `^<oid>`) and `--shallow <oid>` lines. Anything else (revision
 /// expressions, unknown directives) is refused.
-fn parse_pack_stdin(stdin: &[u8]) -> io::Result<PackObjectsInput> {
+pub(crate) fn parse_pack_stdin(stdin: &[u8]) -> io::Result<PackObjectsInput> {
     let Ok(text) = std::str::from_utf8(stdin) else {
         return Err(invalid_data("non-UTF-8 object list"));
     };

@@ -4,26 +4,29 @@ Scrim adds access control inside Git repositories: private branches, private fil
 
 A scrim is a theatre curtain that looks solid or see-through depending on how it is lit. Everyone shares the same repository, and each person sees as much as their access allows.
 
-> **Status: early development.** Milestones M1–M3 (Scrim v1 — private branches, repo-versioned encrypted secrets with CI `SCRIM_KEY` and pre-receive `.env`/secret scanning, and encrypted private files via Git's clean/smudge filter) and M4 (server-side withholding via `gix` per-member object-graph filtering, `uploadpack.packObjectsHook`, `pre-receive` withheld-path/blob guards, `/api/v1/path-rules`, `scrim private --withhold`, and `scrim clone` partial sparse checkouts) are implemented; Milestone M5 (hardening and operations) is next. See the [roadmap](docs/ROADMAP.md).
+> **Status: early development.** Milestones M0–M5 are implemented: private branches over smart HTTP and SSH (`russh`), repo-versioned encrypted secrets (`scrim secrets`, `scrim run`, CI `SCRIM_KEY`, and `pre-receive` `.env`/credential scanning), encrypted private files via Git's clean/smudge filter (`scrim private`), server-side blob withholding (`gix` per-member object-graph filtering and `scrim clone` partial sparse checkouts), fail-closed external mirroring (`scrim mirror`), audited policy logs (`scrim audit`), Redis policy caching, and Cloudflare R2 backups. See the [roadmap](docs/ROADMAP.md), [security model](docs/security-model.md), and [Dokploy deployment guide](deploy/dokploy/README.md).
 
 ## Why
 
 Git access is all-or-nothing per repository: a person sees every branch and every file, or nothing. Teams work around this with extra repositories, submodules, `.env` files passed around in chat, and third-party secret managers. Each workaround adds friction, and leaks still happen.
 
-## What it will do
+## What it does
 
-- **Private branches** that only named groups can see, fetch or push. Non-members never see the refs, cannot fetch their commits by hash, and cannot merge them into visible branches by accident.
-- **Private files and folders** inside a shared repository. Contents are encrypted on the client, so they stay protected on any remote, GitHub included. Repos hosted on `scrim-server` can also withhold the bytes from non-members entirely.
-- **Secrets** stored and versioned with the code, encrypted per environment, and injected at runtime with `scrim run`. No external secret manager and no `.env` files.
+- **Private branches** that only named groups can see, fetch or push over smart HTTP or SSH. Non-members never see the refs, cannot fetch their commits by hash, and cannot merge them into visible branches by accident.
+- **Private files and folders** inside a shared repository. Contents are encrypted on the client with AES-256-SIV, so they stay protected on any remote, GitHub included (`scrim mirror`). Repos hosted on `scrim-server` can also withhold protected blob bytes from non-members entirely (`scrim clone`).
+- **Secrets** stored and versioned with the code, encrypted per environment with XChaCha20-Poly1305, and injected at runtime with `scrim run`. No external secret manager and no `.env` files.
+- **Operations & auditing** built in: manage SSH keys with `scrim ssh-key`, inspect access and override events with `scrim audit`, mirror public refs safely with `scrim mirror`, and deploy with [Dokploy](deploy/dokploy/README.md) with Redis policy caching and Cloudflare R2 backups.
 
 ```sh
 scrim branch private 'refs/heads/private/*' --group core
 scrim private add 'config/billing/**' --group finance
 scrim secrets set DATABASE_URL=postgres://… --scope dev
 scrim run --scope dev -- cargo run
+scrim clone team/app.git
+scrim ssh-key add ~/.ssh/id_ed25519.pub
+scrim audit --limit 20
+scrim mirror github
 ```
-
-*(Planned interface; subject to change.)*
 
 ## How it works
 
@@ -34,7 +37,7 @@ Scrim has two parts, both written in Rust:
 
 There is no web UI. Everything happens in the terminal.
 
-Scrim implements no cryptographic primitives of its own. It uses audited crates only: `age`, and RustCrypto's `aes-siv` and `chacha20poly1305`. The [security model](docs/ROADMAP.md#security-model) states what each feature protects and what it does not.
+Scrim implements no cryptographic primitives of its own. It uses audited crates only: `age`, and RustCrypto's `aes-siv` and `chacha20poly1305`. The [security model](docs/security-model.md) states what each feature protects and what it does not.
 
 ## License
 

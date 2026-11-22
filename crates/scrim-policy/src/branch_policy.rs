@@ -88,6 +88,8 @@ struct CompiledRule {
 pub struct BranchPolicy {
     /// Ordered by pattern so planning output is deterministic.
     rules: Vec<CompiledRule>,
+    /// The merged source rules, in the same pattern order as `rules`.
+    source_rules: Vec<BranchRule>,
 }
 
 impl BranchPolicy {
@@ -116,6 +118,7 @@ impl BranchPolicy {
         }
 
         let mut compiled_rules = Vec::with_capacity(groups_by_pattern.len());
+        let mut source_rules = Vec::with_capacity(groups_by_pattern.len());
         for (pattern, allowed_groups) in groups_by_pattern {
             // `literal_separator(false)` lets `*` match `/`, so
             // `refs/heads/private/*` also matches nested names such as
@@ -135,15 +138,28 @@ impl BranchPolicy {
                 Err(source) => return Err(PolicyError::GlobCompile { pattern, source }),
             };
             compiled_rules.push(CompiledRule {
-                allowed_groups,
+                allowed_groups: allowed_groups.clone(),
                 matcher: glob.compile_matcher(),
                 case_insensitive_matcher: case_insensitive_glob.compile_matcher(),
                 kind: classify_pattern(&pattern),
             });
+            source_rules.push(BranchRule {
+                pattern,
+                allowed_groups,
+            });
         }
         Ok(Self {
             rules: compiled_rules,
+            source_rules,
         })
+    }
+
+    /// Returns the compiled rules sorted by pattern, with same-pattern rules
+    /// merged into one rule holding the union of their allowed groups.
+    ///
+    /// Compiling the returned rules again yields an equivalent policy.
+    pub fn rules(&self) -> &[BranchRule] {
+        &self.source_rules
     }
 
     /// Returns `true` when the policy has no rules, so every ref is visible.
@@ -1083,5 +1099,25 @@ mod tests {
         assert!(git_hide_entry_matches("refs/heads/a/", "refs/heads/a"));
         assert!(!git_hide_entry_matches("refs/heads/a", "refs/heads/ab"));
         assert!(!git_hide_entry_matches("refs/heads/a/", "refs/heads/ab"));
+    }
+
+    #[test]
+    fn rules_are_sorted_merged_and_recompile_equivalently() {
+        let policy = compile(vec![
+            rule("refs/heads/zeta/*", &["ops"]),
+            rule("refs/heads/alpha/*", &["dev"]),
+            rule("refs/heads/zeta/*", &["admin"]),
+        ]);
+        let expected = vec![
+            rule("refs/heads/alpha/*", &["dev"]),
+            rule("refs/heads/zeta/*", &["admin", "ops"]),
+        ];
+        assert_eq!(policy.rules(), expected.as_slice());
+
+        let recompiled = compile(policy.rules().to_vec());
+        assert_eq!(recompiled.rules(), policy.rules());
+        assert!(recompiled.is_ref_visible("refs/heads/zeta/x", &groups(&["admin"])));
+        assert!(!recompiled.is_ref_visible("refs/heads/zeta/x", &groups(&["dev"])));
+        assert!(compile(Vec::new()).rules().is_empty());
     }
 }

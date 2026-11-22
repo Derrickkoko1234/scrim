@@ -56,6 +56,14 @@ pub enum Command {
     Run(RunArgs),
     /// Manage encrypted private files and their access groups.
     Private(PrivateArgs),
+    /// Read the server's audit log of access and policy changes.
+    Audit(AuditArgs),
+    /// Manage SSH public keys used for Git-over-SSH authentication.
+    #[command(name = "ssh-key")]
+    SshKey(SshKeyArgs),
+    /// Push branches and tags visible to everyone to an external mirror,
+    /// refusing if any private file in their history is not encrypted.
+    Mirror(MirrorArgs),
     /// Serve Git's long-running clean/smudge filter protocol (invoked by Git).
     #[command(name = "filter-process", hide = true)]
     FilterProcess,
@@ -462,5 +470,95 @@ pub enum PrivateCommand {
         /// Group to rotate.
         #[arg(long, value_name = "GROUP")]
         group: String,
+    },
+}
+
+/// Default number of audit log entries per page.
+pub const DEFAULT_AUDIT_LIMIT: u32 = 50;
+
+#[derive(Debug, Args)]
+pub struct AuditArgs {
+    /// Only show entries made by this member.
+    #[arg(long, value_name = "MEMBER")]
+    pub actor: Option<String>,
+
+    /// Only show entries with this action (for example member.revoke, path_rule.set).
+    #[arg(long, value_name = "ACTION")]
+    pub action: Option<String>,
+
+    /// Only show entries for this target type (for example member, branch_rule, path_rule).
+    #[arg(long, value_name = "TYPE")]
+    pub target_type: Option<String>,
+
+    /// Maximum number of entries to return (1-500).
+    #[arg(long, default_value_t = DEFAULT_AUDIT_LIMIT, value_name = "N")]
+    pub limit: u32,
+
+    /// Only show entries older than this audit log ID (for paging).
+    #[arg(long, value_name = "ID")]
+    pub before_id: Option<i64>,
+
+    /// Print the raw JSON response for scripting.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MirrorArgs {
+    /// Git remote name (for example github) or URL of the external mirror.
+    #[arg(value_name = "TARGET")]
+    pub target: String,
+
+    /// Server repository key (defaults to local git config scrim.repo).
+    #[arg(long, value_name = "REPO")]
+    pub repo: Option<String>,
+
+    /// Run the visibility and encryption checks and report what would be
+    /// pushed, without pushing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Mirror only branches (refs/heads/*), not tags.
+    #[arg(long)]
+    pub no_tags: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SshKeyArgs {
+    #[command(subcommand)]
+    pub command: SshKeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SshKeyCommand {
+    /// Register an SSH public key from a .pub file or inline key string.
+    Add {
+        /// Path to an OpenSSH .pub file, or an inline OpenSSH public key string.
+        #[arg(value_name = "KEY")]
+        key: String,
+
+        /// Human-readable label for the SSH key.
+        #[arg(long, default_value = "", value_name = "LABEL")]
+        label: String,
+
+        /// Register the key for another member (admin only).
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
+    },
+    /// List active SSH public keys.
+    List {
+        /// List keys for another member (admin only).
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
+    },
+    /// Revoke an SSH public key by ID.
+    Rm {
+        /// Numeric SSH key ID shown by 'scrim ssh-key list'.
+        #[arg(value_name = "ID", allow_negative_numbers = true)]
+        id: i64,
+
+        /// Revoke a key belonging to another member (admin only).
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
     },
 }

@@ -343,6 +343,30 @@ pub fn serve(
     output: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    serve_requests(
+        input,
+        output,
+        stderr,
+        &mut |command, pathname, treeish, content| match command {
+            "clean" => context.clean(pathname, content),
+            "smudge" => context.smudge(pathname, treeish, content),
+            other => Err(anyhow!("unsupported filter command {other:?}")),
+        },
+    )
+}
+
+/// Converts one request's content: `(command, pathname, treeish, content)`.
+type FilterDispatch<'a> =
+    dyn FnMut(&str, &str, Option<&str>, &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> + 'a;
+
+/// The protocol half of [`serve`]: handshake, request framing and responses,
+/// with each request's conversion delegated to `dispatch`.
+fn serve_requests(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    stderr: &mut dyn Write,
+    dispatch: &mut FilterDispatch<'_>,
+) -> anyhow::Result<()> {
     let mut writer = BufWriter::with_capacity(MAX_PKT_LINE_BYTES, output);
     // Reused for every packet; zeroized on drop because it carries plaintext.
     let mut packet_buffer = Zeroizing::new(vec![0_u8; MAX_PKT_DATA_BYTES]);
@@ -377,13 +401,11 @@ pub fn serve(
             Err(err) => return Err(anyhow!(err)).context("failed to read filter content"),
         };
 
-        let result = match (content, command.as_str()) {
-            (None, _) => Err(anyhow!(
+        let result = match content {
+            None => Err(anyhow!(
                 "input is larger than the {MAX_FILTER_INPUT_BYTES}-byte filter limit"
             )),
-            (Some(content), "clean") => context.clean(&pathname, &content),
-            (Some(content), "smudge") => context.smudge(&pathname, treeish.as_deref(), &content),
-            (Some(_), other) => Err(anyhow!("unsupported filter command {other:?}")),
+            Some(content) => dispatch(&command, &pathname, treeish.as_deref(), &content),
         };
         let written = match result {
             Ok(converted) => write_success(&mut writer, &converted),
@@ -397,6 +419,43 @@ pub fn serve(
             return Err(anyhow!(err)).context("failed to write filter response");
         }
     }
+}
+
+/// Largest response the fuzz entry point buffers; writes beyond it fail like
+/// a closed pipe would.
+const MAX_FUZZ_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Fuzz entry point (see `scrim_cli::fuzz_support`): serves `data` as a
+/// complete filter-process session from Git, with no identity, no disk I/O
+/// and a bounded in-memory output buffer.
+///
+/// Smudge runs the real [`FilterContext::smudge`], which for a context
+/// without an identity never touches the disk. Clean runs the real
+/// [`FilterContext::clean`] only for encrypted blobs and placeholders, the
+/// branches that return before reading `.scrim/paths.toml` (from disk or
+/// via `git`); other clean content is echoed back unchanged.
+pub fn fuzz_filter_protocol(data: &[u8]) {
+    let mut context = FilterContext::new(
+        PathBuf::from("/nonexistent-scrim-fuzz-repo"),
+        None,
+        "fuzzing without an identity".to_owned(),
+    );
+    let mut input = io::Cursor::new(data);
+    let mut output_buffer = vec![0_u8; MAX_FUZZ_OUTPUT_BYTES];
+    let mut output = io::Cursor::new(output_buffer.as_mut_slice());
+    let _ = serve_requests(
+        &mut input,
+        &mut output,
+        &mut io::sink(),
+        &mut |command, pathname, treeish, content| match command {
+            "clean" if is_encrypted_file(content) || is_placeholder(content) => {
+                context.clean(pathname, content)
+            }
+            "clean" => Ok(Zeroizing::new(content.to_vec())),
+            "smudge" => context.smudge(pathname, treeish, content),
+            other => Err(anyhow!("unsupported filter command {other:?}")),
+        },
+    );
 }
 
 fn handshake(
@@ -992,5 +1051,50 @@ mod tests {
             must(fresh.clean("config/app.env", SECRET), "clean").to_vec(),
             blob_v2
         );
+    }
+
+    #[test]
+    fn fuzz_filter_protocol_survives_edge_case_inputs() {
+        let key = must(GroupDataKey::generate(), "generate key");
+        let blob = must(
+            encrypt_file("finance", 1, "config/a.env", &key, SECRET),
+            "encrypt",
+        );
+        let placeholder_text = must(format_placeholder("config/a.env", &blob), "placeholder");
+        let large_content = vec![b'x'; MAX_FUZZ_OUTPUT_BYTES + 1];
+
+        let mut session = handshake_bytes(&["clean", "smudge"]);
+        session.extend(request_bytes("smudge", "config/a.env", None, &blob));
+        session.extend(request_bytes("smudge", "notes.txt", Some("abcd"), b"plain"));
+        session.extend(request_bytes(
+            "clean",
+            "config/a.env",
+            None,
+            &placeholder_text,
+        ));
+        session.extend(request_bytes("clean", "moved.env", None, &placeholder_text));
+        session.extend(request_bytes("clean", "config/a.env", None, &blob));
+        session.extend(request_bytes("clean", "notes.txt", None, b"public"));
+        session.extend(request_bytes("delay", "notes.txt", None, b"public"));
+        session.extend(request_bytes("smudge", "huge.bin", None, &large_content));
+
+        let mut truncated = handshake_bytes(&["smudge"]);
+        truncated.extend(text("command=smudge"));
+
+        let inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"0000".to_vec(),
+            b"zzzz".to_vec(),
+            b"0003".to_vec(),
+            b"fff0".to_vec(),
+            text("git-filter-server"),
+            handshake_bytes(&[]),
+            session,
+            truncated,
+            [handshake_bytes(&["clean"]), b"SCRIMFILE\0".to_vec()].concat(),
+        ];
+        for input in inputs {
+            fuzz_filter_protocol(&input);
+        }
     }
 }

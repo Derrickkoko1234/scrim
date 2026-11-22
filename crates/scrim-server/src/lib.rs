@@ -18,6 +18,10 @@
 //! The same authenticated router serves the admin API under `/api/v1` (see
 //! [`MAX_ADMIN_BODY_BYTES`]), through which admins manage members, tokens,
 //! groups, repositories and branch rules in the [`PolicyStore`].
+//!
+//! [`serve_ssh`] serves the same repositories over Git's SSH transport, with
+//! members authenticated by their registered SSH keys and the same
+//! visibility, withholding and `pre-receive` enforcement as smart HTTP.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
@@ -25,12 +29,15 @@
 
 mod admin_api;
 mod auth;
+mod backup;
 mod git_service;
 mod pack_withhold;
+mod policy_cache;
 mod policy_store;
 mod pre_receive;
 mod repo_path;
 mod secret_scan;
+mod ssh_server;
 
 use std::{
     collections::BTreeMap,
@@ -45,11 +52,17 @@ use axum::{
     http::{HeaderValue, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
+    routing::get,
 };
 use tower_http::{decompression::RequestDecompressionLayer, trace::TraceLayer};
 
 pub use admin_api::MAX_ADMIN_BODY_BYTES;
 pub use auth::{AuthConfigError, MAX_TOKEN_BYTES, TokenAuth};
+pub use backup::{
+    BACKUP_MANIFEST_VERSION, BackupArtifact, BackupConfig, BackupManifest, BackupRepoEntry,
+    DEFAULT_R2_PREFIX, LatestBackupPointer, MAX_BACKUP_OBJECT_BYTES, R2Config, RestoreConfig,
+    S3SigningRequest, run_backup, run_restore, sign_s3_request,
+};
 use git_service::{
     GitService, GitVisibilityConfig, advertise_refs, list_repo_refs, sanitize_git_protocol,
     serve_rpc,
@@ -57,23 +70,148 @@ use git_service::{
 pub use pack_withhold::{
     PACK_OBJECTS_HOOK_MODE, PACK_OBJECTS_HOOK_MODE_ENV, run_pack_objects_hook_process,
 };
-use pack_withhold::{PackWithholdContext, start_pack_withhold_session};
+use pack_withhold::{PackWithholdContext, PackWithholdSession, start_pack_withhold_session};
+pub use policy_cache::{
+    CachedPolicyStore, DEFAULT_POLICY_CACHE_TTL_SECONDS, MemoryPolicyCache, POLICY_CACHE_EPOCH_KEY,
+    PolicyCacheBackend, RedisPolicyCache, policy_cache_key,
+};
 pub use policy_store::{
-    API_TOKEN_PREFIX, AuditLogEntry, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
-    CreatedMember, GroupMembershipChange, GroupRecipientsRecord, GroupRecord, GroupWithMembers,
-    IssuedToken, MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_SCOPE_NAME_BYTES,
-    MAX_TOKEN_LABEL_BYTES, MemberPublicKeyRecord, MemberRecord, MemberRepoPolicy,
-    MemoryPolicyStore, PathRuleRecord, PgPolicyStore, PolicyStore, PolicyStoreError,
-    PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult,
-    ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord, StaticPolicyStore,
+    API_TOKEN_PREFIX, AuditLogEntry, AuditLogPage, AuditLogQuery, AuditLogRecord,
+    AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, CreatedMember,
+    DEFAULT_AUDIT_LOG_LIMIT, GroupMembershipChange, GroupRecipientsRecord, GroupRecord,
+    GroupWithMembers, IssuedToken, MAX_AUDIT_LOG_LIMIT, MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES,
+    MAX_SCOPE_NAME_BYTES, MAX_SSH_PUBLIC_KEY_BYTES, MAX_TOKEN_LABEL_BYTES, MemberPublicKeyRecord,
+    MemberRecord, MemberRepoPolicy, MemberSshKeyRecord, MemoryPolicyStore, PathRuleRecord,
+    PgPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture, RegisterRepositoryResult,
+    RepositoryRecord, RevokeMemberResult, ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
+    StaticPolicyStore,
 };
 pub use pre_receive::{
     ALLOW_MERGE_LEAK_PUSH_OPTION, ALLOW_SECRET_SCAN_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE,
     PRE_RECEIVE_HOOK_MODE_ENV, run_pre_receive_hook_process,
 };
-use pre_receive::{HookDir, PreReceiveContext, start_pre_receive_session};
-use repo_path::{RepoHead, read_valid_head, resolve_bare_repo};
+use pre_receive::{HookDir, PreReceiveContext, PreReceiveSession, start_pre_receive_session};
+use repo_path::{RepoHead, ResolvedRepo, read_valid_head, resolve_bare_repo};
 pub use secrecy::SecretString;
+pub use ssh_server::{SshServerConfig, load_or_create_ssh_host_key, serve_ssh};
+
+/// Entry points for the `cargo-fuzz` targets in `fuzz/`. Not a stable API.
+#[doc(hidden)]
+pub mod fuzz_support {
+    use crate::git_service::UploadPackRequestFilter;
+
+    /// Most pack-objects arguments fed to the argument parser per input; git
+    /// never passes more than a handful.
+    const MAX_FUZZ_PACK_ARGS: usize = 64;
+
+    /// Runs `data` through every untrusted-input parser of the server: the
+    /// `upload-pack` request filter (in chunks sized by the first byte), the
+    /// SSH `exec` command parser, the `pack-objects` hook argument and stdin
+    /// parsers, the `pre-receive` ref update and `diff-tree` parsers, and the
+    /// secret scanner. Results are discarded; only panics matter.
+    pub fn fuzz_parsers(data: &[u8]) {
+        let (chunk_size, request) = match data.split_first() {
+            Some((first, rest)) => (usize::from(*first) + 1, rest),
+            None => (1, data),
+        };
+        let mut request_filter = UploadPackRequestFilter::default();
+        let mut is_rejected = false;
+        for chunk in request.chunks(chunk_size) {
+            if request_filter.filter_chunk(chunk).is_err() {
+                is_rejected = true;
+                break;
+            }
+        }
+        if !is_rejected {
+            let _ = request_filter.finish();
+        }
+
+        let _ = crate::ssh_server::parse_git_ssh_command(data);
+
+        let pack_args: Vec<String> = String::from_utf8_lossy(data)
+            .split(['\n', ' ', '\0'])
+            .take(MAX_FUZZ_PACK_ARGS)
+            .map(str::to_owned)
+            .collect();
+        let _ = crate::pack_withhold::parse_pack_args(&pack_args);
+        let _ = crate::pack_withhold::parse_pack_stdin(data);
+
+        let _ = crate::pre_receive::parse_ref_updates(data);
+        let _ = crate::pre_receive::parse_raw_diff_entries(data);
+
+        let _ = crate::secret_scan::scan_blob_bytes(data);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::fuzz_parsers;
+
+        #[test]
+        fn fuzz_parsers_survives_edge_case_inputs() {
+            let zero_oid = "0".repeat(40);
+            let one_oid = "1".repeat(40);
+            let inputs: Vec<Vec<u8>> = vec![
+                Vec::new(),
+                vec![0],
+                vec![0xff; 4096],
+                b"\x000004000".to_vec(),
+                b"\x030009deepen-not x\n0000".to_vec(),
+                b"\x07fff0".to_vec(),
+                b"git-upload-pack '/repo.git'".to_vec(),
+                b"git-receive-pack 'a'\\''b'".to_vec(),
+                b"git --shallow-file pack-objects --revs --filter=blob:limit=9999999999999g"
+                    .to_vec(),
+                format!("{one_oid}\n--not\n^{one_oid}\n--shallow {one_oid}\n").into_bytes(),
+                format!("{zero_oid} {one_oid} refs/heads/main\n").into_bytes(),
+                format!(":100644 100644 {zero_oid} {one_oid} M\0path\0").into_bytes(),
+                b"::100644\0\0\0".to_vec(),
+                b"AKIAABCDEFGHIJKLMNOP ghp_0123456789abcdefghijklmnopqrstuvwxyzAB\n-----BEGIN"
+                    .to_vec(),
+                "é\u{2028}\u{feff}".repeat(100).into_bytes(),
+            ];
+            for input in inputs {
+                fuzz_parsers(&input);
+            }
+        }
+    }
+}
+
+/// Entry points for the criterion benchmarks in `benches/`. Not a stable API.
+#[doc(hidden)]
+pub mod bench_support {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use scrim_policy::WithholdPolicy;
+
+    /// Runs the `pack-objects` hook's object selection exactly as production
+    /// does and returns the number of objects selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as the production selection (malformed
+    /// arguments or object list, unreadable or unexpected objects).
+    pub fn compute_allowed_pack_objects_for_bench(
+        repo_dir: &Path,
+        pack_args: &[String],
+        stdin: &[u8],
+        withhold_policy: &WithholdPolicy,
+        member_groups: &BTreeSet<String>,
+        visible_tag_refs: &[String],
+    ) -> std::io::Result<usize> {
+        match crate::pack_withhold::compute_allowed_pack_objects(
+            repo_dir,
+            pack_args,
+            stdin,
+            withhold_policy,
+            member_groups,
+            visible_tag_refs,
+        ) {
+            Ok(selection) => Ok(selection.objects.len()),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 /// Builds the router that serves the bare repositories found under `repo_root`
 /// over Git smart HTTP (`info/refs`, `git-upload-pack`, `git-receive-pack`),
@@ -100,13 +238,24 @@ pub fn router(repo_root: PathBuf, auth: TokenAuth) -> Router {
 /// Paths under `/api/v1` are the admin API instead of Git; repository paths
 /// starting with `api/` can therefore not be registered.
 pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> Router {
+    router_with_hook_dir(repo_root, policy_store, SharedHookDir::default())
+}
+
+/// Like [`router_with_policy_store`], but sets up git's server-owned hooks in
+/// `hook_dir`, which an [`SshServerConfig`] may share so both transports use
+/// one hook directory.
+pub fn router_with_hook_dir(
+    repo_root: PathBuf,
+    policy_store: Arc<dyn PolicyStore>,
+    hook_dir: SharedHookDir,
+) -> Router {
     let admin_router = admin_api::router(repo_root.clone(), Arc::clone(&policy_store));
     let state = AppState {
         repo_root,
         policy_store: Arc::clone(&policy_store),
-        hook_dir: Arc::new(tokio::sync::Mutex::new(None)),
+        hook_dir,
     };
-    Router::new()
+    let authenticated_router = Router::new()
         // Axum wildcards cannot be followed by a literal suffix, so a single
         // fallback parses `<repo>/info/refs` and `<repo>/git-*-pack` itself.
         .fallback(handle_request)
@@ -119,7 +268,11 @@ pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn Policy
         .layer(middleware::from_fn_with_state(
             policy_store,
             auth::require_auth,
-        ))
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(authenticated_router)
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 // Record only method and path so query strings or accidental
@@ -133,18 +286,39 @@ pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn Policy
         )
 }
 
+async fn healthz() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        r#"{"status":"ok"}"#,
+    )
+        .into_response()
+}
+
 /// State shared by every request handler.
 #[derive(Clone)]
 struct AppState {
     repo_root: PathBuf,
     policy_store: Arc<dyn PolicyStore>,
-    /// Created on the first push (or fetch with withheld paths) rather than
-    /// with the router, so routers that never need a hook (and `cargo test
-    /// --lib`, where the server binary may not be built) do not need the hook
-    /// binary. Replaced when
-    /// its hook is no longer installed; see [`current_hook_dir`].
-    hook_dir: Arc<tokio::sync::Mutex<Option<Arc<HookDir>>>>,
+    hook_dir: SharedHookDir,
 }
+
+/// The directory holding git's server-owned `pre-receive` and `pack-objects`
+/// hooks, shareable between the HTTP router ([`router_with_hook_dir`]) and
+/// the SSH server ([`SshServerConfig`]). Clones share one directory.
+///
+/// It is created on the first push (or fetch with withheld paths) rather than
+/// up front, so servers that never need a hook (and `cargo test --lib`, where
+/// the server binary may not be built) do not need the hook binary, and it is
+/// replaced when its hook is no longer installed; see [`current_hook_dir`].
+#[derive(Clone, Default)]
+pub struct SharedHookDir(Arc<tokio::sync::Mutex<Option<Arc<HookDir>>>>);
 
 /// Returns the shared hook directory, creating it on first use and creating a
 /// fresh one whenever the current one fails [`HookDir::verify_installed`]
@@ -152,10 +326,8 @@ struct AppState {
 /// heals itself instead of refusing every push until restarted.
 ///
 /// A replaced directory is deleted once the last push still using it ends.
-async fn current_hook_dir(
-    hook_dir: &tokio::sync::Mutex<Option<Arc<HookDir>>>,
-) -> std::io::Result<Arc<HookDir>> {
-    let mut current = hook_dir.lock().await;
+async fn current_hook_dir(hook_dir: &SharedHookDir) -> std::io::Result<Arc<HookDir>> {
+    let mut current = hook_dir.0.lock().await;
     if let Some(dir) = current.as_ref()
         && dir.verify_installed().is_ok()
     {
@@ -309,56 +481,21 @@ async fn route_request(state: &AppState, request: Request) -> Response {
             .await
             .map(|body| (service, "advertisement", body))
     } else {
-        let pack_withhold = if service == GitService::UploadPack
-            && policy
-                .withhold_policy
-                .has_withheld_rules(&policy.member_groups)
+        let (pre_receive, pack_withhold) = match start_hook_sessions(
+            service,
+            &state.hook_dir,
+            &resolved_repo,
+            member,
+            policy,
+            &state.policy_store,
+        )
+        .await
         {
-            let hook_dir = match current_hook_dir(&state.hook_dir).await {
-                Ok(hook_dir) => hook_dir,
-                Err(error) => {
-                    tracing::error!(%error, "cannot set up the pack-objects hook");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            let context = PackWithholdContext {
-                repo_dir: resolved_repo.dir.clone(),
-                policy: policy.clone(),
-            };
-            match start_pack_withhold_session(hook_dir, context).await {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    tracing::error!(%error, "cannot start the pack-objects callback");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::error!(%error, "cannot start the git hook session");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-        } else {
-            None
-        };
-        let pre_receive = if service == GitService::ReceivePack {
-            let hook_dir = match current_hook_dir(&state.hook_dir).await {
-                Ok(hook_dir) => hook_dir,
-                Err(error) => {
-                    tracing::error!(%error, "cannot set up the pre-receive hook");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
-            let context = PreReceiveContext {
-                repo_dir: resolved_repo.dir.clone(),
-                canonical_key: resolved_repo.canonical_key.clone(),
-                member: member.clone(),
-                policy,
-                policy_store: Arc::clone(&state.policy_store),
-            };
-            match start_pre_receive_session(hook_dir, context).await {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    tracing::error!(%error, "cannot start the pre-receive callback");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        } else {
-            None
         };
         serve_rpc(
             service,
@@ -377,6 +514,61 @@ async fn route_request(state: &AppState, request: Request) -> Response {
         Err(error) => {
             tracing::error!(%error, "failed to run git");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Starts the server-owned hook sessions one git process for `service` runs
+/// with: the `pre-receive` guard for every `receive-pack`, and the
+/// `pack-objects` hook for an `upload-pack` by a member with withheld paths.
+///
+/// Fails if the hook directory cannot be set up (for example when the server
+/// binary cannot be found) or a callback listener cannot be started.
+async fn start_hook_sessions(
+    service: GitService,
+    hook_dir: &SharedHookDir,
+    resolved_repo: &ResolvedRepo,
+    member: &AuthenticatedMember,
+    policy: MemberRepoPolicy,
+    policy_store: &Arc<dyn PolicyStore>,
+) -> std::io::Result<(Option<PreReceiveSession>, Option<PackWithholdSession>)> {
+    match service {
+        GitService::UploadPack => {
+            if !policy
+                .withhold_policy
+                .has_withheld_rules(&policy.member_groups)
+            {
+                return Ok((None, None));
+            }
+            let hook_dir = match current_hook_dir(hook_dir).await {
+                Ok(hook_dir) => hook_dir,
+                Err(error) => return Err(error),
+            };
+            let context = PackWithholdContext {
+                repo_dir: resolved_repo.dir.clone(),
+                policy,
+            };
+            match start_pack_withhold_session(hook_dir, context).await {
+                Ok(session) => Ok((None, Some(session))),
+                Err(error) => Err(error),
+            }
+        }
+        GitService::ReceivePack => {
+            let hook_dir = match current_hook_dir(hook_dir).await {
+                Ok(hook_dir) => hook_dir,
+                Err(error) => return Err(error),
+            };
+            let context = PreReceiveContext {
+                repo_dir: resolved_repo.dir.clone(),
+                canonical_key: resolved_repo.canonical_key.clone(),
+                member: member.clone(),
+                policy,
+                policy_store: Arc::clone(policy_store),
+            };
+            match start_pre_receive_session(hook_dir, context).await {
+                Ok(session) => Ok((Some(session), None)),
+                Err(error) => Err(error),
+            }
         }
     }
 }

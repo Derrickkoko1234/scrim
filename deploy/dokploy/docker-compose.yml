@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scrim}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-scrim}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-scrim} -d $${POSTGRES_DB:-scrim}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  scrim-server:
+    image: ${SCRIM_IMAGE:-ghcr.io/derrickkoko1234/scrim:main}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SCRIM_REPO_ROOT: /var/lib/scrim/repos
+      SCRIM_LISTEN: 0.0.0.0:8080
+      SCRIM_SSH_LISTEN: 0.0.0.0:2222
+      SCRIM_SSH_HOST_KEY: /var/lib/scrim/ssh/host_ed25519_key
+      DATABASE_URL: postgres://${POSTGRES_USER:-scrim}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-scrim}
+      REDIS_URL: redis://redis:6379
+      # Keep HookDir (`pre-receive` and `pack-objects` symlinks + callback socket)
+      # on the writable data volume rather than a possibly `noexec` tmpfs.
+      XDG_RUNTIME_DIR: /var/lib/scrim/run
+      RUST_LOG: ${RUST_LOG:-info}
+      # Optional Cloudflare R2 settings for `scrim-server backup` / `restore`:
+      # SCRIM_R2_ENDPOINT: ${SCRIM_R2_ENDPOINT}
+      # SCRIM_R2_BUCKET: ${SCRIM_R2_BUCKET}
+      # SCRIM_R2_ACCESS_KEY_ID: ${SCRIM_R2_ACCESS_KEY_ID}
+      # SCRIM_R2_SECRET_ACCESS_KEY: ${SCRIM_R2_SECRET_ACCESS_KEY}
+      # SCRIM_R2_PREFIX: ${SCRIM_R2_PREFIX}
+    expose:
+      - "8080"
+    ports:
+      - "${SCRIM_SSH_PORT:-2222}:2222"
+    volumes:
+      - scrim_data:/var/lib/scrim
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  scrim_data:

@@ -1,5 +1,7 @@
 //! Runs `git upload-pack` / `git receive-pack` for one HTTP request and streams
 //! the data between the HTTP body and the child process in both directions.
+//! The SSH transport starts the same hardened git through
+//! [`spawn_git_interactive`] and does its own streaming.
 //!
 //! Every request can carry its own [`GitVisibilityConfig`], which git applies
 //! through `transfer.hideRefs` so hidden refs are neither advertised nor
@@ -59,7 +61,7 @@ pub struct GitVisibilityConfig {
 
 impl GitVisibilityConfig {
     /// Whether the restrictions for members who may not see every ref apply.
-    fn is_enforced(&self) -> bool {
+    pub(crate) fn is_enforced(&self) -> bool {
         self.enforce_visibility || !self.hidden_refs.is_empty()
     }
 }
@@ -122,7 +124,7 @@ pub fn sanitize_git_protocol(header_value: &str) -> Option<&str> {
 
 /// Owns a spawned `git` child process and ensures its entire process group is
 /// killed on drop if the child has not already been reaped.
-struct ManagedChild {
+pub(crate) struct ManagedChild {
     child: Child,
 }
 
@@ -131,19 +133,19 @@ impl ManagedChild {
         Self { child }
     }
 
-    fn take_stdin(&mut self) -> Option<ChildStdin> {
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()
     }
 
-    fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
     }
 
-    fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.child.stderr.take()
     }
 
-    async fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait().await
     }
 
@@ -188,7 +190,7 @@ pub async fn advertise_refs(
 ) -> io::Result<Body> {
     let mut child = match spawn_git(
         service,
-        true,
+        GitInvocation::AdvertiseRefs,
         repo_dir,
         git_protocol,
         visibility,
@@ -303,7 +305,7 @@ pub fn serve_rpc(
     }
     let mut child = match spawn_git(
         service,
-        false,
+        GitInvocation::StatelessRpc,
         repo_dir,
         git_protocol,
         visibility,
@@ -402,7 +404,7 @@ pub fn serve_rpc(
 /// malformed framing and any `deepen-not` line before git sees it. The rest
 /// of the request (`have` and `done` lines) passes through unchanged.
 #[derive(Debug, Default)]
-struct UploadPackRequestFilter {
+pub(crate) struct UploadPackRequestFilter {
     /// Bytes of an incomplete pkt-line carried over to the next chunk.
     pending: Vec<u8>,
     /// Set once the first flush packet has been forwarded.
@@ -415,7 +417,7 @@ impl UploadPackRequestFilter {
     /// Fails with `InvalidData`, forwarding nothing from `chunk`, on an
     /// invalid length header, a length of 1-3 or above
     /// [`MAX_PKT_LINE_BYTES`], or a `deepen-not` line.
-    fn filter_chunk(&mut self, chunk: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn filter_chunk(&mut self, chunk: &[u8]) -> io::Result<Vec<u8>> {
         if self.is_past_first_flush {
             return Ok(chunk.to_vec());
         }
@@ -451,7 +453,7 @@ impl UploadPackRequestFilter {
     }
 
     /// Fails if the request ended inside a pkt-line before the first flush.
-    fn finish(&self) -> io::Result<()> {
+    pub(crate) fn finish(&self) -> io::Result<()> {
         if self.pending.is_empty() {
             Ok(())
         } else {
@@ -477,11 +479,68 @@ fn invalid_request(message: &str) -> io::Error {
 
 /// The server-owned hook a git process runs with.
 #[derive(Clone, Copy)]
-enum HookSession<'session> {
+pub(crate) enum HookSession<'session> {
     /// `receive-pack`'s `pre-receive` guard.
     PreReceive(&'session PreReceiveSession),
     /// `upload-pack`'s `pack-objects` hook.
     PackWithhold(&'session PackWithholdSession),
+}
+
+/// How a spawned git talks to its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitInvocation {
+    /// `--stateless-rpc --advertise-refs`: a smart-HTTP `info/refs` answer.
+    AdvertiseRefs,
+    /// `--stateless-rpc`: one smart-HTTP RPC.
+    StatelessRpc,
+    /// A full conversation over stdin and stdout (Git over SSH); stderr is
+    /// left piped for the caller instead of being logged.
+    Interactive,
+}
+
+/// Spawns `git <service>` for `repo_dir` for a Git-over-SSH session: git
+/// advertises its refs and then negotiates over stdin and stdout, with stdin,
+/// stdout and stderr all piped for the caller.
+///
+/// Runs with exactly the hardening of the smart-HTTP services (see
+/// [`spawn_git`]). `receive-pack` requires a [`HookSession::PreReceive`] whose
+/// hook is still installed, and a [`HookSession::PackWithhold`] must still be
+/// installed too: git silently skips a missing hook, so this fails without
+/// starting git instead.
+pub(crate) fn spawn_git_interactive(
+    service: GitService,
+    repo_dir: &Path,
+    git_protocol: Option<&str>,
+    visibility: &GitVisibilityConfig,
+    hook_session: Option<HookSession<'_>>,
+) -> io::Result<ManagedChild> {
+    let verified = match (service, hook_session) {
+        (GitService::ReceivePack, Some(HookSession::PreReceive(session))) => {
+            session.verify_hook_installed()
+        }
+        (GitService::ReceivePack, _) => Err(io::Error::other(
+            "receive-pack requires the pre-receive guard",
+        )),
+        (GitService::UploadPack, Some(HookSession::PackWithhold(session))) => {
+            session.verify_hook_installed()
+        }
+        (GitService::UploadPack, Some(HookSession::PreReceive(_))) => Err(io::Error::other(
+            "upload-pack cannot run the pre-receive guard",
+        )),
+        (GitService::UploadPack, None) => Ok(()),
+    };
+    if let Err(error) = verified {
+        return Err(error);
+    }
+    spawn_git(
+        service,
+        GitInvocation::Interactive,
+        repo_dir,
+        git_protocol,
+        visibility,
+        hook_session,
+        Stdio::piped(),
+    )
 }
 
 /// Spawns `git <service>` for `repo_dir` with an empty environment, the
@@ -510,7 +569,7 @@ enum HookSession<'session> {
 /// contains NUL, CR or LF.
 fn spawn_git(
     service: GitService,
-    advertise_refs: bool,
+    invocation: GitInvocation,
     repo_dir: &Path,
     git_protocol: Option<&str>,
     visibility: &GitVisibilityConfig,
@@ -579,9 +638,14 @@ fn spawn_git(
         // Prevent git from falling back to `<dir>/.git` or `<dir>.git`.
         command.arg("--strict");
     }
-    command.arg("--stateless-rpc");
-    if advertise_refs {
-        command.arg("--advertise-refs");
+    match invocation {
+        GitInvocation::AdvertiseRefs => {
+            command.arg("--stateless-rpc").arg("--advertise-refs");
+        }
+        GitInvocation::StatelessRpc => {
+            command.arg("--stateless-rpc");
+        }
+        GitInvocation::Interactive => {}
     }
     command.arg("--").arg(repo_dir);
 
@@ -624,7 +688,9 @@ fn spawn_git(
         Ok(child) => child,
         Err(error) => return Err(error),
     };
-    if let Some(stderr) = child.stderr.take() {
+    if invocation != GitInvocation::Interactive
+        && let Some(stderr) = child.stderr.take()
+    {
         tokio::spawn(log_stderr(service, stderr));
     }
     Ok(ManagedChild::new(child))
@@ -997,8 +1063,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        GitService, GitVisibilityConfig, RepoRefEntry, UploadPackRequestFilter, advertise_refs,
-        list_repo_refs, parse_ref_listing, sanitize_git_protocol, serve_rpc, spawn_git,
+        GitInvocation, GitService, GitVisibilityConfig, RepoRefEntry, UploadPackRequestFilter,
+        advertise_refs, list_repo_refs, parse_ref_listing, sanitize_git_protocol, serve_rpc,
+        spawn_git,
     };
 
     /// A bare repository with `refs/heads/main` (commit `main_commit`, also
@@ -1411,7 +1478,7 @@ mod tests {
             };
             match spawn_git(
                 GitService::UploadPack,
-                true,
+                GitInvocation::AdvertiseRefs,
                 &repo.dir,
                 None,
                 &visibility,

@@ -1,7 +1,8 @@
 //! The admin HTTP API served under `/api/v1`, which the `scrim` CLI talks to.
 //!
 //! Requests arrive already authenticated by [`crate::auth::require_auth`].
-//! `GET /api/v1/whoami`, `PUT /api/v1/me/public-key`, and
+//! `GET /api/v1/whoami`, `PUT /api/v1/me/public-key`, `/api/v1/me/ssh-keys`
+//! (list, add, revoke the member's own SSH keys), and
 //! `GET /api/v1/path-rules/me` are open to every active member,
 //! `GET /api/v1/groups/{group}/recipients` is open to members belonging to that
 //! group (as well as admins), and `GET /api/v1/secret-scopes/recipients` is
@@ -30,8 +31,9 @@ use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 
 use crate::{
     policy_store::{
-        AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, MemberRecord, PathRuleRecord,
-        PolicyStore, PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
+        AuditLogQuery, AuditLogRecord, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
+        DEFAULT_AUDIT_LOG_LIMIT, MemberRecord, MemberSshKeyRecord, PathRuleRecord, PolicyStore,
+        PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
     },
     repo_path::{
         BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo, resolve_bare_repo,
@@ -54,6 +56,8 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
     Router::new()
         .route("/whoami", get(whoami))
         .route("/me/public-key", put(set_own_public_key))
+        .route("/me/ssh-keys", get(list_own_ssh_keys).post(add_own_ssh_key))
+        .route("/me/ssh-keys/{id}", delete(revoke_own_ssh_key))
         .route(
             "/repositories",
             get(list_repositories).post(register_repository),
@@ -69,6 +73,14 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
         .route("/members/{name}", delete(revoke_member))
         .route("/members/{name}/tokens", post(issue_member_token))
         .route("/members/{name}/public-key", put(set_member_public_key))
+        .route(
+            "/members/{name}/ssh-keys",
+            get(list_member_ssh_keys).post(add_member_ssh_key),
+        )
+        .route(
+            "/members/{name}/ssh-keys/{id}",
+            delete(revoke_member_ssh_key),
+        )
         .route(
             "/branch-rules",
             get(list_branch_rules)
@@ -92,6 +104,7 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
             "/secret-scopes/recipients",
             get(get_secret_scope_recipients),
         )
+        .route("/audit-log", get(list_audit_log))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(AdminState {
@@ -869,6 +882,153 @@ async fn set_member_public_key(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AddSshKeyBody {
+    public_key: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Serialize)]
+struct SshKeyResponse {
+    id: i64,
+    fingerprint: String,
+    public_key: String,
+    label: String,
+}
+
+impl From<MemberSshKeyRecord> for SshKeyResponse {
+    fn from(record: MemberSshKeyRecord) -> Self {
+        Self {
+            id: record.id,
+            fingerprint: record.fingerprint,
+            public_key: record.public_key,
+            label: record.label,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SshKeysResponse {
+    member: String,
+    keys: Vec<SshKeyResponse>,
+}
+
+#[derive(Serialize)]
+struct SshKeyAddedResponse {
+    member: String,
+    key: SshKeyResponse,
+}
+
+#[derive(Serialize)]
+struct SshKeyRevokedResponse {
+    member: String,
+    id: i64,
+    revoked: bool,
+}
+
+/// Lists `member_name`'s active SSH keys.
+async fn list_ssh_keys(state: &AdminState, member_name: String) -> ApiResult<SshKeysResponse> {
+    match state.policy_store.list_member_ssh_keys(&member_name).await {
+        Ok(keys) => ok(SshKeysResponse {
+            member: member_name,
+            keys: keys.into_iter().map(SshKeyResponse::from).collect(),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// Registers `body`'s key for `member_name` on behalf of `actor`.
+async fn add_ssh_key(
+    state: &AdminState,
+    actor: &AuthenticatedMember,
+    member_name: &str,
+    body: AddSshKeyBody,
+) -> ApiResult<SshKeyAddedResponse> {
+    match state
+        .policy_store
+        .add_member_ssh_key(Some(actor.id), member_name, &body.public_key, &body.label)
+        .await
+    {
+        Ok(record) => created(SshKeyAddedResponse {
+            member: record.member.clone(),
+            key: SshKeyResponse::from(record),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// Revokes `member_name`'s key `key_id` on behalf of `actor`.
+async fn revoke_ssh_key(
+    state: &AdminState,
+    actor: &AuthenticatedMember,
+    member_name: String,
+    key_id: i64,
+) -> ApiResult<SshKeyRevokedResponse> {
+    match state
+        .policy_store
+        .revoke_member_ssh_key(Some(actor.id), &member_name, key_id)
+        .await
+    {
+        Ok(revoked) => ok(SshKeyRevokedResponse {
+            member: member_name,
+            id: key_id,
+            revoked,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+async fn list_own_ssh_keys(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+) -> ApiResult<SshKeysResponse> {
+    list_ssh_keys(&state, member.name).await
+}
+
+async fn add_own_ssh_key(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiJson(body): ApiJson<AddSshKeyBody>,
+) -> ApiResult<SshKeyAddedResponse> {
+    add_ssh_key(&state, &member, &member.name, body).await
+}
+
+async fn revoke_own_ssh_key(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiPath(key_id): ApiPath<i64>,
+) -> ApiResult<SshKeyRevokedResponse> {
+    let member_name = member.name.clone();
+    revoke_ssh_key(&state, &member, member_name, key_id).await
+}
+
+async fn list_member_ssh_keys(
+    State(state): State<AdminState>,
+    AdminMember(_actor): AdminMember,
+    ApiPath(name): ApiPath<String>,
+) -> ApiResult<SshKeysResponse> {
+    list_ssh_keys(&state, name).await
+}
+
+async fn add_member_ssh_key(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<AddSshKeyBody>,
+) -> ApiResult<SshKeyAddedResponse> {
+    add_ssh_key(&state, &actor, &name, body).await
+}
+
+async fn revoke_member_ssh_key(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiPath((name, key_id)): ApiPath<(String, i64)>,
+) -> ApiResult<SshKeyRevokedResponse> {
+    revoke_ssh_key(&state, &actor, name, key_id).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetSecretScopeBody {
     repository: String,
     scope: String,
@@ -1239,4 +1399,76 @@ async fn get_my_withheld_paths(
         withheld_patterns,
         sparse_checkout_patterns,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListAuditLogQuery {
+    actor: Option<String>,
+    action: Option<String>,
+    target_type: Option<String>,
+    limit: Option<u32>,
+    before_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AuditLogRecordResponse {
+    id: i64,
+    occurred_at: String,
+    actor_member_id: Option<i64>,
+    actor_name: Option<String>,
+    action: String,
+    target_type: String,
+    target_name: String,
+    details: serde_json::Value,
+}
+
+impl From<AuditLogRecord> for AuditLogRecordResponse {
+    fn from(record: AuditLogRecord) -> Self {
+        Self {
+            id: record.id,
+            occurred_at: record.occurred_at,
+            actor_member_id: record.actor_member_id,
+            actor_name: record.actor_name,
+            action: record.action,
+            target_type: record.target_type,
+            target_name: record.target_name,
+            details: record.details,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuditLogResponse {
+    entries: Vec<AuditLogRecordResponse>,
+    next_before_id: Option<i64>,
+}
+
+async fn list_audit_log(
+    State(state): State<AdminState>,
+    AdminMember(_actor): AdminMember,
+    ApiQuery(query): ApiQuery<ListAuditLogQuery>,
+) -> ApiResult<AuditLogResponse> {
+    let limit = match query.limit {
+        Some(limit) => limit,
+        None => DEFAULT_AUDIT_LOG_LIMIT,
+    };
+    let store_query = AuditLogQuery {
+        actor: query.actor,
+        action: query.action,
+        target_type: query.target_type,
+        limit,
+        before_id: query.before_id,
+    };
+    match state.policy_store.list_audit_log(store_query).await {
+        Ok(page) => ok(AuditLogResponse {
+            entries: page
+                .entries
+                .into_iter()
+                .map(AuditLogRecordResponse::from)
+                .collect(),
+            next_before_id: page.next_before_id,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
 }

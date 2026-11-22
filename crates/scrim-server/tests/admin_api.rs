@@ -30,6 +30,17 @@ const TEST_AGE_KEY_2: &str = "age1zqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
 const TEST_AGE_KEY_3: &str = "age1pqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqxpnvqe";
 const TEST_AGE_KEY_ALL_ZERO: &str =
     "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5cu47z";
+const TEST_SSH_KEY_1: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH2ACokL5rFZeMA6cnIFOE6yBk13muMZSo6BO+J/4jM+";
+const TEST_SSH_FINGERPRINT_1: &str = "SHA256:Np8Ba0OTNlnS1Ld82GoBXei8fVIP13IJqvG+Xz1KgG0";
+const TEST_SSH_KEY_2: &str = "ecdsa-sha2-nistp256 \
+    AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBP/zY1wvD7iHSKA4X8GQRfS4mjEVQUqnw1DnZut6\
+    e7eUQPzXYb8rC84vW2jq/3X2GuHtrN/zqnXaLOALTCcqyPo=";
+const TEST_SSH_FINGERPRINT_2: &str = "SHA256:7+aUSc8jzhtDeHMLq0iM8JG0Es1qmwulgYBnsePzwJI";
+const TEST_SSH_RSA_KEY: &str = "ssh-rsa \
+    AAAAB3NzaC1yc2EAAAADAQABAAAAgQCgC/dtvlp1WLBs6x25e4Ole3Gtjog2XzGAZmDqcCy009cvQI681MEm26j0csHp\
+    bBTRJhPnwQQ+5cycqHS0MCgR/+s/b/Cx1oMFT5zgRQUfkLjVUKFRqP3Sx+qD+0xG/flxrJGoX/c5yUV4Kj7VK+q3CTcZ\
+    zZA9xgQF++gsveN5xQ==";
 
 /// A router over a [`MemoryPolicyStore`] holding the admin `root` (ID 1) and
 /// the non-admin `dev` (ID 2), with a handle on the shared store.
@@ -295,6 +306,14 @@ fn admin_routes() -> Vec<(Method, &'static str, Option<Value>)> {
             "/api/v1/secret-scopes?repo=new.git&scope=dev",
             None,
         ),
+        (Method::GET, "/api/v1/audit-log", None),
+        (Method::GET, "/api/v1/members/dev/ssh-keys", None),
+        (
+            Method::POST,
+            "/api/v1/members/dev/ssh-keys",
+            Some(json!({ "public_key": TEST_SSH_KEY_1 })),
+        ),
+        (Method::DELETE, "/api/v1/members/dev/ssh-keys/1", None),
     ]
 }
 
@@ -363,6 +382,13 @@ async fn static_store_answers_administration_with_not_implemented() {
         None,
     ));
     routes.push((Method::GET, "/api/v1/groups/core/recipients", None));
+    routes.push((Method::GET, "/api/v1/me/ssh-keys", None));
+    routes.push((
+        Method::POST,
+        "/api/v1/me/ssh-keys",
+        Some(json!({ "public_key": TEST_SSH_KEY_1 })),
+    ));
+    routes.push((Method::DELETE, "/api/v1/me/ssh-keys/1", None));
     for (method, uri, body) in routes {
         let reply = send(&router, method.clone(), uri, Some(TEST_TOKEN), body).await;
         assert_eq!(
@@ -1480,6 +1506,8 @@ fn scrim_server_command() -> Command {
         .env_remove("DATABASE_URL")
         .env_remove("SCRIM_REPO_ROOT")
         .env_remove("SCRIM_LISTEN")
+        .env_remove("SCRIM_SSH_LISTEN")
+        .env_remove("SCRIM_SSH_HOST_KEY")
         .env("NO_COLOR", "1");
     command
 }
@@ -1522,6 +1550,272 @@ fn bootstrap_admin_is_listed_and_serving_still_needs_its_arguments() {
 
     let stderr = run_failing(scrim_server_command().args(["--listen", "127.0.0.1:0"]));
     assert!(stderr.contains("--repo-root"), "{stderr}");
+}
+
+#[test]
+fn ssh_listen_requires_a_host_key_and_a_database() {
+    let root = match TempDir::new() {
+        Ok(root) => root,
+        Err(error) => panic!("failed to create repo root: {error}"),
+    };
+    let Some(repo_root) = root.path().to_str() else {
+        panic!("repo root is not UTF-8");
+    };
+    let stderr = run_failing(scrim_server_command().args([
+        "--repo-root",
+        repo_root,
+        "--token",
+        TEST_TOKEN,
+        "--ssh-listen",
+        "127.0.0.1:0",
+    ]));
+    assert!(stderr.contains("--ssh-host-key"), "{stderr}");
+
+    let host_key = root.path().join("host_key");
+    let Some(host_key) = host_key.to_str() else {
+        panic!("host key path is not UTF-8");
+    };
+    let stderr = run_failing(scrim_server_command().args([
+        "--repo-root",
+        repo_root,
+        "--token",
+        TEST_TOKEN,
+        "--listen",
+        "127.0.0.1:0",
+        "--ssh-listen",
+        "127.0.0.1:0",
+        "--ssh-host-key",
+        host_key,
+    ]));
+    assert!(stderr.contains("--database-url"), "{stderr}");
+    // Refused before any key was generated.
+    assert!(!root.path().join("host_key").exists());
+}
+
+#[tokio::test]
+async fn ssh_key_lifecycle() {
+    let api = Api::new();
+
+    // A member registers, lists and revokes their own keys.
+    let empty = api
+        .call(Method::GET, "/api/v1/me/ssh-keys", Some(DEV_TOKEN), None)
+        .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_no_store(&empty);
+    assert_eq!(empty.json, json!({ "member": "dev", "keys": [] }));
+
+    let added = api
+        .call(
+            Method::POST,
+            "/api/v1/me/ssh-keys",
+            Some(DEV_TOKEN),
+            Some(json!({
+                "public_key": format!("{TEST_SSH_KEY_1} dev@laptop\n"),
+                "label": "laptop",
+            })),
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::CREATED, "{}", added.json);
+    assert_no_store(&added);
+    let Some(dev_key_id) = added.json.pointer("/key/id").and_then(Value::as_i64) else {
+        panic!("no key id in {}", added.json);
+    };
+    assert_eq!(
+        added.json,
+        json!({
+            "member": "dev",
+            "key": {
+                "id": dev_key_id,
+                "fingerprint": TEST_SSH_FINGERPRINT_1,
+                "public_key": TEST_SSH_KEY_1,
+                "label": "laptop",
+            },
+        })
+    );
+
+    // The same key cannot be registered again, by anyone.
+    for (uri, token) in [
+        ("/api/v1/me/ssh-keys", DEV_TOKEN),
+        ("/api/v1/me/ssh-keys", ADMIN_TOKEN),
+    ] {
+        let duplicate = api
+            .call(
+                Method::POST,
+                uri,
+                Some(token),
+                Some(json!({ "public_key": TEST_SSH_KEY_1 })),
+            )
+            .await;
+        assert_eq!(duplicate.status, StatusCode::CONFLICT, "{}", duplicate.json);
+    }
+
+    // Invalid keys, labels and bodies are refused.
+    for body in [
+        json!({ "public_key": TEST_SSH_RSA_KEY }),
+        json!({ "public_key": "ssh-ed25519 not-base64!" }),
+        json!({ "public_key": "" }),
+        json!({ "public_key": format!("{TEST_SSH_KEY_2}\n{TEST_SSH_KEY_2}") }),
+        json!({ "public_key": TEST_SSH_KEY_2, "label": "bad\u{7}label" }),
+        json!({ "public_key": TEST_SSH_KEY_2, "comment": "unknown field" }),
+        json!({ "label": "missing key" }),
+    ] {
+        let invalid = api
+            .call(
+                Method::POST,
+                "/api/v1/me/ssh-keys",
+                Some(DEV_TOKEN),
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(
+            invalid.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            invalid.json
+        );
+    }
+
+    // An admin manages another member's keys.
+    let admin_added = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members/dev/ssh-keys",
+            Some(json!({ "public_key": TEST_SSH_KEY_2 })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let Some(admin_key_id) = admin_added.pointer("/key/id").and_then(Value::as_i64) else {
+        panic!("no key id in {admin_added}");
+    };
+    assert_eq!(
+        admin_added.pointer("/key/fingerprint"),
+        Some(&json!(TEST_SSH_FINGERPRINT_2))
+    );
+    assert_eq!(admin_added.pointer("/key/label"), Some(&json!("")));
+    let listed = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/members/dev/ssh-keys",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    let ids: Vec<Option<i64>> = match listed.get("keys").and_then(Value::as_array) {
+        Some(keys) => keys
+            .iter()
+            .map(|key| key.get("id").and_then(Value::as_i64))
+            .collect(),
+        None => panic!("no keys in {listed}"),
+    };
+    assert_eq!(ids, vec![Some(dev_key_id), Some(admin_key_id)]);
+    api.admin_expect(
+        Method::GET,
+        "/api/v1/members/nobody/ssh-keys",
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/members/nobody/ssh-keys",
+        Some(json!({ "public_key": TEST_SSH_KEY_1 })),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Keys authenticate their member through the store until revoked.
+    match api.store.authenticate_ssh_key(TEST_SSH_FINGERPRINT_1).await {
+        Ok(Some(member)) => assert_eq!(member.name, "dev"),
+        other => panic!("dev's key should authenticate: {other:?}"),
+    }
+
+    // A member can only revoke their own keys through `/me`.
+    let not_theirs = api
+        .admin(
+            Method::DELETE,
+            &format!("/api/v1/me/ssh-keys/{dev_key_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        not_theirs.status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        not_theirs.json
+    );
+    let revoked = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/ssh-keys/{dev_key_id}"),
+            Some(DEV_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{}", revoked.json);
+    assert_eq!(
+        revoked.json,
+        json!({ "member": "dev", "id": dev_key_id, "revoked": true })
+    );
+    let again = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/ssh-keys/{dev_key_id}"),
+            Some(DEV_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::NOT_FOUND);
+    assert!(matches!(
+        api.store.authenticate_ssh_key(TEST_SSH_FINGERPRINT_1).await,
+        Ok(None)
+    ));
+    let bad_id = api
+        .call(
+            Method::DELETE,
+            "/api/v1/me/ssh-keys/not-a-number",
+            Some(DEV_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(bad_id.status, StatusCode::BAD_REQUEST);
+
+    let admin_revoked = api
+        .admin_expect(
+            Method::DELETE,
+            &format!("/api/v1/members/dev/ssh-keys/{admin_key_id}"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        admin_revoked,
+        json!({ "member": "dev", "id": admin_key_id, "revoked": true })
+    );
+    let after = api
+        .call(Method::GET, "/api/v1/me/ssh-keys", Some(DEV_TOKEN), None)
+        .await;
+    assert_eq!(after.json, json!({ "member": "dev", "keys": [] }));
+
+    // Every change is audited with fingerprints, never key material.
+    let entries = api.store.audit_entries();
+    let actions: Vec<(&str, Option<i64>)> = entries
+        .iter()
+        .map(|entry| (entry.action.as_str(), entry.actor_member_id))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            ("member.ssh_key_add", Some(2)),
+            ("member.ssh_key_add", Some(1)),
+            ("member.ssh_key_revoke", Some(2)),
+            ("member.ssh_key_revoke", Some(1)),
+        ]
+    );
+    for entry in &entries {
+        assert_eq!(entry.target_name, "dev");
+        assert!(entry.details.get("fingerprint").is_some());
+        assert!(!entry.details.to_string().contains("AAAA"));
+    }
 }
 
 #[tokio::test]
@@ -2542,4 +2836,254 @@ async fn path_rules_lifecycle_and_my_withheld_paths() {
                     "pattern": "*.secret",
                 })
     }));
+}
+
+#[tokio::test]
+async fn audit_log_endpoint_filters_paginates_and_validates_queries() {
+    let api = Api::new();
+    api.create_group("core").await;
+    let alice_token = api.create_member("alice", &["core"]).await;
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/repositories",
+        Some(json!({ "path": "team.git" })),
+        StatusCode::CREATED,
+    )
+    .await;
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/path-rules",
+        Some(json!({
+            "repository": "team.git",
+            "pattern": "config/billing/**",
+            "groups": ["core"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    // Alice sets her own public key so we have a second distinct actor in the log.
+    let key_reply = api
+        .call(
+            Method::PUT,
+            "/api/v1/me/public-key",
+            Some(&alice_token),
+            Some(json!({ "public_key": TEST_AGE_KEY_1 })),
+        )
+        .await;
+    assert_eq!(key_reply.status, StatusCode::OK);
+
+    let alice_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(&alice_token), None)
+        .await;
+    assert_eq!(alice_whoami.status, StatusCode::OK);
+    let alice_id = alice_whoami.json.get("id").cloned();
+
+    // Unfiltered query returns all 5 events newest-first.
+    let all_reply = api.admin(Method::GET, "/api/v1/audit-log", None).await;
+    assert_eq!(all_reply.status, StatusCode::OK, "{}", all_reply.json);
+    assert_no_store(&all_reply);
+    assert_eq!(all_reply.json.get("next_before_id"), Some(&Value::Null));
+    let Some(all_entries) = all_reply.json.get("entries").and_then(Value::as_array) else {
+        panic!("expected entries array in {}", all_reply.json);
+    };
+    assert_eq!(all_entries.len(), 5);
+    assert_eq!(all_entries[0].get("id"), Some(&json!(5)));
+    assert_eq!(all_entries[0].get("actor_member_id"), alice_id.as_ref());
+    assert_eq!(all_entries[0].get("actor_name"), Some(&json!("alice")));
+    assert_eq!(
+        all_entries[0].get("action"),
+        Some(&json!("member.public_key_set"))
+    );
+    assert_eq!(all_entries[0].get("target_type"), Some(&json!("member")));
+    assert_eq!(all_entries[0].get("target_name"), Some(&json!("alice")));
+    let occurred_at = string_field(&all_entries[0], "occurred_at");
+    assert_eq!(occurred_at.len(), 20);
+    assert!(occurred_at.ends_with('Z'));
+
+    assert_eq!(all_entries[1].get("id"), Some(&json!(4)));
+    assert_eq!(all_entries[1].get("actor_member_id"), Some(&json!(1)));
+    assert_eq!(all_entries[1].get("actor_name"), Some(&json!("root")));
+    assert_eq!(all_entries[1].get("action"), Some(&json!("path_rule.set")));
+    assert_eq!(all_entries[1].get("target_type"), Some(&json!("path_rule")));
+    assert_eq!(
+        all_entries[1].get("target_name"),
+        Some(&json!("team.git:config/billing/**"))
+    );
+
+    // Cursor pagination: limit=2 -> [5, 4] next=4, then [3, 2] next=2, then [1] next=null.
+    let page1 = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?limit=2",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(page1.get("next_before_id"), Some(&json!(4)));
+    let p1_ids: Vec<i64> = match page1.get("entries").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(Value::as_i64))
+            .collect(),
+        None => panic!("expected entries in {page1}"),
+    };
+    assert_eq!(p1_ids, vec![5, 4]);
+
+    let page2 = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?limit=2&before_id=4",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(page2.get("next_before_id"), Some(&json!(2)));
+    let p2_ids: Vec<i64> = match page2.get("entries").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(Value::as_i64))
+            .collect(),
+        None => panic!("expected entries in {page2}"),
+    };
+    assert_eq!(p2_ids, vec![3, 2]);
+
+    let page3 = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?limit=2&before_id=2",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(page3.get("next_before_id"), Some(&Value::Null));
+    let p3_ids: Vec<i64> = match page3.get("entries").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .filter_map(|e| e.get("id").and_then(Value::as_i64))
+            .collect(),
+        None => panic!("expected entries in {page3}"),
+    };
+    assert_eq!(p3_ids, vec![1]);
+
+    // Filtering by actor, action, and target_type.
+    let by_actor = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?actor=alice",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        by_actor
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let by_action = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?action=path_rule.set&target_type=path_rule",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        by_action
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let empty = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/audit-log?actor=nobody",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(empty, json!({ "entries": [], "next_before_id": null }));
+
+    // Invalid queries return 400.
+    for bad_uri in [
+        "/api/v1/audit-log?limit=0",
+        "/api/v1/audit-log?limit=501",
+        "/api/v1/audit-log?before_id=0",
+        "/api/v1/audit-log?before_id=-1",
+        "/api/v1/audit-log?actor=bad%20actor",
+        "/api/v1/audit-log?action=bad%20action",
+        "/api/v1/audit-log?target_type=bad%20type",
+        "/api/v1/audit-log?unknown=1",
+    ] {
+        let reply = api.admin(Method::GET, bad_uri, None).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{bad_uri}: {}",
+            reply.json
+        );
+    }
+}
+
+#[tokio::test]
+async fn healthz_is_unauthenticated_and_rejects_non_get() {
+    let api = Api::new();
+
+    let reply = api.call(Method::GET, "/healthz", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        reply
+            .headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(reply.json, json!({ "status": "ok" }));
+
+    let post_reply = api.call(Method::POST, "/healthz", None, None).await;
+    assert_eq!(post_reply.status, StatusCode::METHOD_NOT_ALLOWED);
+
+    // Git repository endpoints under `/healthz.git/...` or `/healthz/...` still
+    // go through authentication as usual.
+    GitSandbox::new().init_bare_with_commit(&api.root.path().join("healthz.git"));
+    let unauth_repo = api
+        .call(
+            Method::GET,
+            "/healthz.git/info/refs?service=git-upload-pack",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(unauth_repo.status, StatusCode::UNAUTHORIZED);
+
+    let auth_repo = api
+        .call(
+            Method::GET,
+            "/healthz.git/info/refs?service=git-upload-pack",
+            Some(ADMIN_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(auth_repo.status, StatusCode::OK);
+
+    // Also verify on StaticPolicyStore router (`scrim_server::router`).
+    let root = match TempDir::new() {
+        Ok(root) => root,
+        Err(error) => panic!("failed to create repo root: {error}"),
+    };
+    let static_router = scrim_server::router(root.path().to_path_buf(), test_auth());
+    let static_healthz = send(&static_router, Method::GET, "/healthz", None, None).await;
+    assert_eq!(static_healthz.status, StatusCode::OK);
+    assert_eq!(static_healthz.json, json!({ "status": "ok" }));
 }

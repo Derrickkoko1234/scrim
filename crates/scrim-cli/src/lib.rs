@@ -9,15 +9,24 @@
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
 #![allow(clippy::question_mark)]
 
+mod audit_cmd;
 mod cli;
 pub mod client;
 mod clone_cmd;
 pub mod config;
 mod filter;
 mod git;
+mod mirror_cmd;
 mod private_cmd;
 pub mod private_store;
 pub mod secrets_store;
+mod ssh_key_cmd;
+
+/// Entry points for the `cargo-fuzz` targets in `fuzz/`. Not a stable API.
+#[doc(hidden)]
+pub mod fuzz_support {
+    pub use crate::filter::fuzz_filter_protocol;
+}
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -340,6 +349,27 @@ where
         Command::Private(private_args) => private_cmd::handle_private(
             private_args.command,
             key_file.as_deref(),
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
+        Command::Audit(audit_args) => audit_cmd::handle_audit(
+            audit_args,
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
+        Command::SshKey(ssh_key_args) => ssh_key_cmd::handle_ssh_key(
+            ssh_key_args.command,
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
+        Command::Mirror(mirror_args) => mirror_cmd::handle_mirror(
+            mirror_args,
             server_flag,
             token_override,
             config_path_result.as_deref().ok(),
@@ -1309,6 +1339,21 @@ fn format_list_or_none(items: &[String], empty_label: &str) -> String {
     } else {
         items.join(", ")
     }
+}
+
+/// Replaces control characters (including terminal escape sequences) in
+/// server- or repository-supplied text with their escaped form so printing it
+/// cannot rewrite the user's terminal.
+pub(crate) fn escape_control_chars(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn write_line(out: &mut dyn Write, line: &str) -> anyhow::Result<()> {

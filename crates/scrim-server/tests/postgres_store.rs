@@ -25,9 +25,9 @@ use axum::{
 use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
 use scrim_server::{
-    AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, GroupRecipientsRecord,
-    MemberPublicKeyRecord, PathRuleRecord, PgPolicyStore, PolicyStore, PolicyStoreError,
-    ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
+    AuditLogEntry, AuditLogQuery, AuthenticatedMember, CreateMemberRequest, CreatedMember,
+    GroupRecipientsRecord, MemberPublicKeyRecord, PathRuleRecord, PgPolicyStore, PolicyStore,
+    PolicyStoreError, ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
 };
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -1569,6 +1569,281 @@ async fn administers_path_rules_and_loads_withhold_policy() {
         }
         Err(error) => panic!("expected InvalidPathRule, got: {error}"),
         Ok(_) => panic!("corrupt path_rules row must fail closed"),
+    }
+
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn lists_audit_log_with_filters_and_keyset_pagination() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let admin = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let admin_id = Some(admin.member.id);
+
+    if let Err(error) = store.create_group(admin_id, "core").await {
+        panic!("create_group failed: {error}");
+    }
+    let alice = create_member_ok(store, member_request("alice", false, &["core"])).await;
+    if let Err(error) = store.register_repository(admin_id, "team/app.git").await {
+        panic!("register_repository failed: {error}");
+    }
+    if let Err(error) = store
+        .set_path_rule(
+            admin_id,
+            "team/app.git",
+            "config/billing/**",
+            group_set(&["core"]),
+        )
+        .await
+    {
+        panic!("set_path_rule failed: {error}");
+    }
+    if let Err(error) = store
+        .set_member_public_key(
+            Some(alice.member.id),
+            "alice",
+            "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+        )
+        .await
+    {
+        panic!("set_member_public_key failed: {error}");
+    }
+
+    // Total audit rows: admin.bootstrap (1), group.create (2), member.create (3),
+    // repository.register (4), path_rule.set (5), member.public_key_set (6).
+    let page1 = match store
+        .list_audit_log(AuditLogQuery {
+            actor: None,
+            action: None,
+            target_type: None,
+            limit: 3,
+            before_id: None,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("list_audit_log page 1 failed: {error}"),
+    };
+    assert_eq!(page1.entries.len(), 3);
+    assert_eq!(page1.entries[0].action, "member.public_key_set");
+    assert_eq!(page1.entries[0].actor_name.as_deref(), Some("alice"));
+    assert_eq!(page1.entries[1].action, "path_rule.set");
+    assert_eq!(page1.entries[1].actor_name.as_deref(), Some("root"));
+    assert_eq!(page1.entries[2].action, "repository.register");
+    assert!(page1.next_before_id.is_some());
+    for entry in &page1.entries {
+        assert_eq!(entry.occurred_at.len(), 20);
+        assert!(entry.occurred_at.ends_with('Z'));
+    }
+
+    let page2 = match store
+        .list_audit_log(AuditLogQuery {
+            actor: None,
+            action: None,
+            target_type: None,
+            limit: 10,
+            before_id: page1.next_before_id,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("list_audit_log page 2 failed: {error}"),
+    };
+    assert_eq!(page2.entries.len(), 3);
+    assert_eq!(page2.entries[0].action, "member.create");
+    assert_eq!(page2.entries[0].actor_name, None);
+    assert_eq!(page2.entries[1].action, "group.create");
+    assert_eq!(page2.entries[2].action, "admin.bootstrap");
+    assert_eq!(page2.next_before_id, None);
+
+    let filtered = match store
+        .list_audit_log(AuditLogQuery {
+            actor: Some("root".to_owned()),
+            action: Some("path_rule.set".to_owned()),
+            target_type: Some("path_rule".to_owned()),
+            limit: 10,
+            before_id: None,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("filtered list_audit_log failed: {error}"),
+    };
+    assert_eq!(filtered.entries.len(), 1);
+    assert_eq!(
+        filtered.entries[0].target_name,
+        "team/app.git:config/billing/**"
+    );
+    assert_eq!(filtered.next_before_id, None);
+
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn administers_and_authenticates_member_ssh_keys() {
+    const ED25519_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH2ACokL5rFZeMA6cnIFOE6yBk13muMZSo6BO+J/4jM+";
+    const ED25519_FINGERPRINT: &str = "SHA256:Np8Ba0OTNlnS1Ld82GoBXei8fVIP13IJqvG+Xz1KgG0";
+    const ECDSA_KEY: &str = "ecdsa-sha2-nistp256 \
+        AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBP/zY1wvD7iHSKA4X8GQRfS4mjEVQUqnw1DnZut6\
+        e7eUQPzXYb8rC84vW2jq/3X2GuHtrN/zqnXaLOALTCcqyPo=";
+    const ECDSA_FINGERPRINT: &str = "SHA256:7+aUSc8jzhtDeHMLq0iM8JG0Es1qmwulgYBnsePzwJI";
+
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let admin = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let admin_id = Some(admin.member.id);
+    let alice = create_member_ok(store, member_request("alice", false, &[])).await;
+    let _bob = create_member_ok(store, member_request("bob", false, &[])).await;
+
+    let added = match store
+        .add_member_ssh_key(
+            admin_id,
+            "alice",
+            &format!("{ED25519_KEY} alice@laptop"),
+            "laptop",
+        )
+        .await
+    {
+        Ok(added) => added,
+        Err(error) => panic!("add_member_ssh_key failed: {error}"),
+    };
+    assert_eq!(added.member, "alice");
+    assert_eq!(added.public_key, ED25519_KEY);
+    assert_eq!(added.fingerprint, ED25519_FINGERPRINT);
+    assert_eq!(added.label, "laptop");
+    assert!(!added.revoked);
+
+    assert!(matches!(
+        store
+            .add_member_ssh_key(admin_id, "bob", ED25519_KEY, "")
+            .await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .add_member_ssh_key(admin_id, "nobody", ECDSA_KEY, "")
+            .await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .add_member_ssh_key(admin_id, "alice", "ssh-rsa AAAA", "")
+            .await,
+        Err(PolicyStoreError::InvalidInput(_))
+    ));
+    let second = match store
+        .add_member_ssh_key(Some(alice.member.id), "alice", ECDSA_KEY, "desktop")
+        .await
+    {
+        Ok(second) => second,
+        Err(error) => panic!("adding the second key failed: {error}"),
+    };
+    assert_eq!(second.fingerprint, ECDSA_FINGERPRINT);
+
+    match store.authenticate_ssh_key(ED25519_FINGERPRINT).await {
+        Ok(Some(member)) => assert_eq!(member.id, alice.member.id),
+        other => panic!("alice's key should authenticate: {other:?}"),
+    }
+    assert!(matches!(
+        store.authenticate_ssh_key("SHA256:unknown").await,
+        Ok(None)
+    ));
+    match store.list_member_ssh_keys("alice").await {
+        Ok(keys) => {
+            let ids: Vec<i64> = keys.iter().map(|key| key.id).collect();
+            assert_eq!(ids, vec![added.id, second.id]);
+        }
+        Err(error) => panic!("list_member_ssh_keys failed: {error}"),
+    }
+    assert!(matches!(store.list_member_ssh_keys("bob").await, Ok(keys) if keys.is_empty()));
+    assert!(matches!(
+        store.list_member_ssh_keys("nobody").await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+
+    // Keys can only be revoked through their own member, and only once.
+    assert!(matches!(
+        store.revoke_member_ssh_key(admin_id, "bob", added.id).await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .revoke_member_ssh_key(admin_id, "alice", added.id)
+            .await,
+        Ok(true)
+    ));
+    assert!(matches!(
+        store
+            .revoke_member_ssh_key(admin_id, "alice", added.id)
+            .await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.authenticate_ssh_key(ED25519_FINGERPRINT).await,
+        Ok(None)
+    ));
+    // A revoked key stays registered, so it cannot be re-added.
+    assert!(matches!(
+        store
+            .add_member_ssh_key(admin_id, "alice", ED25519_KEY, "")
+            .await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+
+    // Revoking the member disables their remaining keys.
+    assert!(matches!(
+        store.authenticate_ssh_key(ECDSA_FINGERPRINT).await,
+        Ok(Some(_))
+    ));
+    if let Err(error) = store.revoke_member(admin_id, "alice").await {
+        panic!("revoke_member failed: {error}");
+    }
+    assert!(matches!(
+        store.authenticate_ssh_key(ECDSA_FINGERPRINT).await,
+        Ok(None)
+    ));
+
+    let page = match store
+        .list_audit_log(AuditLogQuery {
+            actor: None,
+            action: None,
+            target_type: Some("member".to_owned()),
+            limit: 10,
+            before_id: None,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("list_audit_log failed: {error}"),
+    };
+    let actions: Vec<&str> = page
+        .entries
+        .iter()
+        .map(|entry| entry.action.as_str())
+        .collect();
+    assert_eq!(
+        &actions[..4],
+        [
+            "member.revoke",
+            "member.ssh_key_revoke",
+            "member.ssh_key_add",
+            "member.ssh_key_add",
+        ]
+    );
+    for entry in &page.entries[1..4] {
+        assert_eq!(entry.target_name, "alice");
+        assert!(entry.details.get("fingerprint").is_some());
+        assert!(!entry.details.to_string().contains("AAAA"));
     }
 
     isolated.drop_schema().await;

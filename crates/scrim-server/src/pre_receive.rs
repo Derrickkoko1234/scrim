@@ -511,7 +511,7 @@ pub(crate) fn derive_proof(domain: &str, token: &str) -> Zeroizing<String> {
 }
 
 /// Lowercase hex encoding of `bytes`.
-fn encode_hex(bytes: &[u8]) -> Zeroizing<String> {
+pub(crate) fn encode_hex(bytes: &[u8]) -> Zeroizing<String> {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut text = Zeroizing::new(String::with_capacity(bytes.len() * 2));
     for byte in bytes {
@@ -2038,7 +2038,7 @@ fn withheld_path_message(path: &[u8]) -> String {
 /// One entry of `git diff-tree -r --raw -z` output for a single pair of
 /// trees.
 #[derive(Debug, PartialEq, Eq)]
-struct RawDiffEntry {
+pub(crate) struct RawDiffEntry {
     path: Vec<u8>,
     /// Mode after the change; `000000` for a deletion.
     new_mode: String,
@@ -2061,7 +2061,7 @@ impl RawDiffEntry {
 /// `:<old mode> <new mode> <old id> <new id> <status>` and a path per entry,
 /// optionally preceded (with `--stdin`) by the commit ID. Combined (`-c`)
 /// entries are an error.
-fn parse_raw_diff_entries(output: &[u8]) -> io::Result<Vec<RawDiffEntry>> {
+pub(crate) fn parse_raw_diff_entries(output: &[u8]) -> io::Result<Vec<RawDiffEntry>> {
     let invalid = |reason: &str| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2811,7 +2811,7 @@ fn internal_error(context: &str, error: &dyn std::fmt::Display) -> String {
 
 /// One `<old-oid> <new-oid> <ref-name>` line of `pre-receive` input.
 #[derive(Debug, PartialEq, Eq)]
-struct RefUpdate {
+pub(crate) struct RefUpdate {
     old_oid: String,
     new_oid: String,
     ref_name: String,
@@ -2832,7 +2832,7 @@ impl RefUpdate {
 /// length), lines with both IDs zero, non-UTF-8 ref names (closes `L4`), and
 /// names that do not start with `refs/` or contain control characters,
 /// whitespace, `..` or `//`.
-fn parse_ref_updates(stdin_bytes: &[u8]) -> Result<Vec<RefUpdate>, &'static str> {
+pub(crate) fn parse_ref_updates(stdin_bytes: &[u8]) -> Result<Vec<RefUpdate>, &'static str> {
     let Some(body) = stdin_bytes.strip_suffix(b"\n") else {
         return Err(MALFORMED_UPDATE_MESSAGE);
     };

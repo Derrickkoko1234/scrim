@@ -2901,3 +2901,765 @@ fn private_withhold_commands_call_path_rule_endpoints_and_update_sparse_checkout
     assert!(!stdout_str(&out).contains("Sparse checkout"));
     assert!(server.take_requests().is_empty());
 }
+
+const AUDIT_PAGE: &str = r#"{"entries":[
+    {"id":42,"occurred_at":"2026-11-22T17:00:00Z","actor_member_id":1,"actor_name":"root","action":"path_rule.set","target_type":"path_rule","target_name":"team.git:config/billing/**","details":{"groups":["finance"]}},
+    {"id":41,"occurred_at":"2026-11-22T16:00:00Z","actor_member_id":null,"actor_name":null,"action":"member.create","target_type":"member","target_name":"ev\u001b[2Jil","details":{}}
+  ],"next_before_id":41}"#;
+
+#[test]
+fn audit_validates_locally_forwards_filters_and_prints_human_and_json_output() {
+    let server = MockServer::start(|req| {
+        if req.method != "GET" || !req.target.starts_with("/api/v1/audit-log") {
+            return (404, r#"{"error":"not found"}"#.to_owned());
+        }
+        if req.target == "/api/v1/audit-log?limit=50" {
+            return (200, r#"{"entries":[],"next_before_id":null}"#.to_owned());
+        }
+        (200, AUDIT_PAGE.to_owned())
+    });
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config = tmp.path().join("config.toml");
+    must(
+        fs::write(
+            &config,
+            format!("server = \"{}\"\ntoken = \"scrim_tok\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+
+    for (args, expected) in [
+        (
+            vec!["audit", "--limit", "0"],
+            "--limit must be between 1 and 500",
+        ),
+        (
+            vec!["audit", "--limit", "501"],
+            "--limit must be between 1 and 500",
+        ),
+        (
+            vec!["audit", "--before-id", "0"],
+            "--before-id must be a positive",
+        ),
+        (vec!["audit", "--actor", ""], "--actor cannot be empty"),
+    ] {
+        let out = run_bin(scrim_bin(), &args, tmp.path(), &config, None);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(
+            stderr_str(&out).contains(expected),
+            "{args:?}: {}",
+            stderr_str(&out)
+        );
+    }
+    assert!(server.take_requests().is_empty());
+
+    let filtered = run_bin(
+        scrim_bin(),
+        &[
+            "audit",
+            "--actor",
+            "root",
+            "--action",
+            "path_rule.set",
+            "--target-type",
+            "path_rule",
+            "--limit",
+            "10",
+            "--before-id",
+            "100",
+        ],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&filtered, "scrim audit with filters");
+    let requests = server.take_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].target,
+        "/api/v1/audit-log?actor=root&action=path_rule.set&target_type=path_rule&limit=10&before_id=100"
+    );
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer scrim_tok")
+    );
+    let text = stdout_str(&filtered);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "#42  2026-11-22T17:00:00Z  root  path_rule.set  path_rule:team.git:config/billing/**  {\"groups\":[\"finance\"]}",
+            "#41  2026-11-22T16:00:00Z  system  member.create  member:ev\\u{1b}[2Jil",
+            "More entries available; pass --before-id 41 to view older entries.",
+        ]
+    );
+    assert!(!text.contains('\u{1b}'));
+
+    let empty = run_bin(scrim_bin(), &["audit"], tmp.path(), &config, None);
+    assert_success(&empty, "scrim audit");
+    assert_eq!(stdout_str(&empty), "No audit log entries.\n");
+    let requests = server.take_requests();
+    assert_eq!(requests[0].target, "/api/v1/audit-log?limit=50");
+
+    let json = run_bin(
+        scrim_bin(),
+        &["audit", "--json", "--limit", "2"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&json, "scrim audit --json");
+    let parsed: serde_json::Value = must(
+        serde_json::from_str(&stdout_str(&json)),
+        "parse audit --json output",
+    );
+    assert_eq!(parsed["next_before_id"], serde_json::json!(41));
+    assert_eq!(parsed["entries"][0]["id"], serde_json::json!(42));
+    assert_eq!(
+        parsed["entries"][0]["actor_name"],
+        serde_json::json!("root")
+    );
+    assert_eq!(
+        parsed["entries"][0]["details"],
+        serde_json::json!({"groups": ["finance"]})
+    );
+    assert_eq!(parsed["entries"][1]["actor_name"], serde_json::Value::Null);
+    let requests = server.take_requests();
+    assert_eq!(requests[0].target, "/api/v1/audit-log?limit=2");
+}
+
+/// Refs in a bare repository, one `refname` per line, sorted.
+fn bare_refs(harness: &GitHarness, bare: &Path, config: &Path) -> Vec<String> {
+    let out = harness.git_ok(&["for-each-ref", "--format=%(refname)"], bare, config, &[]);
+    stdout_str(&out).lines().map(str::to_owned).collect()
+}
+
+fn init_bare(harness: &GitHarness, parent: &Path, name: &str, config: &Path) -> PathBuf {
+    let bare = parent.join(name);
+    must(fs::create_dir_all(&bare), "create bare repo dir");
+    harness.git_ok(&["init", "-q", "--bare"], &bare, config, &[]);
+    bare
+}
+
+#[test]
+fn mirror_pushes_only_public_refs_and_fails_closed_on_unencrypted_private_files() {
+    let withholds_billing = Arc::new(AtomicBool::new(false));
+    let withholds_billing_bg = Arc::clone(&withholds_billing);
+    let server = MockServer::start(move |req| {
+        match (req.method.as_str(), req.target.as_str()) {
+            ("GET", "/api/v1/branch-rules?repo=org%2Fapp.git") => (
+                200,
+                r#"{"repository":"org/app.git","rules":[{"pattern":"refs/heads/private/*","groups":["core"]},{"pattern":"refs/tags/private-*","groups":["core"]}]}"#
+                    .to_owned(),
+            ),
+            ("GET", "/api/v1/path-rules?repo=org%2Fapp.git") => {
+                if withholds_billing_bg.load(Ordering::SeqCst) {
+                    (
+                        200,
+                        r#"{"repository":"org/app.git","rules":[{"pattern":"config/billing/**","groups":["finance"]}]}"#
+                            .to_owned(),
+                    )
+                } else {
+                    (200, r#"{"repository":"org/app.git","rules":[]}"#.to_owned())
+                }
+            }
+            _ => (404, r#"{"error":"not found"}"#.to_owned()),
+        }
+    });
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let cfg = tmp.path().join("cfg");
+    must(fs::create_dir_all(&cfg), "mkdir cfg");
+    let config = cfg.join("config.toml");
+    must(
+        fs::write(
+            &config,
+            format!("server = \"{}\"\ntoken = \"scrim_tok\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+    write_identity(
+        &cfg.join("identity.age"),
+        &scrim_crypto::MemberIdentity::generate(),
+    );
+
+    let repo = harness.init_repo(tmp.path(), "app", &config);
+    harness.git_ok(
+        &["config", "scrim.repo", "org/app.git"],
+        &repo,
+        &config,
+        &[],
+    );
+    must(
+        fs::write(repo.join("README.md"), "public\n"),
+        "write README",
+    );
+    must(
+        fs::create_dir_all(repo.join("docs/secret")),
+        "mkdir docs/secret",
+    );
+    must(
+        fs::write(
+            repo.join("docs/secret/plan.md"),
+            format!("{PRIVATE_SECRET}\n"),
+        ),
+        "write plan.md",
+    );
+    must(
+        fs::create_dir_all(repo.join("config/billing")),
+        "mkdir config/billing",
+    );
+    must(
+        fs::write(repo.join("config/billing/plain.txt"), "plaintext rates\n"),
+        "write plain.txt",
+    );
+    let add = harness.scrim(
+        &[
+            "private",
+            "add",
+            "docs/secret/**",
+            "--group",
+            "finance",
+            "--offline",
+        ],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&add, "scrim private add");
+    harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "initial"], &repo, &config, &[]);
+    harness.git_ok(&["tag", "-a", "v1.0", "-m", "release"], &repo, &config, &[]);
+
+    harness.git_ok(
+        &["checkout", "-q", "-b", "private/secret"],
+        &repo,
+        &config,
+        &[],
+    );
+    must(
+        fs::write(repo.join("roadmap.txt"), "unannounced plans\n"),
+        "write roadmap",
+    );
+    harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "private work"], &repo, &config, &[]);
+    let private_commit = must_some(
+        git_stdout(&repo, &["rev-parse", "HEAD"]),
+        "private commit id",
+    );
+    harness.git_ok(&["tag", "private-v1"], &repo, &config, &[]);
+    harness.git_ok(&["checkout", "-q", "main"], &repo, &config, &[]);
+    // A public-named symbolic ref to a private branch is never pushed.
+    harness.git_ok(
+        &[
+            "symbolic-ref",
+            "refs/heads/alias",
+            "refs/heads/private/secret",
+        ],
+        &repo,
+        &config,
+        &[],
+    );
+
+    // Invalid targets fail before contacting the server.
+    let bad_target = harness.scrim(&["mirror", "--", "-oops"], &repo, &config, &[]);
+    assert!(!bad_target.status.success());
+    assert!(stderr_str(&bad_target).contains("must not start with '-'"));
+    assert!(server.take_requests().is_empty());
+
+    // Dry run reports the plan without pushing.
+    let mirror = init_bare(&harness, tmp.path(), "mirror.git", &config);
+    let mirror_arg = mirror.to_string_lossy().into_owned();
+    let dry_run = harness.scrim(&["mirror", "--dry-run", &mirror_arg], &repo, &config, &[]);
+    assert_success(&dry_run, "scrim mirror --dry-run");
+    let dry_out = stdout_str(&dry_run);
+    assert!(dry_out.contains(&format!(
+        "Dry run — would mirror 2 public ref(s) to {mirror_arg}:"
+    )));
+    assert!(dry_out.contains("  refs/heads/main\n"));
+    assert!(dry_out.contains("  refs/tags/v1.0\n"));
+    assert!(dry_out.contains("Skipped 2 private ref(s):"));
+    assert!(dry_out.contains("  refs/heads/private/secret\n"));
+    assert!(dry_out.contains("  refs/tags/private-v1\n"));
+    assert!(dry_out.contains("Skipped 1 symbolic ref(s)"));
+    assert!(dry_out.contains("  refs/heads/alias\n"));
+    assert!(dry_out.contains("Safety check: passed"));
+    assert!(bare_refs(&harness, &mirror, &config).is_empty());
+    let requests = server.take_requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.authorization.as_deref(), Some("Bearer scrim_tok"));
+    }
+
+    // A real mirror receives only public refs, with private files encrypted.
+    let pushed = harness.scrim(&["mirror", &mirror_arg], &repo, &config, &[]);
+    assert_success(&pushed, "scrim mirror");
+    let pushed_out = stdout_str(&pushed);
+    assert!(pushed_out.contains(&format!("Mirrored 2 public ref(s) to {mirror_arg}:")));
+    assert!(pushed_out.contains("Skipped 2 private ref(s):"));
+    assert_eq!(
+        bare_refs(&harness, &mirror, &config),
+        vec!["refs/heads/main", "refs/tags/v1.0"]
+    );
+    let mirrored_secret = harness.git_ok(
+        &["cat-file", "blob", "main:docs/secret/plan.md"],
+        &mirror,
+        &config,
+        &[],
+    );
+    assert!(mirrored_secret.stdout.starts_with(b"SCRIMFILE\0"));
+    assert!(!contains_bytes(
+        &mirrored_secret.stdout,
+        PRIVATE_SECRET.as_bytes()
+    ));
+    let private_object = harness.git(
+        &["cat-file", "-e", &format!("{private_commit}^{{commit}}")],
+        &mirror,
+        &config,
+        &[],
+    );
+    assert!(
+        !private_object.status.success(),
+        "private branch commit leaked into the mirror"
+    );
+
+    // --no-tags mirrors only branches.
+    let branches_only = init_bare(&harness, tmp.path(), "branches-only.git", &config);
+    let branches_arg = branches_only.to_string_lossy().into_owned();
+    let no_tags = harness.scrim(&["mirror", "--no-tags", &branches_arg], &repo, &config, &[]);
+    assert_success(&no_tags, "scrim mirror --no-tags");
+    assert_eq!(
+        bare_refs(&harness, &branches_only, &config),
+        vec!["refs/heads/main"]
+    );
+
+    // A server-withheld path stored as plaintext blocks the whole mirror.
+    withholds_billing.store(true, Ordering::SeqCst);
+    let withheld_mirror = init_bare(&harness, tmp.path(), "withheld.git", &config);
+    let withheld_arg = withheld_mirror.to_string_lossy().into_owned();
+    for args in [
+        vec!["mirror", "--dry-run", withheld_arg.as_str()],
+        vec!["mirror", withheld_arg.as_str()],
+    ] {
+        let refused = harness.scrim(&args, &repo, &config, &[]);
+        assert!(!refused.status.success(), "{args:?} should fail closed");
+        let stderr = stderr_str(&refused);
+        assert!(stderr.contains("nothing was pushed"), "{stderr}");
+        assert!(stderr.contains("config/billing/plain.txt"), "{stderr}");
+        assert!(
+            stderr.contains("withheld by the server's path rules"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("scrim private add"), "{stderr}");
+        assert!(bare_refs(&harness, &withheld_mirror, &config).is_empty());
+    }
+    withholds_billing.store(false, Ordering::SeqCst);
+
+    // A plaintext blob committed under a .scrim/paths.toml rule (bypassing the
+    // clean filter) also blocks the mirror.
+    let leak_file = tmp.path().join("leak.md");
+    must(
+        fs::write(&leak_file, format!("leaked {PRIVATE_SECRET}\n")),
+        "write leak file",
+    );
+    let leak_blob = harness.git_ok(
+        &[
+            "hash-object",
+            "-w",
+            "--no-filters",
+            &leak_file.to_string_lossy(),
+        ],
+        &repo,
+        &config,
+        &[],
+    );
+    let leak_oid = stdout_str(&leak_blob).trim().to_owned();
+    harness.git_ok(
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{leak_oid},docs/secret/leak.md"),
+        ],
+        &repo,
+        &config,
+        &[],
+    );
+    harness.git_ok(
+        &["commit", "-q", "-m", "bypass filter"],
+        &repo,
+        &config,
+        &[],
+    );
+    let leak_mirror = init_bare(&harness, tmp.path(), "leak.git", &config);
+    let leak_arg = leak_mirror.to_string_lossy().into_owned();
+    let refused = harness.scrim(&["mirror", &leak_arg], &repo, &config, &[]);
+    assert!(
+        !refused.status.success(),
+        "plaintext private file should fail closed"
+    );
+    let stderr = stderr_str(&refused);
+    assert!(stderr.contains("docs/secret/leak.md"), "{stderr}");
+    assert!(stderr.contains(".scrim/paths.toml"), "{stderr}");
+    assert!(stderr.contains("stored as plaintext"), "{stderr}");
+    assert!(bare_refs(&harness, &leak_mirror, &config).is_empty());
+}
+
+#[test]
+fn ssh_key_add_list_rm_and_local_validation() {
+    let server = MockServer::start(|req| match (req.method.as_str(), req.target.as_str()) {
+        ("POST", "/api/v1/me/ssh-keys") => {
+            let body: serde_json::Value =
+                must(serde_json::from_str(&req.body), "parse POST /me/ssh-keys");
+            let label = body["label"].as_str();
+            let resp = match label {
+                Some("laptop") => serde_json::json!({
+                    "member": "bob",
+                    "key": {
+                        "id": 1,
+                        "fingerprint": "SHA256:selfFileFp111",
+                        "public_key": body["public_key"],
+                        "label": "laptop"
+                    }
+                }),
+                _ => serde_json::json!({
+                    "member": "bob",
+                    "key": {
+                        "id": 2,
+                        "fingerprint": "SHA256:selfInlineFp222",
+                        "public_key": body["public_key"],
+                        "label": ""
+                    }
+                }),
+            };
+            (201, resp.to_string())
+        }
+        ("POST", "/api/v1/members/alice/ssh-keys") => {
+            let body: serde_json::Value = must(
+                serde_json::from_str(&req.body),
+                "parse POST /members/alice/ssh-keys",
+            );
+            (
+                201,
+                serde_json::json!({
+                    "member": "alice",
+                    "key": {
+                        "id": 3,
+                        "fingerprint": "SHA256:aliceFp333",
+                        "public_key": body["public_key"],
+                        "label": body["label"]
+                    }
+                })
+                .to_string(),
+            )
+        }
+        ("POST", "/api/v1/members/alice%20smith/ssh-keys") => (
+            201,
+            serde_json::json!({
+                "member": "alice smith",
+                "key": {
+                    "id": 4,
+                    "fingerprint": "SHA256:aliceSmithFp444",
+                    "public_key": "ssh-ed25519 AAAA",
+                    "label": "ci"
+                }
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/v1/me/ssh-keys") => (
+            200,
+            serde_json::json!({
+                "member": "bob",
+                "keys": []
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/v1/members/alice/ssh-keys") => (
+            200,
+            serde_json::json!({
+                "member": "alice\u{001b}[2J",
+                "keys": [
+                    {
+                        "id": 3,
+                        "fingerprint": "SHA256:aliceFp333",
+                        "public_key": "ssh-ed25519 AAAA",
+                        "label": "workstation"
+                    },
+                    {
+                        "id": 5,
+                        "fingerprint": "SHA256:aliceFp555",
+                        "public_key": "ssh-ed25519 BBBB",
+                        "label": ""
+                    }
+                ]
+            })
+            .to_string(),
+        ),
+        ("DELETE", "/api/v1/me/ssh-keys/1") => (
+            200,
+            serde_json::json!({
+                "member": "bob",
+                "id": 1,
+                "revoked": true
+            })
+            .to_string(),
+        ),
+        ("DELETE", "/api/v1/members/alice/ssh-keys/3") => (
+            200,
+            serde_json::json!({
+                "member": "alice",
+                "id": 3,
+                "revoked": true
+            })
+            .to_string(),
+        ),
+        _ => (404, r#"{"error":"unexpected route"}"#.to_owned()),
+    });
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config = tmp.path().join("config.toml");
+    must(
+        fs::write(
+            &config,
+            format!("server = \"{}\"\ntoken = \"scrim_tok\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+
+    let key_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl bob@laptop";
+    let pub_file = tmp.path().join("id_ed25519.pub");
+    must(
+        fs::write(&pub_file, format!("{key_line}\r\n")),
+        "write .pub file",
+    );
+
+    // 1. Local validation rejects invalid inputs before making any HTTP call.
+    let big_file = tmp.path().join("oversized.pub");
+    must(
+        fs::write(&big_file, vec![b'A'; 8 * 1024 + 1]),
+        "write oversized.pub",
+    );
+    let empty_file = tmp.path().join("empty.pub");
+    must(fs::write(&empty_file, "\r\n"), "write empty.pub");
+    let multi_file = tmp.path().join("multi.pub");
+    must(
+        fs::write(&multi_file, format!("{key_line}\n{key_line}\n")),
+        "write multi.pub",
+    );
+    let non_utf8 = tmp.path().join("binary.pub");
+    must(fs::write(&non_utf8, [0xff, 0xfe]), "write binary.pub");
+    let dir_pub = tmp.path().join("dir.pub");
+    must(fs::create_dir(&dir_pub), "create dir.pub");
+
+    #[cfg(unix)]
+    {
+        let link_pub = tmp.path().join("link.pub");
+        must(
+            std::os::unix::fs::symlink(&pub_file, &link_pub),
+            "create symlink",
+        );
+        let out = run_bin(
+            scrim_bin(),
+            &["ssh-key", "add", "link.pub"],
+            tmp.path(),
+            &config,
+            None,
+        );
+        assert!(!out.status.success(), "symlink .pub should fail");
+        assert!(stderr_str(&out).contains("symlink"), "{}", stderr_str(&out));
+    }
+
+    let invalid_cases: &[(&[&str], &str)] = &[
+        (&["ssh-key", "rm", "0"], "positive integer"),
+        (&["ssh-key", "rm", "-1"], "positive integer"),
+        (&["ssh-key", "add", ""], "cannot be empty"),
+        (
+            &["ssh-key", "add", "ssh-ed25519 AAAA\nssh-ed25519 BBBB"],
+            "single line",
+        ),
+        (&["ssh-key", "add", "oversized.pub"], "exceeds maximum size"),
+        (&["ssh-key", "add", "empty.pub"], "cannot be empty"),
+        (&["ssh-key", "add", "multi.pub"], "single line"),
+        (&["ssh-key", "add", "binary.pub"], "not valid UTF-8"),
+        (&["ssh-key", "add", "dir.pub"], "is a directory"),
+        (
+            &["ssh-key", "add", key_line, "--member", ""],
+            "--member cannot be empty",
+        ),
+        (
+            &["ssh-key", "list", "--member", "  "],
+            "--member cannot be empty",
+        ),
+        (
+            &["ssh-key", "rm", "1", "--member", ""],
+            "--member cannot be empty",
+        ),
+    ];
+    for (args, expected_err) in invalid_cases {
+        let out = run_bin(scrim_bin(), args, tmp.path(), &config, None);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(
+            stderr_str(&out).contains(expected_err),
+            "{args:?}: stderr={}",
+            stderr_str(&out)
+        );
+    }
+    assert!(
+        server.take_requests().is_empty(),
+        "local validation must not make HTTP requests"
+    );
+
+    // 2. Add from .pub file (self).
+    let add_file = run_bin(
+        scrim_bin(),
+        &["ssh-key", "add", "id_ed25519.pub", "--label", "laptop"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&add_file, "ssh-key add from file");
+    let add_file_out = stdout_str(&add_file);
+    assert!(add_file_out.contains("#1"), "{add_file_out}");
+    assert!(add_file_out.contains("bob"), "{add_file_out}");
+    assert!(
+        add_file_out.contains("SHA256:selfFileFp111"),
+        "{add_file_out}"
+    );
+    assert!(add_file_out.contains("laptop"), "{add_file_out}");
+
+    // 3. Add inline key (self, no label, trailing CRLF trimmed).
+    let inline_with_crlf = format!("{key_line}\r\n");
+    let add_inline_self = run_bin(
+        scrim_bin(),
+        &["ssh-key", "add", &inline_with_crlf],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&add_inline_self, "ssh-key add inline self");
+    let add_inline_out = stdout_str(&add_inline_self);
+    assert!(add_inline_out.contains("#2"), "{add_inline_out}");
+    assert!(
+        add_inline_out.contains("SHA256:selfInlineFp222"),
+        "{add_inline_out}"
+    );
+    assert!(!add_inline_out.contains("label:"), "{add_inline_out}");
+
+    // 4. Add inline key for another member (--member alice) and URL-encoded member.
+    let add_admin = run_bin(
+        scrim_bin(),
+        &[
+            "ssh-key",
+            "add",
+            key_line,
+            "--label",
+            "workstation",
+            "--member",
+            "alice",
+        ],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&add_admin, "ssh-key add --member alice");
+    let add_admin_out = stdout_str(&add_admin);
+    assert!(add_admin_out.contains("#3"), "{add_admin_out}");
+    assert!(add_admin_out.contains("alice"), "{add_admin_out}");
+    assert!(
+        add_admin_out.contains("SHA256:aliceFp333"),
+        "{add_admin_out}"
+    );
+    assert!(add_admin_out.contains("workstation"), "{add_admin_out}");
+
+    let add_encoded = run_bin(
+        scrim_bin(),
+        &[
+            "ssh-key",
+            "add",
+            "ssh-ed25519 AAAA",
+            "--label",
+            "ci",
+            "--member",
+            "alice smith",
+        ],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&add_encoded, "ssh-key add --member 'alice smith'");
+
+    // 5. List self (empty).
+    let list_self = run_bin(scrim_bin(), &["ssh-key", "list"], tmp.path(), &config, None);
+    assert_success(&list_self, "ssh-key list self");
+    assert_eq!(stdout_str(&list_self), "SSH keys for bob:\n  (none)\n");
+
+    // 6. List member (non-empty, escapes control characters).
+    let list_alice = run_bin(
+        scrim_bin(),
+        &["ssh-key", "list", "--member", "alice"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&list_alice, "ssh-key list --member alice");
+    let list_alice_out = stdout_str(&list_alice);
+    assert!(!list_alice_out.contains('\u{1b}'));
+    assert_eq!(
+        list_alice_out,
+        "SSH keys for alice\\u{1b}[2J:\n  #3  SHA256:aliceFp333  workstation\n  #5  SHA256:aliceFp555\n"
+    );
+
+    // 7. Revoke self and admin member keys.
+    let rm_self = run_bin(
+        scrim_bin(),
+        &["ssh-key", "rm", "1"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&rm_self, "ssh-key rm self");
+    assert_eq!(stdout_str(&rm_self), "Revoked SSH key #1 for bob.\n");
+
+    let rm_alice = run_bin(
+        scrim_bin(),
+        &["ssh-key", "rm", "3", "--member", "alice"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&rm_alice, "ssh-key rm --member alice");
+    assert_eq!(stdout_str(&rm_alice), "Revoked SSH key #3 for alice.\n");
+
+    let requests = server.take_requests();
+    assert_eq!(requests.len(), 8);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].target, "/api/v1/me/ssh-keys");
+    let req0_body: serde_json::Value = must(serde_json::from_str(&requests[0].body), "req0 json");
+    assert_eq!(req0_body["public_key"], serde_json::json!(key_line));
+    assert_eq!(req0_body["label"], serde_json::json!("laptop"));
+
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].target, "/api/v1/me/ssh-keys");
+    let req1_body: serde_json::Value = must(serde_json::from_str(&requests[1].body), "req1 json");
+    assert_eq!(req1_body["public_key"], serde_json::json!(key_line));
+    assert_eq!(req1_body["label"], serde_json::json!(""));
+
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(requests[2].target, "/api/v1/members/alice/ssh-keys");
+
+    assert_eq!(requests[3].method, "POST");
+    assert_eq!(requests[3].target, "/api/v1/members/alice%20smith/ssh-keys");
+
+    assert_eq!(requests[4].method, "GET");
+    assert_eq!(requests[4].target, "/api/v1/me/ssh-keys");
+
+    assert_eq!(requests[5].method, "GET");
+    assert_eq!(requests[5].target, "/api/v1/members/alice/ssh-keys");
+
+    assert_eq!(requests[6].method, "DELETE");
+    assert_eq!(requests[6].target, "/api/v1/me/ssh-keys/1");
+
+    assert_eq!(requests[7].method, "DELETE");
+    assert_eq!(requests[7].target, "/api/v1/members/alice/ssh-keys/3");
+}

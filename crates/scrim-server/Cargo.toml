@@ -12,9 +12,14 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 base64 = "0.23.1"
 clap = { version = "4.6.9", features = ["derive", "env"] }
+flate2 = "1.1.11"
+fred = { version = "10.1.0", default-features = false, features = ["i-keys", "enable-rustls-ring"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
 gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+hmac = "0.13.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+russh = { version = "0.65.4", default-features = false, features = ["ring", "flate2"] }
 scrim-policy = { version = "0.0.0", path = "../scrim-policy" }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -22,6 +27,7 @@ serde_json = "1.0.154"
 sha2 = { version = "0.11.1", features = ["zeroize"] }
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "json", "tls-rustls-ring-native-roots"] }
 subtle = "2.6.1"
+tar = { version = "0.4.46", default-features = false }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "net", "signal", "io-util", "fs", "sync", "time"] }
 tokio-util = { version = "0.7.20", features = ["io", "rt"] }
@@ -34,9 +40,13 @@ zeroize = "1.9.2"
 libc = "0.2.191"
 
 [dev-dependencies]
-flate2 = "1.1.11"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 http-body-util = "0.1.5"
 scrim-cli = { version = "0.0.0", path = "../scrim-cli" }
 scrim-crypto = { version = "0.0.0", path = "../scrim-crypto" }
 sha1 = "0.11.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[[bench]]
+name = "pack_withhold"
+harness = false

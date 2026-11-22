@@ -1,7 +1,10 @@
-//! The scrim-server binary: serves bare Git repositories over smart HTTP.
+//! The scrim-server binary: serves bare Git repositories over smart HTTP and,
+//! with `--ssh-listen`, over SSH.
 //!
 //! `scrim-server bootstrap-admin` instead creates the first admin member in
-//! the database and prints their token once.
+//! the database and prints their token once; `scrim-server backup` and
+//! `scrim-server restore` copy the repositories and database to and from
+//! Cloudflare R2.
 //!
 //! The same binary is git's `pre-receive` hook: started by `git receive-pack`
 //! with `SCRIM_HOOK_MODE=pre-receive`, it asks the running server for its
@@ -23,12 +26,15 @@ use std::{
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use scrim_server::{
-    MAX_TOKEN_BYTES, PACK_OBJECTS_HOOK_MODE, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV,
-    PgPolicyStore, PolicyStore, SecretString, TokenAuth, run_pack_objects_hook_process,
-    run_pre_receive_hook_process,
+    BackupConfig, CachedPolicyStore, DEFAULT_R2_PREFIX, MAX_TOKEN_BYTES, PACK_OBJECTS_HOOK_MODE,
+    PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore, R2Config,
+    RedisPolicyCache, RestoreConfig, SecretString, SharedHookDir, SshServerConfig, TokenAuth,
+    load_or_create_ssh_host_key, run_backup, run_pack_objects_hook_process,
+    run_pre_receive_hook_process, run_restore, serve_ssh,
 };
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -88,6 +94,24 @@ struct Config {
     /// connection.
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: Option<String>,
+
+    /// Address to serve Git over SSH on, e.g. `0.0.0.0:2222`. Members
+    /// authenticate with the SSH keys registered for them, so this requires
+    /// `--database-url` and `--ssh-host-key`. Disabled when not given.
+    #[arg(long, env = "SCRIM_SSH_LISTEN", requires = "ssh_host_key")]
+    ssh_listen: Option<SocketAddr>,
+
+    /// Path of the SSH server's host key (OpenSSH format). A new Ed25519 key
+    /// is generated there (mode 0600) if the file does not exist.
+    #[arg(long, env = "SCRIM_SSH_HOST_KEY")]
+    ssh_host_key: Option<PathBuf>,
+
+    /// Redis URL (`redis://` or, for TLS, `rediss://`) of a cache for each
+    /// request's member and repository policy, shared by every server using
+    /// the same database. Requires `--database-url`. Authentication is never
+    /// cached, and the server falls back to the database if Redis is down.
+    #[arg(long, env = "REDIS_URL", hide_env_values = true)]
+    redis_url: Option<String>,
 }
 
 /// One-off administrative commands.
@@ -96,6 +120,102 @@ enum Command {
     /// Creates the first admin member and prints their API token once.
     /// Fails if an active admin already exists.
     BootstrapAdmin(BootstrapAdminArgs),
+    /// Uploads a backup of every bare repository (and, with `DATABASE_URL`,
+    /// a `pg_dump` of the database) to Cloudflare R2, then points
+    /// `<prefix>/latest.json` at it.
+    Backup(BackupArgs),
+    /// Restores a backup from Cloudflare R2 into an empty repo root (and,
+    /// with `DATABASE_URL`, the database through `pg_restore --clean`).
+    Restore(RestoreArgs),
+}
+
+/// Where backups live: an S3-compatible Cloudflare R2 bucket.
+#[derive(Args)]
+struct R2Args {
+    /// R2 endpoint, e.g. `https://<account>.r2.cloudflarestorage.com`.
+    #[arg(long, env = "SCRIM_R2_ENDPOINT")]
+    r2_endpoint: String,
+
+    /// R2 bucket name.
+    #[arg(long, env = "SCRIM_R2_BUCKET")]
+    r2_bucket: String,
+
+    /// Access key ID of an R2 API token.
+    #[arg(long, env = "SCRIM_R2_ACCESS_KEY_ID", hide_env_values = true)]
+    r2_access_key_id: String,
+
+    /// Secret access key of the R2 API token. Prefer the environment variable
+    /// so the secret does not appear in process listings.
+    #[arg(long, env = "SCRIM_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
+    r2_secret_access_key: String,
+
+    /// Key prefix under which backups are stored.
+    #[arg(long, env = "SCRIM_R2_PREFIX", default_value = DEFAULT_R2_PREFIX)]
+    r2_prefix: String,
+}
+
+impl R2Args {
+    /// Converts the arguments, moving the secret into a [`SecretString`].
+    fn into_config(self) -> R2Config {
+        let secret = Zeroizing::new(self.r2_secret_access_key);
+        R2Config {
+            endpoint: self.r2_endpoint,
+            bucket: self.r2_bucket,
+            access_key_id: self.r2_access_key_id,
+            secret_access_key: SecretString::from(Box::<str>::from(secret.as_str())),
+            prefix: self.r2_prefix,
+        }
+    }
+}
+
+/// Arguments of `scrim-server backup`.
+#[derive(Args)]
+struct BackupArgs {
+    /// Directory containing the bare repositories to back up.
+    #[arg(long, env = "SCRIM_REPO_ROOT")]
+    repo_root: PathBuf,
+
+    /// PostgreSQL connection URL to dump; the database is skipped if unset.
+    /// The password reaches `pg_dump` only through `PGPASSWORD`.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    database_url: Option<String>,
+
+    #[command(flatten)]
+    r2: R2Args,
+
+    /// `pg_dump` executable.
+    #[arg(long, default_value = "pg_dump")]
+    pg_dump_bin: PathBuf,
+}
+
+/// Arguments of `scrim-server restore`.
+#[derive(Args)]
+struct RestoreArgs {
+    /// Directory to restore the bare repositories into. Created if missing;
+    /// must be empty unless `--force` is given.
+    #[arg(long, env = "SCRIM_REPO_ROOT")]
+    repo_root: PathBuf,
+
+    /// PostgreSQL connection URL to restore into; the database dump is
+    /// skipped if unset. Existing objects in the dump are dropped first.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    database_url: Option<String>,
+
+    #[command(flatten)]
+    r2: R2Args,
+
+    /// ID of the backup to restore, or `latest`.
+    #[arg(long, default_value = "latest")]
+    backup_id: String,
+
+    /// Restore into a non-empty repo root, replacing repositories at the
+    /// same paths.
+    #[arg(long)]
+    force: bool,
+
+    /// `pg_restore` executable.
+    #[arg(long, default_value = "pg_restore")]
+    pg_restore_bin: PathBuf,
 }
 
 /// Arguments of `scrim-server bootstrap-admin`.
@@ -140,6 +260,8 @@ fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     match config.command {
         Some(Command::BootstrapAdmin(args)) => runtime.block_on(run_bootstrap_admin(args)),
+        Some(Command::Backup(args)) => runtime.block_on(run_backup_command(args)),
+        Some(Command::Restore(args)) => runtime.block_on(run_restore_command(args)),
         None => runtime.block_on(run_server(config)),
     }
 }
@@ -182,6 +304,79 @@ async fn run_bootstrap_admin(args: BootstrapAdminArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Moves an optional database URL into a [`SecretString`].
+fn secret_database_url(database_url: Option<String>) -> Option<SecretString> {
+    database_url.map(|url| {
+        let url = Zeroizing::new(url);
+        SecretString::from(Box::<str>::from(url.as_str()))
+    })
+}
+
+/// Uploads a backup and prints its ID to stdout.
+async fn run_backup_command(args: BackupArgs) -> anyhow::Result<()> {
+    init_tracing_to_stderr();
+    let manifest = match run_backup(BackupConfig {
+        repo_root: args.repo_root,
+        database_url: secret_database_url(args.database_url),
+        r2: args.r2.into_config(),
+        pg_dump_bin: args.pg_dump_bin,
+    })
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => return Err(error.context("backup failed")),
+    };
+    println!("{}", manifest.backup_id);
+    eprintln!(
+        "Backed up {} repositories{} as {}.",
+        manifest.repos.len(),
+        if manifest.database.is_some() {
+            " and the database"
+        } else {
+            ""
+        },
+        manifest.backup_id
+    );
+    Ok(())
+}
+
+/// Restores a backup and reports what was restored.
+async fn run_restore_command(args: RestoreArgs) -> anyhow::Result<()> {
+    init_tracing_to_stderr();
+    let manifest = match run_restore(RestoreConfig {
+        repo_root: args.repo_root,
+        database_url: secret_database_url(args.database_url),
+        r2: args.r2.into_config(),
+        backup_id: Some(args.backup_id),
+        force: args.force,
+        pg_restore_bin: args.pg_restore_bin,
+    })
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => return Err(error.context("restore failed")),
+    };
+    eprintln!(
+        "Restored {} repositories from backup {}.",
+        manifest.repos.len(),
+        manifest.backup_id
+    );
+    Ok(())
+}
+
+/// Logs to stderr (stdout carries the command's result) at `info`, or as
+/// `RUST_LOG` says.
+fn init_tracing_to_stderr() {
+    let mut env_filter = EnvFilter::new("info");
+    if let Ok(from_env) = EnvFilter::try_from_default_env() {
+        env_filter = from_env;
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 /// Serves until Ctrl-C with the parsed server configuration.
 async fn run_server(config: Config) -> anyhow::Result<()> {
     let mut env_filter = EnvFilter::new("info");
@@ -208,6 +403,16 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         Err(error) => return Err(error),
     };
 
+    if config.ssh_listen.is_some() && config.database_url.is_none() {
+        bail!("--ssh-listen requires --database-url: SSH keys are stored in the database");
+    }
+    if config.redis_url.is_some() && config.database_url.is_none() {
+        bail!("--redis-url requires --database-url: Redis only caches the database's policy");
+    }
+
+    // One hook directory for both transports.
+    let hook_dir = SharedHookDir::default();
+    let mut ssh_policy_store: Option<Arc<dyn PolicyStore>> = None;
     let router = if let Some(database_url) = config.database_url {
         // Keep the URL (and any password in it) out of every error message.
         let database_url = Zeroizing::new(database_url);
@@ -220,7 +425,20 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         if let Err(error) = store.migrate().await {
             return Err(anyhow::Error::new(error)).context("cannot migrate the database");
         }
-        scrim_server::router_with_policy_store(repo_root.clone(), Arc::new(store))
+        let mut store: Arc<dyn PolicyStore> = Arc::new(store);
+        if let Some(redis_url) = config.redis_url {
+            // Keep the URL (and any password in it) out of every error message.
+            let redis_url = Zeroizing::new(redis_url);
+            let redis_cache = match RedisPolicyCache::connect(&redis_url).await {
+                Ok(redis_cache) => redis_cache,
+                Err(error) => bail!("cannot connect to the Redis policy cache: {error}"),
+            };
+            drop(redis_url);
+            store = Arc::new(CachedPolicyStore::new(store, Arc::new(redis_cache)));
+            tracing::info!("caching member repository policy in Redis");
+        }
+        ssh_policy_store = Some(Arc::clone(&store));
+        scrim_server::router_with_hook_dir(repo_root.clone(), store, hook_dir.clone())
     } else {
         let auth = match load_token_auth(config.token, config.token_file).await {
             Ok(auth) => auth,
@@ -245,16 +463,72 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     };
     tracing::info!(repo_root = %repo_root.display(), address = %local_address, "serving");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            // If the signal handler cannot be installed, keep serving rather than exit.
-            if tokio::signal::ctrl_c().await.is_err() {
-                std::future::pending::<()>().await;
+    let ssh_server = match (config.ssh_listen, config.ssh_host_key, ssh_policy_store) {
+        (Some(ssh_address), Some(host_key_path), Some(policy_store)) => {
+            let host_key = match load_or_create_ssh_host_key(&host_key_path)
+                .with_context(|| format!("cannot load SSH host key {}", host_key_path.display()))
+            {
+                Ok(host_key) => host_key,
+                Err(error) => return Err(error),
+            };
+            let ssh_listener = match tokio::net::TcpListener::bind(ssh_address)
+                .await
+                .with_context(|| format!("cannot listen for SSH on {ssh_address}"))
+            {
+                Ok(listener) => listener,
+                Err(error) => return Err(error),
+            };
+            match ssh_listener.local_addr() {
+                Ok(address) => tracing::info!(%address, "serving git over SSH"),
+                Err(error) => tracing::warn!(%error, "cannot read SSH listener address"),
             }
+            Some((
+                ssh_listener,
+                SshServerConfig {
+                    repo_root: repo_root.clone(),
+                    policy_store,
+                    host_key,
+                    hook_dir,
+                },
+            ))
+        }
+        // clap requires `--ssh-host-key` with `--ssh-listen`, and the
+        // database was checked above.
+        (Some(_), _, _) => bail!("--ssh-listen requires --ssh-host-key and --database-url"),
+        (None, _, _) => None,
+    };
+
+    let shutdown = CancellationToken::new();
+    let ctrl_c_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        // If the signal handler cannot be installed, keep serving rather than exit.
+        if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("shutting down");
-        })
-        .await
-        .context("server error")
+            ctrl_c_shutdown.cancel();
+        }
+    });
+
+    // Whichever server stops first (cleanly or not) stops the other.
+    let http_server = async {
+        let result = axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+            .await
+            .context("server error");
+        shutdown.cancel();
+        result
+    };
+    let Some((ssh_listener, ssh_config)) = ssh_server else {
+        return http_server.await;
+    };
+    let ssh_server = async {
+        let result = serve_ssh(ssh_listener, ssh_config, shutdown.clone().cancelled_owned())
+            .await
+            .context("SSH server error");
+        shutdown.cancel();
+        result
+    };
+    let (http_result, ssh_result) = tokio::join!(http_server, ssh_server);
+    http_result.and(ssh_result)
 }
 
 /// Loads the configured token from `--token` or `--token-file` and builds a [`TokenAuth`].
