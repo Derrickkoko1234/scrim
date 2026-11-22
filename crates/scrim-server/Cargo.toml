@@ -14,6 +14,7 @@ base64 = "0.23.1"
 clap = { version = "4.6.9", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 scrim-policy = { version = "0.0.0", path = "../scrim-policy" }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

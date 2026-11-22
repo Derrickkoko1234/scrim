@@ -42,6 +42,8 @@ pub enum Command {
     Keygen(KeygenArgs),
     /// Register a repository on the Scrim server and configure local Git.
     Init(InitArgs),
+    /// Clone a Scrim repository, excluding paths the server withholds from you.
+    Clone(CloneArgs),
     /// Manage Scrim groups and group memberships.
     Group(GroupArgs),
     /// Manage member accounts and API tokens.
@@ -98,6 +100,30 @@ pub struct InitArgs {
     /// Overwrite an existing local Git remote URL if it differs.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CloneArgs {
+    /// Repository URL (https://git.example.com/team/app.git) or repository key
+    /// (team/app.git) on the configured server.
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+
+    /// Destination directory (defaults to the repository name without .git).
+    #[arg(value_name = "DIRECTORY")]
+    pub directory: Option<PathBuf>,
+
+    /// Branch to check out instead of the remote's default branch.
+    #[arg(short, long, value_name = "BRANCH")]
+    pub branch: Option<String>,
+
+    /// Name of the Git remote to create.
+    #[arg(long, default_value = "origin", value_name = "NAME")]
+    pub remote: String,
+
+    /// Configure the clone without checking out files.
+    #[arg(long)]
+    pub no_checkout: bool,
 }
 
 #[derive(Debug, Args)]
@@ -381,26 +407,56 @@ pub struct PrivateArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PrivateCommand {
-    /// Encrypt files matching a path glob for members of a group.
+    /// Encrypt files matching a path glob for a group, or with --withhold have
+    /// the server withhold them from everyone outside the given groups.
     Add {
         /// Repo-relative .gitattributes-style glob (for example, config/billing/**).
         glob: String,
-        /// Group whose members may read matching files.
-        #[arg(long, value_name = "GROUP")]
-        group: String,
+        /// Group whose members may read matching files (repeatable with --withhold).
+        #[arg(long = "group", required = true, value_name = "GROUP")]
+        groups: Vec<String>,
         /// Create a new group key locally for only the caller's own public key without contacting the server.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "withhold")]
         offline: bool,
+        /// Add a server-side rule so non-members never receive matching file contents.
+        #[arg(long)]
+        withhold: bool,
+        /// Server repository key for --withhold (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO", requires = "withhold")]
+        repo: Option<String>,
     },
-    /// Stop encrypting files matching a path glob (they are stored as plaintext again).
+    /// Stop encrypting files matching a path glob (they are stored as plaintext
+    /// again), or with --withhold remove the server-side withholding rule.
     Rm {
         /// Path glob previously passed to 'scrim private add'.
         glob: String,
+        /// Remove the server-side withholding rule instead of the encryption rule.
+        #[arg(long)]
+        withhold: bool,
+        /// Server repository key for --withhold (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO", requires = "withhold")]
+        repo: Option<String>,
     },
-    /// Show private path rules, group keys and the state of tracked private files.
-    Status,
-    /// Configure the Git filter and decrypt or refresh checked-out private files.
-    Setup,
+    /// Show private path rules, group keys and the state of tracked private
+    /// files, or with --withhold the server-side withholding rules.
+    Status {
+        /// List the server-side withholding rules instead of local encryption state.
+        #[arg(long)]
+        withhold: bool,
+        /// Server repository key for --withhold (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO", requires = "withhold")]
+        repo: Option<String>,
+    },
+    /// Configure the Git filter and decrypt or refresh checked-out private
+    /// files; with --withhold also update sparse checkout to exclude withheld paths.
+    Setup {
+        /// Also fetch the paths withheld from you and update sparse checkout.
+        #[arg(long)]
+        withhold: bool,
+        /// Server repository key for --withhold (defaults to local git config scrim.repo).
+        #[arg(long, value_name = "REPO", requires = "withhold")]
+        repo: Option<String>,
+    },
     /// Rotate a group's key to match its current members on the server and re-encrypt its files.
     Sync {
         /// Group to rotate.

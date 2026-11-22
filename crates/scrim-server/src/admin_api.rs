@@ -1,16 +1,16 @@
 //! The admin HTTP API served under `/api/v1`, which the `scrim` CLI talks to.
 //!
 //! Requests arrive already authenticated by [`crate::auth::require_auth`].
-//! `GET /api/v1/whoami` and `PUT /api/v1/me/public-key` are open to every
-//! active member, `GET /api/v1/groups/{group}/recipients` is open to members
-//! belonging to that group (as well as admins), and
-//! `GET /api/v1/secret-scopes/recipients` is open to members belonging to the
-//! scope's groups (as well as admins); every other route requires an admin and
-//! answers `403` otherwise. Bodies are JSON (at most
-//! [`MAX_ADMIN_BODY_BYTES`] after decompression), every response carries
-//! `Cache-Control: no-store`, and every error is `{"error": "<message>"}`.
-//! Internal failures are logged and answered with a generic `500` message so
-//! no SQL or filesystem detail reaches the client.
+//! `GET /api/v1/whoami`, `PUT /api/v1/me/public-key`, and
+//! `GET /api/v1/path-rules/me` are open to every active member,
+//! `GET /api/v1/groups/{group}/recipients` is open to members belonging to that
+//! group (as well as admins), and `GET /api/v1/secret-scopes/recipients` is
+//! open to members belonging to the scope's groups (as well as admins); every
+//! other route requires an admin and answers `403` otherwise. Bodies are JSON
+//! (at most [`MAX_ADMIN_BODY_BYTES`] after decompression), every response
+//! carries `Cache-Control: no-store`, and every error is
+//! `{"error": "<message>"}`. Internal failures are logged and answered with a
+//! generic `500` message so no SQL or filesystem detail reaches the client.
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
@@ -30,10 +30,12 @@ use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 
 use crate::{
     policy_store::{
-        AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, MemberRecord, PolicyStore,
-        PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
+        AuthenticatedMember, BranchRuleRecord, CreateMemberRequest, MemberRecord, PathRuleRecord,
+        PolicyStore, PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
     },
-    repo_path::{BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo},
+    repo_path::{
+        BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo, resolve_bare_repo,
+    },
 };
 
 /// Largest accepted admin request body, in bytes.
@@ -73,6 +75,13 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
                 .put(set_branch_rule)
                 .delete(remove_branch_rule),
         )
+        .route(
+            "/path-rules",
+            get(list_path_rules)
+                .put(set_path_rule)
+                .delete(remove_path_rule),
+        )
+        .route("/path-rules/me", get(get_my_withheld_paths))
         .route(
             "/secret-scopes",
             get(list_secret_scopes)
@@ -144,6 +153,7 @@ fn store_error(error: PolicyStoreError) -> ApiError {
         }
         error @ (PolicyStoreError::Database(_)
         | PolicyStoreError::InvalidBranchRule { .. }
+        | PolicyStoreError::InvalidPathRule { .. }
         | PolicyStoreError::Internal(_)) => {
             tracing::error!(%error, "admin API policy store failure");
             ApiError::internal()
@@ -1077,5 +1087,156 @@ async fn get_group_recipients(
             .map(ScopeRecipientResponse::from)
             .collect(),
         members_without_key: record.members_without_key,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPathRuleBody {
+    repository: String,
+    pattern: String,
+    groups: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PathRuleResponse {
+    repository: String,
+    pattern: String,
+    groups: Vec<String>,
+}
+
+async fn set_path_rule(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiJson(body): ApiJson<SetPathRuleBody>,
+) -> ApiResult<PathRuleResponse> {
+    let groups: BTreeSet<String> = body.groups.into_iter().collect();
+    match state
+        .policy_store
+        .set_path_rule(Some(actor.id), &body.repository, &body.pattern, groups)
+        .await
+    {
+        Ok(rule) => ok(PathRuleResponse {
+            repository: rule.repository,
+            pattern: rule.pattern,
+            groups: rule.groups,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListPathRulesQuery {
+    repo: String,
+}
+
+#[derive(Serialize)]
+struct PathRuleSummary {
+    pattern: String,
+    groups: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PathRulesResponse {
+    repository: String,
+    rules: Vec<PathRuleSummary>,
+}
+
+async fn list_path_rules(
+    State(state): State<AdminState>,
+    AdminMember(_actor): AdminMember,
+    ApiQuery(query): ApiQuery<ListPathRulesQuery>,
+) -> ApiResult<PathRulesResponse> {
+    match state.policy_store.list_path_rules(&query.repo).await {
+        Ok(rules) => ok(PathRulesResponse {
+            repository: query.repo,
+            rules: rules
+                .into_iter()
+                .map(|rule: PathRuleRecord| PathRuleSummary {
+                    pattern: rule.pattern,
+                    groups: rule.groups,
+                })
+                .collect(),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovePathRuleQuery {
+    repo: String,
+    pattern: String,
+}
+
+#[derive(Serialize)]
+struct PathRuleRemovedResponse {
+    repository: String,
+    pattern: String,
+    removed: bool,
+}
+
+async fn remove_path_rule(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiQuery(query): ApiQuery<RemovePathRuleQuery>,
+) -> ApiResult<PathRuleRemovedResponse> {
+    match state
+        .policy_store
+        .remove_path_rule(Some(actor.id), &query.repo, &query.pattern)
+        .await
+    {
+        Ok(removed) => ok(PathRuleRemovedResponse {
+            repository: query.repo,
+            pattern: query.pattern,
+            removed,
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MyPathRulesQuery {
+    repo: String,
+}
+
+#[derive(Serialize)]
+struct MyPathRulesResponse {
+    repository: String,
+    withheld_patterns: Vec<String>,
+    sparse_checkout_patterns: Vec<String>,
+}
+
+async fn get_my_withheld_paths(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiQuery(query): ApiQuery<MyPathRulesQuery>,
+) -> ApiResult<MyPathRulesResponse> {
+    let Some(resolved) = resolve_bare_repo(&state.repo_root, &query.repo).await else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "repository not found"));
+    };
+    let policy = match state
+        .policy_store
+        .load_member_repo_policy(member.id, &resolved.canonical_key)
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => return Err(store_error(error)),
+    };
+    let withheld_patterns = policy
+        .withhold_policy
+        .withheld_patterns(&policy.member_groups)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let sparse_checkout_patterns = policy
+        .withhold_policy
+        .sparse_checkout_patterns(&policy.member_groups);
+    ok(MyPathRulesResponse {
+        repository: resolved.canonical_key,
+        withheld_patterns,
+        sparse_checkout_patterns,
     })
 }

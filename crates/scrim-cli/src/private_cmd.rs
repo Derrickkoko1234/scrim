@@ -11,24 +11,30 @@ use scrim_crypto::{
     GroupDataKey, GroupKeysFile, MemberIdentity, MemberPublicKey, extract_placeholder,
     is_encrypted_file, is_placeholder, rotate_group_key,
 };
-use scrim_policy::{PathPolicy, PathRule, validate_group_name};
+use scrim_policy::{PathPolicy, PathRule, validate_group_name, validate_path_glob};
 use secrecy::SecretString;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::PrivateCommand;
 use crate::client::ScrimClient;
+use crate::clone_cmd::{WITHHOLD_PARTIAL_CLONE_FILTER, validate_withheld_response};
 use crate::config::load_member_identity;
 use crate::filter::{FilterContext, serve};
 use crate::git::{
     git_add_renormalize, git_cat_file_blob, git_checkout_index_force, git_configure_scrim_filter,
-    git_is_scrim_filter_configured, git_ls_files, git_toplevel,
+    git_extra_header_env, git_is_scrim_filter_configured, git_ls_files,
+    git_promisor_remotes_for_server, git_refetch_partial_remote,
+    git_sparse_checkout_disable_if_active, git_sparse_checkout_set, git_toplevel,
 };
 use crate::private_store::{
     list_local_groups, read_group_keys, read_path_policy, sync_gitattributes, write_group_keys,
     write_path_policy,
 };
 use crate::secrets_store::require_repo_root;
-use crate::{CliEnv, build_authenticated_client, recipients_from_server, write_line};
+use crate::{
+    CliEnv, build_authenticated_client, format_list_or_none, recipients_from_server,
+    resolve_repo_arg, write_line,
+};
 
 /// Environment variables forwarded to `git` processes that may start
 /// `scrim filter-process`, so the filter resolves the same config and
@@ -82,7 +88,7 @@ impl FilterEnv {
         Self(vars)
     }
 
-    fn pairs(&self) -> Vec<(&str, &str)> {
+    pub(crate) fn pairs(&self) -> Vec<(&str, &str)> {
         self.0
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -340,9 +346,33 @@ pub(crate) fn handle_private(
     match command {
         PrivateCommand::Add {
             glob,
-            group,
+            groups,
+            withhold: true,
+            repo,
+            ..
+        } => handle_withhold_add(
+            glob,
+            groups,
+            repo,
+            server_flag,
+            token_override,
+            config_path,
+            env,
+        ),
+        PrivateCommand::Add {
+            glob,
+            groups,
             offline,
+            withhold: false,
+            ..
         } => {
+            // Encrypted files are protected by exactly one group's key.
+            let group = match groups.as_slice() {
+                [group] => group.clone(),
+                _ => bail!(
+                    "encrypted private files use a single group key, so pass exactly one --group; pass --withhold to restrict paths on the server to several groups"
+                ),
+            };
             let rule = match PathRule::new(&glob, &group) {
                 Ok(rule) => rule,
                 Err(err) => return Err(anyhow!(err)),
@@ -504,7 +534,16 @@ pub(crate) fn handle_private(
                 "Remember to commit .gitattributes and the .scrim/ files.",
             )
         }
-        PrivateCommand::Rm { glob } => {
+        PrivateCommand::Rm {
+            glob,
+            withhold: true,
+            repo,
+        } => handle_withhold_rm(glob, repo, server_flag, token_override, config_path, env),
+        PrivateCommand::Rm {
+            glob,
+            withhold: false,
+            ..
+        } => {
             let repo_root = match require_repo_root(&env.cwd) {
                 Ok(root) => root,
                 Err(err) => return Err(err),
@@ -579,8 +618,14 @@ pub(crate) fn handle_private(
                 "Remember to commit .gitattributes and the .scrim/ files.",
             )
         }
-        PrivateCommand::Status => handle_status(cli_key_file, config_path, env),
-        PrivateCommand::Setup => {
+        PrivateCommand::Status {
+            withhold: true,
+            repo,
+        } => handle_withhold_status(repo, server_flag, token_override, config_path, env),
+        PrivateCommand::Status {
+            withhold: false, ..
+        } => handle_status(cli_key_file, config_path, env),
+        PrivateCommand::Setup { withhold, repo } => {
             let repo_root = match require_repo_root(&env.cwd) {
                 Ok(root) => root,
                 Err(err) => return Err(err),
@@ -588,6 +633,25 @@ pub(crate) fn handle_private(
             if let Err(err) = git_configure_scrim_filter(&repo_root) {
                 return Err(err);
             }
+            let filter_env = FilterEnv::new(env, cli_key_file, config_path);
+            // Updating sparse checkout first lets the refresh below see every
+            // private file that is now part of the working tree.
+            let sparse_line = if withhold {
+                match apply_withheld_sparse_checkout(
+                    &repo_root,
+                    repo,
+                    server_flag,
+                    token_override,
+                    config_path,
+                    &filter_env,
+                    env,
+                ) {
+                    Ok(line) => Some(line),
+                    Err(err) => return Err(err),
+                }
+            } else {
+                None
+            };
             let policy = match read_path_policy(&repo_root) {
                 Ok(policy) => policy,
                 Err(err) => return Err(err),
@@ -633,7 +697,6 @@ pub(crate) fn handle_private(
                     Err(err) => return Err(err),
                 }
             }
-            let filter_env = FilterEnv::new(env, cli_key_file, config_path);
             if !refresh.is_empty()
                 && let Err(err) =
                     git_checkout_index_force(&repo_root, &refresh, &filter_env.pairs())
@@ -644,6 +707,11 @@ pub(crate) fn handle_private(
                 env.stdout,
                 "Configured Git filter 'scrim' for this repository",
             ) {
+                return Err(err);
+            }
+            if let Some(line) = sparse_line
+                && let Err(err) = write_line(env.stdout, &line)
+            {
                 return Err(err);
             }
             write_line(
@@ -738,6 +806,214 @@ pub(crate) fn handle_private(
             )
         }
     }
+}
+
+/// `scrim private add --withhold`: creates or replaces a server-side rule
+/// that withholds paths matching `glob` from everyone outside `groups`.
+fn handle_withhold_add(
+    glob: String,
+    groups: Vec<String>,
+    repo: Option<String>,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    if let Err(err) = validate_path_glob(&glob) {
+        return Err(anyhow!(err));
+    }
+    for group in &groups {
+        if let Err(err) = validate_group_name(group) {
+            return Err(anyhow!(err));
+        }
+    }
+    let client =
+        match build_authenticated_client(server_flag, token_override, config_path, &env.cwd) {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
+    let repo_key = match resolve_repo_arg(repo, &env.cwd) {
+        Ok(repo_key) => repo_key,
+        Err(err) => return Err(err),
+    };
+    let response = match client.put_path_rule(&repo_key, &glob, &groups) {
+        Ok(response) => response,
+        Err(err) => return Err(err),
+    };
+    write_line(
+        env.stdout,
+        &format!(
+            "Withholding '{}' in {} from everyone except groups: {}",
+            response.pattern,
+            response.repository,
+            format_list_or_none(&response.groups, "(none)")
+        ),
+    )
+}
+
+/// `scrim private rm --withhold`: removes a server-side withholding rule.
+fn handle_withhold_rm(
+    glob: String,
+    repo: Option<String>,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    if let Err(err) = validate_path_glob(&glob) {
+        return Err(anyhow!(err));
+    }
+    let client =
+        match build_authenticated_client(server_flag, token_override, config_path, &env.cwd) {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
+    let repo_key = match resolve_repo_arg(repo, &env.cwd) {
+        Ok(repo_key) => repo_key,
+        Err(err) => return Err(err),
+    };
+    let response = match client.delete_path_rule(&repo_key, &glob) {
+        Ok(response) => response,
+        Err(err) => return Err(err),
+    };
+    let line = if response.removed {
+        format!(
+            "Removed withholding rule '{}' from {}",
+            response.pattern, response.repository
+        )
+    } else {
+        format!(
+            "No withholding rule '{}' found in {}",
+            response.pattern, response.repository
+        )
+    };
+    write_line(env.stdout, &line)
+}
+
+/// `scrim private status --withhold`: lists server-side withholding rules.
+fn handle_withhold_status(
+    repo: Option<String>,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    let client =
+        match build_authenticated_client(server_flag, token_override, config_path, &env.cwd) {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
+    let repo_key = match resolve_repo_arg(repo, &env.cwd) {
+        Ok(repo_key) => repo_key,
+        Err(err) => return Err(err),
+    };
+    let response = match client.list_path_rules(&repo_key) {
+        Ok(response) => response,
+        Err(err) => return Err(err),
+    };
+    if let Err(err) = write_line(
+        env.stdout,
+        &format!("Withholding rules for {}:", response.repository),
+    ) {
+        return Err(err);
+    }
+    if response.rules.is_empty() {
+        return write_line(env.stdout, "  (none)");
+    }
+    for rule in &response.rules {
+        if let Err(err) = write_line(
+            env.stdout,
+            &format!(
+                "  {} -> {}",
+                rule.pattern,
+                format_list_or_none(&rule.groups, "(none)")
+            ),
+        ) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Fetches the paths withheld from the caller and makes the local sparse
+/// checkout exclude exactly those, returning a summary line. The Scrim
+/// bearer token is passed to Git (scoped to the server URL) because widening
+/// the checkout may lazily fetch newly visible blobs from a partial clone.
+fn apply_withheld_sparse_checkout(
+    repo_root: &Path,
+    repo: Option<String>,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path: Option<&Path>,
+    filter_env: &FilterEnv,
+    env: &CliEnv<'_>,
+) -> anyhow::Result<String> {
+    let client =
+        match build_authenticated_client(server_flag, token_override, config_path, &env.cwd) {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
+    let repo_key = match resolve_repo_arg(repo, &env.cwd) {
+        Ok(repo_key) => repo_key,
+        Err(err) => return Err(err),
+    };
+    let response = match client.get_my_withheld_paths(&repo_key) {
+        Ok(response) => response,
+        Err(err) => return Err(err),
+    };
+    if let Err(err) = validate_withheld_response(&response) {
+        return Err(err);
+    }
+    let auth_env = match git_extra_header_env(
+        &env.env_vars,
+        client.base_url(),
+        &client.authorization_header(),
+    ) {
+        Ok(vars) => vars,
+        Err(err) => return Err(err),
+    };
+    let mut git_env = filter_env.pairs();
+    git_env.extend(
+        auth_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+
+    // On a partial clone, refetch visible blobs at commit level before
+    // widening or disabling sparse checkout: `scrim-server` refuses bare
+    // blob-OID promisor lazy fetches by design, so newly visible files must
+    // arrive via a commit-level refetch pack first.
+    let promisor_remotes = match git_promisor_remotes_for_server(repo_root, client.base_url()) {
+        Ok(remotes) => remotes,
+        Err(err) => return Err(err),
+    };
+    for promisor_remote in promisor_remotes {
+        if let Err(err) = git_refetch_partial_remote(
+            repo_root,
+            &promisor_remote,
+            WITHHOLD_PARTIAL_CLONE_FILTER,
+            &git_env,
+        ) {
+            return Err(err);
+        }
+    }
+
+    if response.withheld_patterns.is_empty() {
+        return match git_sparse_checkout_disable_if_active(repo_root, &git_env) {
+            Ok(true) => Ok("Sparse checkout: disabled (no paths withheld from you)".to_owned()),
+            Ok(false) => Ok("Sparse checkout: not needed (no paths withheld from you)".to_owned()),
+            Err(err) => Err(err),
+        };
+    }
+    if let Err(err) =
+        git_sparse_checkout_set(repo_root, &response.sparse_checkout_patterns, &git_env)
+    {
+        return Err(err);
+    }
+    Ok(format!(
+        "Sparse checkout: excluding {} withheld pattern(s)",
+        response.withheld_patterns.len()
+    ))
 }
 
 fn handle_status(

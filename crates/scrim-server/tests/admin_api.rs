@@ -262,6 +262,21 @@ fn admin_routes() -> Vec<(Method, &'static str, Option<Value>)> {
         ),
         (
             Method::PUT,
+            "/api/v1/path-rules",
+            Some(json!({
+                "repository": "new.git",
+                "pattern": "config/billing/**",
+                "groups": ["core"],
+            })),
+        ),
+        (Method::GET, "/api/v1/path-rules?repo=new.git", None),
+        (
+            Method::DELETE,
+            "/api/v1/path-rules?repo=new.git&pattern=config%2Fbilling%2F**",
+            None,
+        ),
+        (
+            Method::PUT,
             "/api/v1/members/dev/public-key",
             Some(json!({ "public_key": TEST_AGE_KEY_1 })),
         ),
@@ -361,6 +376,29 @@ async fn static_store_answers_administration_with_not_implemented() {
     // The repository is registered before it is created, so nothing was
     // written to disk for the store that cannot register it.
     assert!(!root.path().join("new.git").exists());
+
+    // `/api/v1/path-rules/me` works on StaticPolicyStore and returns empty arrays
+    // for an existing bare repository on disk.
+    let sandbox = GitSandbox::new();
+    sandbox.init_bare_with_commit(&root.path().join("static-repo.git"));
+    let me = send(
+        &router,
+        Method::GET,
+        "/api/v1/path-rules/me?repo=static-repo.git",
+        Some(TEST_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.json);
+    assert_no_store(&me);
+    assert_eq!(
+        me.json,
+        json!({
+            "repository": "static-repo.git",
+            "withheld_patterns": [],
+            "sparse_checkout_patterns": [],
+        })
+    );
 }
 
 #[tokio::test]
@@ -2083,4 +2121,425 @@ async fn group_recipients_lifecycle_and_authorization() {
         .admin(Method::GET, "/api/v1/groups/.bad/recipients", None)
         .await;
     assert_eq!(admin_invalid.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn path_rules_lifecycle_and_my_withheld_paths() {
+    let api = Api::new();
+    let sandbox = GitSandbox::new();
+    api.create_group("core").await;
+    api.create_group("finance").await;
+    api.create_group("security").await;
+
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/repositories",
+        Some(json!({ "path": "team/app.git" })),
+        StatusCode::CREATED,
+    )
+    .await;
+    // Populate with a commit so the bare repository is valid on disk too.
+    populate(&sandbox, &api.root.path().join("team/app.git"));
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/repositories",
+        Some(json!({ "path": "empty.git" })),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // Create intra-root symlink alias to verify `/api/v1/path-rules/me` resolves canonical keys.
+    #[cfg(unix)]
+    {
+        let alias = api.root.path().join("alias.git");
+        if let Err(error) = std::os::unix::fs::symlink("team/app.git", &alias) {
+            panic!("failed to create symlink alias: {error}");
+        }
+    }
+
+    let alice_token = api.create_member("alice", &["finance"]).await;
+    let bob_token = api.create_member("bob", &["core"]).await;
+    let full_token = api
+        .create_member("carol", &["core", "finance", "security"])
+        .await;
+
+    // Validation & missing-target errors on admin path-rule endpoints.
+    let invalid_cases = vec![
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": "/abs/secret", "groups": ["core"] }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": ".scrim/**", "groups": ["core"] }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": ".git/config", "groups": ["core"] }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": "config/[oops", "groups": ["core"] }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(json!({ "repository": "team/app.git", "pattern": "config/**", "groups": [] })),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": "config/**", "groups": ["bad group"] }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(json!({ "repository": "../bad.git", "pattern": "config/**", "groups": ["core"] })),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "missing.git", "pattern": "config/**", "groups": ["core"] }),
+            ),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(
+                json!({ "repository": "team/app.git", "pattern": "config/**", "groups": ["ghosts"] }),
+            ),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/api/v1/path-rules?repo=missing.git",
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/path-rules?repo=team%2Fapp.git&pattern=missing%2F**",
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (method, uri, body, expected_status) in invalid_cases {
+        let reply = api.admin(method.clone(), uri, body).await;
+        assert_eq!(
+            reply.status, expected_status,
+            "{method} {uri}: {}",
+            reply.json
+        );
+        assert!(reply.json.get("error").is_some_and(Value::is_string));
+    }
+
+    // Set rules (out of alphabetical order) and verify sorted listing & replacement.
+    let rule_one = api
+        .admin(
+            Method::PUT,
+            "/api/v1/path-rules",
+            Some(json!({
+                "repository": "team/app.git",
+                "pattern": "config/billing/**",
+                "groups": ["security", "finance"],
+            })),
+        )
+        .await;
+    assert_eq!(rule_one.status, StatusCode::OK, "{}", rule_one.json);
+    assert_no_store(&rule_one);
+    assert_eq!(
+        rule_one.json,
+        json!({
+            "repository": "team/app.git",
+            "pattern": "config/billing/**",
+            "groups": ["finance", "security"],
+        })
+    );
+
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/path-rules",
+        Some(json!({
+            "repository": "team/app.git",
+            "pattern": "*.secret",
+            "groups": ["security"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/path-rules",
+        Some(json!({
+            "repository": "team/app.git",
+            "pattern": "docs/internal/*.md",
+            "groups": ["core"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+
+    let listed = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/path-rules?repo=team%2Fapp.git",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        listed,
+        json!({
+            "repository": "team/app.git",
+            "rules": [
+                { "pattern": "*.secret", "groups": ["security"] },
+                { "pattern": "config/billing/**", "groups": ["finance", "security"] },
+                { "pattern": "docs/internal/*.md", "groups": ["core"] },
+            ],
+        })
+    );
+
+    // `/api/v1/path-rules/me`:
+    // - `bob` (`core`) sees withheld `*.secret` and `config/billing/**`, NOT `docs/internal/*.md`.
+    let bob_me = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(&bob_token),
+            None,
+        )
+        .await;
+    assert_eq!(bob_me.status, StatusCode::OK);
+    assert_no_store(&bob_me);
+    assert_eq!(
+        bob_me.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": ["*.secret", "config/billing/**"],
+            "sparse_checkout_patterns": ["/*", "!*.secret", "!/config/billing/**"],
+        })
+    );
+
+    // - `alice` (`finance`) satisfies `config/billing/**`, so only `*.secret` and `docs/internal/*.md` are withheld.
+    let alice_me = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(&alice_token),
+            None,
+        )
+        .await;
+    assert_eq!(alice_me.status, StatusCode::OK);
+    assert_eq!(
+        alice_me.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": ["*.secret", "docs/internal/*.md"],
+            "sparse_checkout_patterns": ["/*", "!*.secret", "!/docs/internal/*.md"],
+        })
+    );
+
+    // - `carol` (`core`, `finance`, `security`) satisfies every rule, gets empty lists.
+    let carol_me = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(&full_token),
+            None,
+        )
+        .await;
+    assert_eq!(carol_me.status, StatusCode::OK);
+    assert_eq!(
+        carol_me.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": [],
+            "sparse_checkout_patterns": [],
+        })
+    );
+
+    // - `dev` (no groups) gets all 3 rules withheld.
+    let dev_me = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(DEV_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(dev_me.status, StatusCode::OK);
+    assert_eq!(
+        dev_me.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": ["*.secret", "config/billing/**", "docs/internal/*.md"],
+            "sparse_checkout_patterns": [
+                "/*",
+                "!*.secret",
+                "!/config/billing/**",
+                "!/docs/internal/*.md",
+            ],
+        })
+    );
+
+    // - Symlink alias resolves to `team/app.git` and returns the canonical key & its rules.
+    #[cfg(unix)]
+    {
+        let alias_me = api
+            .call(
+                Method::GET,
+                "/api/v1/path-rules/me?repo=alias.git",
+                Some(&bob_token),
+                None,
+            )
+            .await;
+        assert_eq!(alias_me.status, StatusCode::OK);
+        assert_eq!(
+            alias_me.json,
+            json!({
+                "repository": "team/app.git",
+                "withheld_patterns": ["*.secret", "config/billing/**"],
+                "sparse_checkout_patterns": ["/*", "!*.secret", "!/config/billing/**"],
+            })
+        );
+    }
+
+    // - Repo with no rules returns empty lists.
+    let empty_me = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=empty.git",
+            Some(&bob_token),
+            None,
+        )
+        .await;
+    assert_eq!(empty_me.status, StatusCode::OK);
+    assert_eq!(
+        empty_me.json,
+        json!({
+            "repository": "empty.git",
+            "withheld_patterns": [],
+            "sparse_checkout_patterns": [],
+        })
+    );
+
+    // - Missing or unsafe repo paths on `/api/v1/path-rules/me` return 404.
+    for bad_repo in ["missing.git", "../team/app.git", ".hidden.git", ""] {
+        let reply = api
+            .call(
+                Method::GET,
+                &format!("/api/v1/path-rules/me?repo={bad_repo}"),
+                Some(&bob_token),
+                None,
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{bad_repo:?}");
+        assert_eq!(reply.error(), "repository not found");
+    }
+
+    // Replace `config/billing/**` groups to `["core"]`: `bob` now sees it, `alice` no longer does.
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/path-rules",
+        Some(json!({
+            "repository": "team/app.git",
+            "pattern": "config/billing/**",
+            "groups": ["core"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let bob_after = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(&bob_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        bob_after.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": ["*.secret"],
+            "sparse_checkout_patterns": ["/*", "!*.secret"],
+        })
+    );
+
+    // Delete `*.secret` and verify listing, `/me`, and audit entries.
+    let removed = api
+        .admin_expect(
+            Method::DELETE,
+            "/api/v1/path-rules?repo=team%2Fapp.git&pattern=*.secret",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        removed,
+        json!({ "repository": "team/app.git", "pattern": "*.secret", "removed": true })
+    );
+    let bob_after_delete = api
+        .call(
+            Method::GET,
+            "/api/v1/path-rules/me?repo=team%2Fapp.git",
+            Some(&bob_token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        bob_after_delete.json,
+        json!({
+            "repository": "team/app.git",
+            "withheld_patterns": [],
+            "sparse_checkout_patterns": [],
+        })
+    );
+
+    let entries = api.store.audit_entries();
+    assert!(entries.iter().any(|entry| {
+        entry.action == "path_rule.set"
+            && entry.target_type == "path_rule"
+            && entry.target_name == "team/app.git:config/billing/**"
+            && entry.details
+                == json!({
+                    "repository": "team/app.git",
+                    "pattern": "config/billing/**",
+                    "groups": ["finance", "security"],
+                })
+    }));
+    assert!(entries.iter().any(|entry| {
+        entry.action == "path_rule.remove"
+            && entry.target_type == "path_rule"
+            && entry.target_name == "team/app.git:*.secret"
+            && entry.details
+                == json!({
+                    "repository": "team/app.git",
+                    "pattern": "*.secret",
+                })
+    }));
 }

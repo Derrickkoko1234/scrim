@@ -23,7 +23,7 @@
 //! # Checks
 //!
 //! The server decides with full knowledge of the member and the branch rules
-//! ([`evaluate_pre_receive`]), in five checks:
+//! ([`evaluate_pre_receive`]), in six checks:
 //!
 //! 1. every update line is well formed and names a UTF-8 `refs/...` ref, and
 //!    a push updates at most [`MAX_REF_UPDATES_PER_PUSH`] refs;
@@ -55,7 +55,16 @@
 //!    audit log. This applies to every member, admins included; only what
 //!    changed in each new commit is scanned (merges by combined diff, so a
 //!    file taken unchanged from a parent is not rescanned), so content
-//!    already accepted never has to be overridden again.
+//!    already accepted never has to be overridden again;
+//! 6. a member with withheld paths (see [`scrim_policy::WithholdPolicy`])
+//!    neither changes a withheld path (matched also ignoring ASCII case; a
+//!    non-UTF-8 path counts as withheld) in a new commit, nor publishes a blob
+//!    the repository only holds at withheld paths: not at a visible path of a
+//!    new commit, not as a ref's direct target, and not as a thin pack's
+//!    `REF_DELTA` base (an existing object in the quarantine). A merge may
+//!    only take a withheld path unchanged from one parent, and only where the
+//!    other side left it untouched since their merge bases, so neither an
+//!    evil merge nor picking an older side rewrites it. Never overridable.
 //!
 //! Every failure (bad framing, an unreachable server, a git error, a failed
 //! audit write) rejects the push.
@@ -71,7 +80,7 @@
 //! rejects the push whenever the object is not reachable from a visible ref.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet, btree_map},
     env::VarError,
     ffi::{OsStr, OsString},
     io::{self, Read, Write},
@@ -93,25 +102,26 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     auth::sha256_zeroizing,
     git_service::{RepoRefEntry, list_repo_refs, run_isolated_git},
+    pack_withhold::find_withheld_only_blobs,
     policy_store::{AuditLogEntry, AuthenticatedMember, MemberRepoPolicy, PolicyStore},
     secret_scan::{MAX_SCANNED_BLOB_BYTES, check_blocked_path_bytes, scan_blob_bytes},
 };
 
 /// The hook's end of the callback connection.
 #[cfg(unix)]
-type HookStream = std::os::unix::net::UnixStream;
+pub(crate) type HookStream = std::os::unix::net::UnixStream;
 #[cfg(not(unix))]
-type HookStream = std::net::TcpStream;
+pub(crate) type HookStream = std::net::TcpStream;
 
 /// The server's callback listener and its accepted connections.
 #[cfg(unix)]
-type CallbackListener = tokio::net::UnixListener;
+pub(crate) type CallbackListener = tokio::net::UnixListener;
 #[cfg(unix)]
-type CallbackConnection = tokio::net::UnixStream;
+pub(crate) type CallbackConnection = tokio::net::UnixStream;
 #[cfg(not(unix))]
-type CallbackListener = tokio::net::TcpListener;
+pub(crate) type CallbackListener = tokio::net::TcpListener;
 #[cfg(not(unix))]
-type CallbackConnection = tokio::net::TcpStream;
+pub(crate) type CallbackConnection = tokio::net::TcpStream;
 
 /// Environment variable that switches the scrim-server binary into hook mode
 /// when set to [`PRE_RECEIVE_HOOK_MODE`].
@@ -156,6 +166,11 @@ const SERVER_BINARY_STEM: &str = "scrim-server";
 /// Name of the hook inside the hook directory.
 const PRE_RECEIVE_HOOK_NAME: &str = "pre-receive";
 
+/// Name of the `uploadpack.packObjectsHook` link inside the hook directory
+/// (see [`crate::pack_withhold`]). Not a git hook name, so it never runs as a
+/// `core.hooksPath` hook.
+const PACK_OBJECTS_HOOK_NAME: &str = "pack-objects";
+
 /// Most bytes of update lines the hook forwards.
 const MAX_HOOK_STDIN_BYTES: usize = 16 * 1024 * 1024;
 
@@ -175,14 +190,14 @@ const MAX_HOOK_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// How long the hook waits to connect to the callback listener.
 #[cfg(not(unix))]
-const HOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the hook waits for the verdict; the history walks of checks 3 and
 /// 4 can take a while on large repositories.
-const HOOK_READ_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const HOOK_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long the hook may block sending its request.
-const HOOK_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const HOOK_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the callback listener waits for one connection to send its whole
 /// request before dropping it and waiting for the next.
@@ -193,7 +208,7 @@ const CALLBACK_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REJECTED_CALLBACK_CONNECTIONS: usize = 16;
 
 /// Number of random bytes in a callback token.
-const TOKEN_BYTES: usize = 32;
+pub(crate) const TOKEN_BYTES: usize = 32;
 
 /// Number of random bytes in a callback socket's file name. Kept short so the
 /// socket path fits in `sun_path` (104 bytes on macOS) even under a long
@@ -241,6 +256,12 @@ const UNAUTHENTICATED_VERDICT_MESSAGE: &str =
 const HIDDEN_OBJECTS_MESSAGE: &str = "scrim: push rejected: contains objects not supplied in this push and not reachable from visible refs";
 const INTERNAL_ERROR_MESSAGE: &str = "scrim: push rejected: internal error while checking the push";
 const INVALID_HOOK_REQUEST_MESSAGE: &str = "scrim: push rejected: invalid pre-receive request";
+const WITHHELD_CONTENT_MESSAGE: &str =
+    "scrim: push rejected: references the content of a path withheld from you";
+
+/// The empty blob: its content is known to everyone, so it is never treated
+/// as withheld content.
+const EMPTY_BLOB_ID: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 /// What the hook sends to the callback listener.
 #[derive(Serialize, Deserialize)]
@@ -258,6 +279,24 @@ struct HookRequest {
     git_quarantine_path: Option<String>,
     /// `GIT_PUSH_OPTION_0 .. N-1`.
     push_options: Vec<String>,
+}
+
+impl CallbackRequest for HookRequest {
+    const MAX_BYTES: usize = MAX_HOOK_REQUEST_BYTES;
+
+    fn request_proof_mut(&mut self) -> &mut String {
+        &mut self.request_proof
+    }
+}
+
+/// A request a hook sends to its callback listener, authenticated by a
+/// request proof (see [`accept_authenticated_callback`]).
+pub(crate) trait CallbackRequest: serde::de::DeserializeOwned {
+    /// Largest serialized request the listener reads.
+    const MAX_BYTES: usize;
+
+    /// The request proof, zeroized by the listener once checked.
+    fn request_proof_mut(&mut self) -> &mut String;
 }
 
 /// The server's verdict.
@@ -376,34 +415,11 @@ fn exchange_over_callback(
     request_bytes: &[u8],
     expected_response_proof: &str,
 ) -> io::Result<HookResponse> {
-    let mut stream = match connect_to_callback(callback_address) {
-        Ok(stream) => stream,
-        Err(error) => return Err(error),
-    };
-    if let Err(error) = stream.set_read_timeout(Some(HOOK_READ_TIMEOUT)) {
-        return Err(error);
-    }
-    if let Err(error) = stream.set_write_timeout(Some(HOOK_WRITE_TIMEOUT)) {
-        return Err(error);
-    }
-    if let Err(error) = stream.write_all(request_bytes) {
-        return Err(error);
-    }
-    // Signals the end of the request; the server reads until EOF.
-    if let Err(error) = stream.shutdown(Shutdown::Write) {
-        return Err(error);
-    }
-
-    let mut response_bytes = Vec::new();
-    let mut limited_stream = (&stream).take(MAX_HOOK_RESPONSE_BYTES as u64 + 1);
-    if let Err(error) = limited_stream.read_to_end(&mut response_bytes) {
-        return Err(error);
-    }
-    if response_bytes.len() > MAX_HOOK_RESPONSE_BYTES {
-        return Err(invalid_input(
-            "oversized response from the server".to_owned(),
-        ));
-    }
+    let response_bytes =
+        match send_callback_request(callback_address, request_bytes, MAX_HOOK_RESPONSE_BYTES) {
+            Ok(response_bytes) => response_bytes,
+            Err(error) => return Err(error),
+        };
     let mut response = match serde_json::from_slice::<HookResponse>(&response_bytes) {
         Ok(response) => response,
         Err(_) => {
@@ -426,16 +442,55 @@ fn exchange_over_callback(
     }
 }
 
+/// Connects to the callback listener at `callback_address`, sends
+/// `request_bytes`, closes the write side and returns the whole answer, at
+/// most `max_response_bytes` long.
+pub(crate) fn send_callback_request(
+    callback_address: &OsStr,
+    request_bytes: &[u8],
+    max_response_bytes: usize,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut stream = match connect_to_callback(callback_address) {
+        Ok(stream) => stream,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = stream.set_read_timeout(Some(HOOK_READ_TIMEOUT)) {
+        return Err(error);
+    }
+    if let Err(error) = stream.set_write_timeout(Some(HOOK_WRITE_TIMEOUT)) {
+        return Err(error);
+    }
+    if let Err(error) = stream.write_all(request_bytes) {
+        return Err(error);
+    }
+    // Signals the end of the request; the server reads until EOF.
+    if let Err(error) = stream.shutdown(Shutdown::Write) {
+        return Err(error);
+    }
+
+    let mut response_bytes = Zeroizing::new(Vec::new());
+    let mut limited_stream = (&stream).take(max_response_bytes as u64 + 1);
+    if let Err(error) = limited_stream.read_to_end(&mut response_bytes) {
+        return Err(error);
+    }
+    if response_bytes.len() > max_response_bytes {
+        return Err(invalid_input(
+            "oversized response from the server".to_owned(),
+        ));
+    }
+    Ok(response_bytes)
+}
+
 /// Connects to the callback socket at path `callback_address`.
 #[cfg(unix)]
-fn connect_to_callback(callback_address: &OsStr) -> io::Result<HookStream> {
+pub(crate) fn connect_to_callback(callback_address: &OsStr) -> io::Result<HookStream> {
     HookStream::connect(Path::new(callback_address))
 }
 
 /// Connects to the loopback callback listener at `callback_address`
 /// (`127.0.0.1:<port>`).
 #[cfg(not(unix))]
-fn connect_to_callback(callback_address: &OsStr) -> io::Result<HookStream> {
+pub(crate) fn connect_to_callback(callback_address: &OsStr) -> io::Result<HookStream> {
     let address = match callback_address
         .to_str()
         .and_then(|text| text.parse::<std::net::SocketAddr>().ok())
@@ -448,7 +503,7 @@ fn connect_to_callback(callback_address: &OsStr) -> io::Result<HookStream> {
 
 /// Returns `hex(sha256(domain || token))`, the proof of knowing `token` used
 /// in one direction of the callback exchange.
-fn derive_proof(domain: &str, token: &str) -> Zeroizing<String> {
+pub(crate) fn derive_proof(domain: &str, token: &str) -> Zeroizing<String> {
     let mut input = Zeroizing::new(Vec::with_capacity(domain.len() + token.len()));
     input.extend_from_slice(domain.as_bytes());
     input.extend_from_slice(token.as_bytes());
@@ -467,7 +522,7 @@ fn encode_hex(bytes: &[u8]) -> Zeroizing<String> {
 }
 
 /// Returns `byte_count` random bytes from the operating system, hex-encoded.
-fn generate_random_hex(byte_count: usize) -> io::Result<Zeroizing<String>> {
+pub(crate) fn generate_random_hex(byte_count: usize) -> io::Result<Zeroizing<String>> {
     let mut random_bytes = Zeroizing::new(vec![0_u8; byte_count]);
     if let Err(error) = getrandom::fill(random_bytes.as_mut_slice()) {
         return Err(io::Error::other(format!(
@@ -525,22 +580,24 @@ fn read_push_options() -> io::Result<Vec<String>> {
     Ok(push_options)
 }
 
-fn invalid_input(message: String) -> io::Error {
+pub(crate) fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 /// A private directory holding the server-owned `pre-receive` hook, used as
 /// `core.hooksPath` for every `git receive-pack`, so hooks inside a
-/// repository never run. On Unix it also holds each push's callback socket.
-/// Deleted when dropped.
+/// repository never run, and the `pack-objects` link used as
+/// `uploadpack.packObjectsHook` for fetches with withheld paths. On Unix it
+/// also holds each request's callback socket. Deleted when dropped.
 #[derive(Debug)]
 pub(crate) struct HookDir {
     dir: TempDir,
 }
 
 impl HookDir {
-    /// Creates a `0700` temporary directory containing `pre-receive`, a
-    /// symbolic link (a copy on non-Unix platforms) to the scrim-server binary.
+    /// Creates a `0700` temporary directory containing `pre-receive` and
+    /// `pack-objects`, each a symbolic link (a copy on non-Unix platforms) to
+    /// the scrim-server binary.
     ///
     /// The directory goes under `XDG_RUNTIME_DIR` when that names an existing
     /// directory (it is private to the user and not swept by
@@ -570,15 +627,17 @@ impl HookDir {
             Ok(dir) => dir,
             Err(error) => return Err(error),
         };
-        let hook_path = dir.path().join(PRE_RECEIVE_HOOK_NAME);
-        // A link runs the binary directly: no shell script, so no quoting
-        // issues and nothing extra needed in minimal containers.
-        #[cfg(unix)]
-        let link_result = std::os::unix::fs::symlink(&binary, &hook_path);
-        #[cfg(not(unix))]
-        let link_result = std::fs::copy(&binary, &hook_path).map(|_| ());
-        if let Err(error) = link_result {
-            return Err(error);
+        for hook_name in [PRE_RECEIVE_HOOK_NAME, PACK_OBJECTS_HOOK_NAME] {
+            let hook_path = dir.path().join(hook_name);
+            // A link runs the binary directly: no shell script, so no quoting
+            // issues and nothing extra needed in minimal containers.
+            #[cfg(unix)]
+            let link_result = std::os::unix::fs::symlink(&binary, &hook_path);
+            #[cfg(not(unix))]
+            let link_result = std::fs::copy(&binary, &hook_path).map(|_| ());
+            if let Err(error) = link_result {
+                return Err(error);
+            }
         }
         let hook_dir = Self { dir };
         match hook_dir.verify_installed() {
@@ -592,26 +651,38 @@ impl HookDir {
         self.dir.path()
     }
 
-    /// Fails unless `pre-receive` still resolves to an executable regular
-    /// file.
+    /// The `pack-objects` link, to run as `uploadpack.packObjectsHook`.
+    pub(crate) fn pack_objects_hook_path(&self) -> PathBuf {
+        self.dir.path().join(PACK_OBJECTS_HOOK_NAME)
+    }
+
+    /// Fails unless `pre-receive` and `pack-objects` still resolve to
+    /// executable regular files.
     ///
     /// git silently skips a hook it cannot execute, which would accept the
     /// push unchecked, so this runs before every `receive-pack` (for example
-    /// to catch the binary being replaced or removed during an upgrade).
+    /// to catch the binary being replaced or removed during an upgrade), and
+    /// before every fetch that relies on the `pack-objects` hook.
     pub(crate) fn verify_installed(&self) -> io::Result<()> {
-        let hook_path = self.dir.path().join(PRE_RECEIVE_HOOK_NAME);
-        let metadata = match std::fs::metadata(&hook_path) {
-            Ok(metadata) => metadata,
-            Err(error) => return Err(error),
-        };
-        if !metadata.is_file() {
-            return Err(io::Error::other("pre-receive hook is not a regular file"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return Err(io::Error::other("pre-receive hook is not executable"));
+        for hook_name in [PRE_RECEIVE_HOOK_NAME, PACK_OBJECTS_HOOK_NAME] {
+            let hook_path = self.dir.path().join(hook_name);
+            let metadata = match std::fs::metadata(&hook_path) {
+                Ok(metadata) => metadata,
+                Err(error) => return Err(error),
+            };
+            if !metadata.is_file() {
+                return Err(io::Error::other(format!(
+                    "{hook_name} hook is not a regular file"
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return Err(io::Error::other(format!(
+                        "{hook_name} hook is not executable"
+                    )));
+                }
             }
         }
         Ok(())
@@ -748,7 +819,7 @@ pub(crate) struct PreReceiveSession {
 /// Removes a callback socket file when dropped, so socket files never
 /// accumulate in the hook directory.
 #[cfg(unix)]
-struct CallbackSocketFile {
+pub(crate) struct CallbackSocketFile {
     path: PathBuf,
 }
 
@@ -758,7 +829,7 @@ impl Drop for CallbackSocketFile {
         if let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
         {
-            tracing::warn!(%error, "cannot remove a pre-receive callback socket");
+            tracing::warn!(%error, "cannot remove a hook callback socket");
         }
     }
 }
@@ -804,8 +875,43 @@ pub(crate) async fn start_pre_receive_session(
         Err(error) => return Err(error),
     };
 
+    let bound = match bind_callback_listener(&hook_dir).await {
+        Ok(bound) => bound,
+        Err(error) => return Err(error),
+    };
+    let callback_task = AbortOnDropHandle::new(tokio::spawn(answer_hook_callback(
+        bound.listener,
+        derive_proof(REQUEST_PROOF_DOMAIN, &token),
+        derive_proof(RESPONSE_PROOF_DOMAIN, &token),
+        context,
+    )));
+    Ok(PreReceiveSession {
+        _callback_task: callback_task,
+        #[cfg(unix)]
+        _callback_socket: bound.socket_file,
+        hook_dir,
+        callback_address: bound.address,
+        token,
+    })
+}
+
+/// A freshly bound per-request callback listener.
+pub(crate) struct BoundCallbackListener {
+    pub(crate) listener: CallbackListener,
+    /// The address the hook connects to (see [`connect_to_callback`]).
+    pub(crate) address: OsString,
+    /// Removes the socket file when dropped.
     #[cfg(unix)]
-    let (listener, callback_address, callback_socket) = {
+    pub(crate) socket_file: CallbackSocketFile,
+}
+
+/// Binds a callback listener for one request: on Unix a socket with a random
+/// name in `hook_dir`, elsewhere an ephemeral loopback TCP port.
+pub(crate) async fn bind_callback_listener(
+    hook_dir: &HookDir,
+) -> io::Result<BoundCallbackListener> {
+    #[cfg(unix)]
+    {
         let socket_name = match generate_random_hex(CALLBACK_SOCKET_NAME_BYTES) {
             Ok(socket_name) => socket_name,
             Err(error) => return Err(error),
@@ -815,40 +921,25 @@ pub(crate) async fn start_pre_receive_session(
             Ok(listener) => listener,
             Err(error) => return Err(error),
         };
-        let callback_address = socket_path.clone().into_os_string();
-        (
+        Ok(BoundCallbackListener {
             listener,
-            callback_address,
-            CallbackSocketFile { path: socket_path },
-        )
-    };
+            address: socket_path.clone().into_os_string(),
+            socket_file: CallbackSocketFile { path: socket_path },
+        })
+    }
     #[cfg(not(unix))]
-    let (listener, callback_address) = {
+    {
+        let _ = hook_dir;
         let listener = match CallbackListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) => return Err(error),
         };
-        let callback_address = match listener.local_addr() {
+        let address = match listener.local_addr() {
             Ok(address) => OsString::from(address.to_string()),
             Err(error) => return Err(error),
         };
-        (listener, callback_address)
-    };
-
-    let callback_task = AbortOnDropHandle::new(tokio::spawn(answer_hook_callback(
-        listener,
-        derive_proof(REQUEST_PROOF_DOMAIN, &token),
-        derive_proof(RESPONSE_PROOF_DOMAIN, &token),
-        context,
-    )));
-    Ok(PreReceiveSession {
-        _callback_task: callback_task,
-        #[cfg(unix)]
-        _callback_socket: callback_socket,
-        hook_dir,
-        callback_address,
-        token,
-    })
+        Ok(BoundCallbackListener { listener, address })
+    }
 }
 
 /// Waits for the hook's authenticated request on `listener`, judges the push
@@ -889,46 +980,56 @@ async fn accept_authenticated_request(
     listener: CallbackListener,
     expected_request_proof: &str,
 ) -> Option<(CallbackConnection, HookRequest)> {
+    accept_authenticated_callback(listener, expected_request_proof).await
+}
+
+/// [`accept_authenticated_request`] for any [`CallbackRequest`] type.
+pub(crate) async fn accept_authenticated_callback<T: CallbackRequest>(
+    listener: CallbackListener,
+    expected_request_proof: &str,
+) -> Option<(CallbackConnection, T)> {
     for _ in 0..MAX_REJECTED_CALLBACK_CONNECTIONS {
         let mut stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(error) => {
-                tracing::warn!(%error, "failed to accept a pre-receive callback");
+                tracing::warn!(%error, "failed to accept a hook callback");
                 continue;
             }
         };
-        let mut request = match read_hook_request(&mut stream).await {
+        let mut request = match read_callback_request::<T>(&mut stream).await {
             Ok(request) => request,
             Err(reason) => {
-                tracing::warn!("dropped a pre-receive callback connection: {reason}");
+                tracing::warn!("dropped a hook callback connection: {reason}");
                 continue;
             }
         };
+        let request_proof = request.request_proof_mut();
         let is_proof_valid = bool::from(
-            request
-                .request_proof
+            request_proof
                 .as_bytes()
                 .ct_eq(expected_request_proof.as_bytes()),
         );
-        request.request_proof.zeroize();
+        request_proof.zeroize();
         if is_proof_valid {
-            // Only one hook runs per receive-pack, so nothing else may
+            // Only one hook runs per git process, so nothing else may
             // connect from here on.
             drop(listener);
             return Some((stream, request));
         }
-        tracing::warn!("pre-receive callback presented an invalid request proof");
+        tracing::warn!("hook callback presented an invalid request proof");
     }
-    tracing::warn!("too many invalid pre-receive callback connections; giving up");
+    tracing::warn!("too many invalid hook callback connections; giving up");
     None
 }
 
 /// Reads one whole request (until the peer closes its write side) from
 /// `stream`, within [`CALLBACK_REQUEST_READ_TIMEOUT`] and
-/// [`MAX_HOOK_REQUEST_BYTES`]. Returns why on failure, for the log.
-async fn read_hook_request(stream: &mut CallbackConnection) -> Result<HookRequest, &'static str> {
+/// [`CallbackRequest::MAX_BYTES`]. Returns why on failure, for the log.
+async fn read_callback_request<T: CallbackRequest>(
+    stream: &mut CallbackConnection,
+) -> Result<T, &'static str> {
     let mut request_bytes = Zeroizing::new(Vec::new());
-    let mut limited_stream = stream.take(MAX_HOOK_REQUEST_BYTES as u64 + 1);
+    let mut limited_stream = stream.take(T::MAX_BYTES as u64 + 1);
     let read_result = tokio::time::timeout(
         CALLBACK_REQUEST_READ_TIMEOUT,
         limited_stream.read_to_end(&mut request_bytes),
@@ -937,8 +1038,8 @@ async fn read_hook_request(stream: &mut CallbackConnection) -> Result<HookReques
     match read_result {
         Err(_) => Err("timed out reading the request"),
         Ok(Err(_)) => Err("failed to read the request"),
-        Ok(Ok(_)) if request_bytes.len() > MAX_HOOK_REQUEST_BYTES => Err("oversized request"),
-        Ok(Ok(_)) => match serde_json::from_slice::<HookRequest>(&request_bytes) {
+        Ok(Ok(_)) if request_bytes.len() > T::MAX_BYTES => Err("oversized request"),
+        Ok(Ok(_)) => match serde_json::from_slice::<T>(&request_bytes) {
             Ok(request) => Ok(request),
             Err(_) => Err("malformed request"),
         },
@@ -1103,6 +1204,20 @@ async fn check_push(context: &PreReceiveContext, request: &HookRequest) -> Resul
     }
 
     if let Err(message) = check_hidden_objects(
+        context,
+        &updates,
+        &repo_refs,
+        &symrefs,
+        &walk_env,
+        quarantine_directory.as_deref(),
+    )
+    .await
+    {
+        return Err(message);
+    }
+
+    // Check 6: withheld paths and withheld blobs, never overridable.
+    if let Err(message) = check_withheld_paths(
         context,
         &updates,
         &repo_refs,
@@ -1486,6 +1601,538 @@ async fn check_merge_leaks(
         });
     }
     Ok(pending_audit_entries)
+}
+
+/// Check 6: for a member with withheld paths, refuses new commits that change
+/// a withheld path, and any push that would publish a blob the repository
+/// only holds at withheld paths (see the module documentation).
+///
+/// Collects the blob IDs this push could expose (new or changed entries of
+/// new commits, blobs and trees refs point at directly, and every object in
+/// the quarantine directory, which includes `REF_DELTA` bases copied in by
+/// `index-pack --fix-thin`), then asks
+/// [`find_withheld_only_blobs`] which of them already exist in the repository
+/// only at withheld paths of the member's visible history.
+async fn check_withheld_paths(
+    context: &PreReceiveContext,
+    updates: &[RefUpdate],
+    repo_refs: &[RepoRefEntry],
+    symrefs: &BTreeMap<&str, &str>,
+    walk_env: &[(&str, &OsStr)],
+    quarantine_directory: Option<&Path>,
+) -> Result<(), String> {
+    let policy = &context.policy;
+    if !policy
+        .withhold_policy
+        .has_withheld_rules(&policy.member_groups)
+    {
+        return Ok(());
+    }
+    let pushed: Vec<&RefUpdate> = updates
+        .iter()
+        .filter(|update| !update.is_delete())
+        .collect();
+    if pushed.is_empty() {
+        return Ok(());
+    }
+
+    let mut peel_input = String::new();
+    for update in &pushed {
+        peel_input.push_str(&update.new_oid);
+        peel_input.push_str("^{}\n");
+    }
+    let peel_output = match run_isolated_git(
+        &context.repo_dir,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        walk_env,
+        peel_input.into_bytes(),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return Err(internal_error("cannot peel the pushed objects", &error)),
+    };
+    let peeled = match parse_peeled_objects(&peel_output, pushed.len()) {
+        Ok(peeled) => peeled,
+        Err(error) => return Err(internal_error("unexpected cat-file output", &error)),
+    };
+
+    let mut candidate_blobs: BTreeSet<String> = BTreeSet::new();
+    let mut commit_tips = String::new();
+    for (update, (object_id, object_type)) in pushed.iter().zip(peeled) {
+        match object_type.as_str() {
+            "commit" => {
+                commit_tips.push_str(&object_id);
+                commit_tips.push('\n');
+            }
+            "blob" => {
+                candidate_blobs.insert(object_id);
+            }
+            "tree" => {
+                let output = match run_isolated_git(
+                    &context.repo_dir,
+                    &["ls-tree", "-r", "-z", &object_id],
+                    walk_env,
+                    Vec::new(),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(error) => return Err(internal_error("cannot list a pushed tree", &error)),
+                };
+                let ref_location = ContentLocation {
+                    commit: None,
+                    ref_name: Some(update.ref_name.clone()),
+                    path: None,
+                };
+                match parse_ls_tree_entries(&output, &ref_location) {
+                    Ok(files) => candidate_blobs.extend(
+                        files
+                            .into_iter()
+                            .filter(|file| file.mode != "160000")
+                            .map(|file| file.blob_id),
+                    ),
+                    Err(error) => return Err(internal_error("unexpected ls-tree output", &error)),
+                }
+            }
+            _ => {
+                return Err(internal_error(
+                    "unexpected peeled object type",
+                    &object_type,
+                ));
+            }
+        }
+    }
+
+    // Symbolic refs are skipped: their targets are listed themselves.
+    let visible_refs: Vec<String> = repo_refs
+        .iter()
+        .filter(|entry| {
+            entry.symref_target.is_none()
+                && policy.branch_policy.is_ref_chain_visible(
+                    &entry.name,
+                    symrefs,
+                    &policy.member_groups,
+                )
+        })
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    if !commit_tips.is_empty() {
+        for visible_ref in &visible_refs {
+            commit_tips.push('^');
+            commit_tips.push_str(visible_ref);
+            commit_tips.push('\n');
+        }
+        let walk_output = match run_isolated_git(
+            &context.repo_dir,
+            &["rev-list", "--parents", "--stdin"],
+            walk_env,
+            commit_tips.into_bytes(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => return Err(internal_error("cannot walk the new commits", &error)),
+        };
+        let new_commits = match parse_commit_parents(&walk_output) {
+            Ok(new_commits) => new_commits,
+            Err(error) => return Err(internal_error("unexpected rev-list output", &error)),
+        };
+
+        let mut diff_input = String::new();
+        for (commit, parents) in &new_commits {
+            if parents.len() < 2 {
+                diff_input.push_str(commit);
+                diff_input.push('\n');
+            }
+        }
+        if !diff_input.is_empty() {
+            let diff_output = match run_isolated_git(
+                &context.repo_dir,
+                &[
+                    "diff-tree",
+                    "--stdin",
+                    "-r",
+                    "--root",
+                    "--no-renames",
+                    "--raw",
+                    "-z",
+                ],
+                walk_env,
+                diff_input.into_bytes(),
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => return Err(internal_error("cannot diff the new commits", &error)),
+            };
+            let entries = match parse_raw_diff_entries(&diff_output) {
+                Ok(entries) => entries,
+                Err(error) => return Err(internal_error("unexpected diff-tree output", &error)),
+            };
+            for entry in entries {
+                if is_withheld_write_path(context, &entry.path) {
+                    return Err(withheld_path_message(&entry.path));
+                }
+                if let Some(blob_id) = entry.new_blob_id() {
+                    candidate_blobs.insert(blob_id);
+                }
+            }
+        }
+        for (commit, parents) in &new_commits {
+            if parents.len() >= 2
+                && let Err(message) = check_merge_withheld_paths(
+                    context,
+                    walk_env,
+                    commit,
+                    parents,
+                    &mut candidate_blobs,
+                )
+                .await
+            {
+                return Err(message);
+            }
+        }
+    }
+
+    if let Some(quarantine_directory) = quarantine_directory {
+        // The quarantine alone (no alternates): the objects this push holds.
+        let listing = match run_isolated_git(
+            &context.repo_dir,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--unordered",
+                "--batch-check=%(objectname)",
+            ],
+            &[("GIT_OBJECT_DIRECTORY", quarantine_directory.as_os_str())],
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(internal_error(
+                    "cannot list the quarantined objects",
+                    &error,
+                ));
+            }
+        };
+        match parse_object_ids(&listing) {
+            Ok(object_ids) => candidate_blobs.extend(object_ids),
+            Err(error) => return Err(internal_error("unexpected cat-file output", &error)),
+        }
+    }
+
+    candidate_blobs.remove(EMPTY_BLOB_ID);
+    if candidate_blobs.is_empty() {
+        return Ok(());
+    }
+    let mut candidates = HashSet::with_capacity(candidate_blobs.len());
+    for blob_id in &candidate_blobs {
+        match gix::ObjectId::from_hex(blob_id.as_bytes()) {
+            Ok(object_id) => {
+                candidates.insert(object_id);
+            }
+            Err(error) => return Err(internal_error("unexpected object ID", &error)),
+        }
+    }
+    let repo_dir = context.repo_dir.clone();
+    let withhold_policy = policy.withhold_policy.clone();
+    let member_groups = policy.member_groups.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        find_withheld_only_blobs(
+            &repo_dir,
+            &visible_refs,
+            &candidates,
+            &withhold_policy,
+            &member_groups,
+        )
+    })
+    .await;
+    match joined {
+        Ok(Ok(withheld_only)) if withheld_only.is_empty() => Ok(()),
+        Ok(Ok(_)) => Err(WITHHELD_CONTENT_MESSAGE.to_owned()),
+        Ok(Err(error)) => Err(internal_error("cannot classify the pushed blobs", &error)),
+        Err(error) => Err(internal_error("the blob classification panicked", &error)),
+    }
+}
+
+/// Check 6 for one new merge commit `merge` with `parents`.
+///
+/// An entry differing from every parent is new content (what a combined
+/// diff shows): rejected at a withheld path, and otherwise added to
+/// `candidate_blobs`. An entry at a withheld path that differs from parent
+/// `i` must equal another parent `j`'s entry, and parent `i` must have left
+/// the path untouched since its merge bases with parent `j`: the merge then
+/// takes `j`'s side exactly as git's own merge would. Otherwise the merge
+/// would delete, revert or replace a withheld file (as `git merge -s ours`
+/// from a branch lacking it would).
+async fn check_merge_withheld_paths(
+    context: &PreReceiveContext,
+    walk_env: &[(&str, &OsStr)],
+    merge: &str,
+    parents: &[String],
+    candidate_blobs: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let mut parent_diffs: Vec<BTreeMap<Vec<u8>, RawDiffEntry>> = Vec::with_capacity(parents.len());
+    for parent in parents {
+        match diff_trees(context, walk_env, parent, merge).await {
+            Ok(entries) => parent_diffs.push(
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect(),
+            ),
+            Err(message) => return Err(message),
+        }
+    }
+    let Some(first_diff) = parent_diffs.first() else {
+        return Ok(());
+    };
+    for (path, entry) in first_diff {
+        if parent_diffs.iter().all(|diff| diff.contains_key(path)) {
+            if is_withheld_write_path(context, path) {
+                return Err(withheld_path_message(path));
+            }
+            if let Some(blob_id) = entry.new_blob_id() {
+                candidate_blobs.insert(blob_id);
+            }
+        }
+    }
+
+    // Paths parent `i` changed since its merge bases with parent `j`,
+    // computed on demand; `None` when no merge base could be found.
+    let mut changed_since_bases: BTreeMap<(usize, usize), Option<BTreeSet<Vec<u8>>>> =
+        BTreeMap::new();
+    for (index, diff) in parent_diffs.iter().enumerate() {
+        for path in diff.keys() {
+            if !is_withheld_write_path(context, path) {
+                continue;
+            }
+            let mut is_clean_take = false;
+            for (other_index, other_diff) in parent_diffs.iter().enumerate() {
+                if other_index == index || other_diff.contains_key(path) {
+                    continue;
+                }
+                let key = (index, other_index);
+                if let btree_map::Entry::Vacant(entry) = changed_since_bases.entry(key) {
+                    let (Some(parent), Some(other)) =
+                        (parents.get(index), parents.get(other_index))
+                    else {
+                        continue;
+                    };
+                    let changed =
+                        match paths_changed_since_merge_bases(context, walk_env, parent, other)
+                            .await
+                        {
+                            Ok(changed) => changed,
+                            Err(message) => return Err(message),
+                        };
+                    entry.insert(changed);
+                }
+                if let Some(Some(changed)) = changed_since_bases.get(&key)
+                    && !changed.contains(path)
+                {
+                    is_clean_take = true;
+                    break;
+                }
+            }
+            if !is_clean_take {
+                return Err(withheld_path_message(path));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The paths `parent` changed since any of its merge bases with `other`, or
+/// `None` if they have no merge base (or git cannot tell), which callers
+/// treat as "changed".
+async fn paths_changed_since_merge_bases(
+    context: &PreReceiveContext,
+    walk_env: &[(&str, &OsStr)],
+    parent: &str,
+    other: &str,
+) -> Result<Option<BTreeSet<Vec<u8>>>, String> {
+    // `merge-base` exits 1 without output when there is no common ancestor.
+    let Ok(output) = run_isolated_git(
+        &context.repo_dir,
+        &["merge-base", "--all", parent, other],
+        walk_env,
+        Vec::new(),
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let bases = match parse_object_ids(&output) {
+        Ok(bases) => bases,
+        Err(error) => return Err(internal_error("unexpected merge-base output", &error)),
+    };
+    if bases.is_empty() {
+        return Ok(None);
+    }
+    let mut changed = BTreeSet::new();
+    for base in &bases {
+        match diff_trees(context, walk_env, base, parent).await {
+            Ok(entries) => changed.extend(entries.into_iter().map(|entry| entry.path)),
+            Err(message) => return Err(message),
+        }
+    }
+    Ok(Some(changed))
+}
+
+/// Runs `git diff-tree -r --no-renames --raw -z <from> <to>`.
+async fn diff_trees(
+    context: &PreReceiveContext,
+    walk_env: &[(&str, &OsStr)],
+    from: &str,
+    to: &str,
+) -> Result<Vec<RawDiffEntry>, String> {
+    let output = match run_isolated_git(
+        &context.repo_dir,
+        &["diff-tree", "-r", "--no-renames", "--raw", "-z", from, to],
+        walk_env,
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return Err(internal_error("cannot diff a merge", &error)),
+    };
+    match parse_raw_diff_entries(&output) {
+        Ok(entries) => Ok(entries),
+        Err(error) => Err(internal_error("unexpected diff-tree output", &error)),
+    }
+}
+
+/// Whether the member may not write `path`: withheld exactly or ignoring
+/// ASCII case (a case-insensitive checkout would write the withheld file), or
+/// not UTF-8 (fail closed).
+fn is_withheld_write_path(context: &PreReceiveContext, path: &[u8]) -> bool {
+    let policy = &context.policy;
+    match std::str::from_utf8(path) {
+        Ok(path) => {
+            policy
+                .withhold_policy
+                .is_path_withheld(path, &policy.member_groups)
+                || policy
+                    .withhold_policy
+                    .is_path_withheld_case_insensitive(path, &policy.member_groups)
+        }
+        Err(_) => true,
+    }
+}
+
+/// The rejection for a change to the withheld `path`. Never names the groups
+/// that would grant access.
+fn withheld_path_message(path: &[u8]) -> String {
+    format!(
+        "scrim: push rejected: you do not have access to modify withheld path {}",
+        display_path(path)
+    )
+}
+
+/// One entry of `git diff-tree -r --raw -z` output for a single pair of
+/// trees.
+#[derive(Debug, PartialEq, Eq)]
+struct RawDiffEntry {
+    path: Vec<u8>,
+    /// Mode after the change; `000000` for a deletion.
+    new_mode: String,
+    new_oid: String,
+}
+
+impl RawDiffEntry {
+    /// The resulting blob, unless the entry was deleted or is a submodule
+    /// commit.
+    fn new_blob_id(&self) -> Option<String> {
+        if self.new_mode == "000000" || self.new_mode == "160000" || is_zero_oid(&self.new_oid) {
+            None
+        } else {
+            Some(self.new_oid.clone())
+        }
+    }
+}
+
+/// Parses `git diff-tree -r --raw -z` output for single-parent diffs:
+/// `:<old mode> <new mode> <old id> <new id> <status>` and a path per entry,
+/// optionally preceded (with `--stdin`) by the commit ID. Combined (`-c`)
+/// entries are an error.
+fn parse_raw_diff_entries(output: &[u8]) -> io::Result<Vec<RawDiffEntry>> {
+    let invalid = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected diff-tree output: {reason}"),
+        )
+    };
+    let mut entries = Vec::new();
+    let mut tokens = output.split(|byte| *byte == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let Some(header) = token.strip_prefix(b":") else {
+            if parse_oid(token).is_none() {
+                return Err(invalid("expected a commit ID"));
+            }
+            continue;
+        };
+        let Some(path) = tokens.next() else {
+            return Err(invalid("entry without a path"));
+        };
+        if path.is_empty() {
+            return Err(invalid("empty path"));
+        }
+        let Ok(header) = std::str::from_utf8(header) else {
+            return Err(invalid("non-UTF-8 entry header"));
+        };
+        let fields: Vec<&str> = header.split(' ').collect();
+        let [_old_mode, new_mode, _old_oid, new_oid, _status] = fields.as_slice() else {
+            return Err(invalid("wrong number of entry fields"));
+        };
+        let Some(new_oid) = parse_oid(new_oid.as_bytes()) else {
+            return Err(invalid("bad object ID"));
+        };
+        if new_mode.len() != 6 || !new_mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+            return Err(invalid("bad mode"));
+        }
+        entries.push(RawDiffEntry {
+            path: path.to_vec(),
+            new_mode: (*new_mode).to_owned(),
+            new_oid,
+        });
+    }
+    Ok(entries)
+}
+
+/// Parses `git rev-list --parents` output into `(commit, parents)` pairs.
+fn parse_commit_parents(output: &[u8]) -> io::Result<Vec<(String, Vec<String>)>> {
+    let mut commits = Vec::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut object_ids = Vec::new();
+        for field in line.split(|byte| *byte == b' ') {
+            match parse_oid(field) {
+                Some(object_id) => object_ids.push(object_id),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rev-list printed an unexpected line",
+                    ));
+                }
+            }
+        }
+        let mut object_ids = object_ids.into_iter();
+        if let Some(commit) = object_ids.next() {
+            commits.push((commit, object_ids.collect()));
+        }
+    }
+    Ok(commits)
 }
 
 /// Runs `git rev-list --stdin` with `revisions` (tips and `^excluded` lines)

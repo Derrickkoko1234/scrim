@@ -4,7 +4,9 @@
 //! Every request can carry its own [`GitVisibilityConfig`], which git applies
 //! through `transfer.hideRefs` so hidden refs are neither advertised nor
 //! fetchable by object ID. Every `receive-pack` RPC runs with the
-//! server-owned `pre-receive` guard (see [`crate::pre_receive`]).
+//! server-owned `pre-receive` guard (see [`crate::pre_receive`]), and an
+//! `upload-pack` RPC for a member with withheld paths builds its pack through
+//! the `pack-objects` hook (see [`crate::pack_withhold`]).
 
 use std::{
     ffi::{OsStr, OsString},
@@ -22,7 +24,7 @@ use tokio::{
 };
 use tokio_util::{io::ReaderStream, task::AbortOnDropHandle};
 
-use crate::pre_receive::PreReceiveSession;
+use crate::{pack_withhold::PackWithholdSession, pre_receive::PreReceiveSession};
 
 /// Longest `Git-Protocol` header value that is passed on to git.
 const MAX_GIT_PROTOCOL_LENGTH: usize = 256;
@@ -247,6 +249,7 @@ pub async fn advertise_refs(
         None,
         None,
         None,
+        None,
     ))
 }
 
@@ -258,6 +261,10 @@ pub async fn advertise_refs(
 /// installed) this fails without starting git, since git silently skips a
 /// missing hook. The session is kept alive in the response stream for as long
 /// as git runs.
+///
+/// `upload-pack` with `pack_withhold` builds its pack through that session's
+/// `pack-objects` hook; this fails without starting git if the hook is no
+/// longer installed. `pack_withhold` is ignored for `receive-pack`.
 pub fn serve_rpc(
     service: GitService,
     repo_dir: &Path,
@@ -265,7 +272,21 @@ pub fn serve_rpc(
     visibility: &GitVisibilityConfig,
     request_body: Body,
     pre_receive: Option<PreReceiveSession>,
+    pack_withhold: Option<PackWithholdSession>,
 ) -> io::Result<Body> {
+    let pack_withhold = pack_withhold.filter(|_| service == GitService::UploadPack);
+    if let Some(session) = &pack_withhold
+        && let Err(error) = session.verify_hook_installed()
+    {
+        return Err(error);
+    }
+    let hook_session = match (&pre_receive, &pack_withhold) {
+        (Some(session), _) if service == GitService::ReceivePack => {
+            Some(HookSession::PreReceive(session))
+        }
+        (_, Some(session)) => Some(HookSession::PackWithhold(session)),
+        _ => None,
+    };
     if service == GitService::ReceivePack {
         match &pre_receive {
             Some(session) => {
@@ -286,7 +307,7 @@ pub fn serve_rpc(
         repo_dir,
         git_protocol,
         visibility,
-        pre_receive.as_ref(),
+        hook_session,
         Stdio::piped(),
     ) {
         Ok(child) => child,
@@ -372,6 +393,7 @@ pub fn serve_rpc(
         Some(body_error_rx),
         Some(stdin_pump),
         pre_receive,
+        pack_withhold,
     ))
 }
 
@@ -453,6 +475,15 @@ fn invalid_request(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
+/// The server-owned hook a git process runs with.
+#[derive(Clone, Copy)]
+enum HookSession<'session> {
+    /// `receive-pack`'s `pre-receive` guard.
+    PreReceive(&'session PreReceiveSession),
+    /// `upload-pack`'s `pack-objects` hook.
+    PackWithhold(&'session PackWithholdSession),
+}
+
 /// Spawns `git <service>` for `repo_dir` with an empty environment, the
 /// SHA-in-want hardening, and one `transfer.hideRefs` per hidden ref.
 ///
@@ -464,9 +495,16 @@ fn invalid_request(message: &str) -> io::Error {
 /// to v0 transparently.
 ///
 /// `receive-pack` always advertises push options (so `git push -o` works over
-/// smart HTTP). With `pre_receive`, it also runs that session's hook
-/// directory as `core.hooksPath` (overriding any repository-local hooks) and
-/// passes the hook its callback address and token.
+/// smart HTTP). With a [`HookSession::PreReceive`], it also runs that
+/// session's hook directory as `core.hooksPath` (overriding any
+/// repository-local hooks) and passes the hook its callback address and
+/// token.
+///
+/// `upload-pack` always allows only the `blob:none` and `blob:limit` partial
+/// clone filters: `sparse:oid` would let a client probe withheld blob IDs.
+/// With a [`HookSession::PackWithhold`], `uploadpack.packObjectsHook` runs
+/// that session's hook (git only honors it from command-line or system config, never from
+/// the repository) with its callback address and token.
 ///
 /// Returns `InvalidInput` without spawning if a hidden-ref pattern is empty or
 /// contains NUL, CR or LF.
@@ -476,7 +514,7 @@ fn spawn_git(
     repo_dir: &Path,
     git_protocol: Option<&str>,
     visibility: &GitVisibilityConfig,
-    pre_receive: Option<&PreReceiveSession>,
+    hook_session: Option<HookSession<'_>>,
     stdin: Stdio,
 ) -> io::Result<ManagedChild> {
     for pattern in &visibility.hidden_refs {
@@ -508,7 +546,26 @@ fn spawn_git(
     if service == GitService::ReceivePack {
         command.arg("-c").arg("receive.advertisePushOptions=true");
     }
-    if let Some(session) = pre_receive {
+    if service == GitService::UploadPack {
+        for setting in [
+            "uploadpack.allowFilter=true",
+            "uploadpackfilter.allow=false",
+            "uploadpackfilter.blob:none.allow=true",
+            "uploadpackfilter.blob:limit.allow=true",
+        ] {
+            command.arg("-c").arg(setting);
+        }
+    }
+    if let Some(HookSession::PackWithhold(session)) = hook_session {
+        let hook_command = match session.hook_command() {
+            Ok(hook_command) => hook_command,
+            Err(error) => return Err(error),
+        };
+        command
+            .arg("-c")
+            .arg(format!("uploadpack.packObjectsHook={hook_command}"));
+    }
+    if let Some(HookSession::PreReceive(session)) = hook_session {
         let mut hooks_path_setting = OsString::from("core.hooksPath=");
         hooks_path_setting.push(session.hooks_dir());
         command.arg("-c").arg(hooks_path_setting);
@@ -543,8 +600,14 @@ fn spawn_git(
     {
         command.env("GIT_PROTOCOL", git_protocol);
     }
-    if let Some(session) = pre_receive {
-        command.envs(session.hook_env());
+    match hook_session {
+        Some(HookSession::PreReceive(session)) => {
+            command.envs(session.hook_env());
+        }
+        Some(HookSession::PackWithhold(session)) => {
+            command.envs(session.hook_env());
+        }
+        None => {}
     }
 
     #[cfg(unix)]
@@ -809,11 +872,12 @@ async fn log_stderr(service: GitService, mut stderr: ChildStderr) {
 }
 
 struct OutputStream {
-    // Declared before `_pre_receive` and `_stdin_pump` so dropping the stream
+    // Declared before the sessions and `_stdin_pump` so dropping the stream
     // kills git before the hook directory is deleted (git would silently skip
     // a missing hook) and before aborting the pump closes its stdin pipe.
     child: ManagedChild,
     _pre_receive: Option<PreReceiveSession>,
+    _pack_withhold: Option<PackWithholdSession>,
     _stdin_pump: Option<AbortOnDropHandle<()>>,
     reader: ReaderStream<ChildStdout>,
     body_error_rx: Option<oneshot::Receiver<io::Error>>,
@@ -849,10 +913,12 @@ fn stream_child_output(
     body_error_rx: Option<oneshot::Receiver<io::Error>>,
     stdin_pump: Option<AbortOnDropHandle<()>>,
     pre_receive: Option<PreReceiveSession>,
+    pack_withhold: Option<PackWithholdSession>,
 ) -> Body {
     let initial_state = Some(Box::new(OutputStream {
         child,
         _pre_receive: pre_receive,
+        _pack_withhold: pack_withhold,
         _stdin_pump: stdin_pump,
         reader: ReaderStream::new(stdout),
         body_error_rx,
@@ -1279,6 +1345,7 @@ mod tests {
                 &hide_private_branches(),
                 Body::from(request),
                 None,
+                None,
             ) {
                 Ok(body) => body,
                 Err(error) => panic!("serve_rpc failed: {error}"),
@@ -1307,6 +1374,7 @@ mod tests {
             &hide_private_branches(),
             Body::from(request),
             None,
+            None,
         ) {
             Ok(body) => body,
             Err(error) => panic!("serve_rpc failed: {error}"),
@@ -1327,6 +1395,7 @@ mod tests {
             None,
             &GitVisibilityConfig::default(),
             Body::empty(),
+            None,
             None,
         );
         assert!(result.is_err());

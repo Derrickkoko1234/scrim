@@ -239,6 +239,51 @@ pub struct DeleteBranchRuleResponse {
 }
 
 #[derive(Serialize)]
+struct PutPathRuleRequest<'a> {
+    repository: &'a str,
+    pattern: &'a str,
+    groups: &'a [String],
+}
+
+/// Server-side path withholding rule after `PUT /api/v1/path-rules`.
+#[derive(Debug, Deserialize)]
+pub struct PutPathRuleResponse {
+    pub repository: String,
+    pub pattern: String,
+    pub groups: Vec<String>,
+}
+
+/// One server-side path withholding rule in a repository listing.
+#[derive(Debug, Deserialize)]
+pub struct PathRuleSummary {
+    pub pattern: String,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListPathRulesResponse {
+    pub repository: String,
+    pub rules: Vec<PathRuleSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePathRuleResponse {
+    pub repository: String,
+    pub pattern: String,
+    pub removed: bool,
+}
+
+/// Paths the authenticated member cannot receive from a repository, plus the
+/// non-cone sparse-checkout patterns that exclude them.
+#[derive(Debug, Deserialize)]
+pub struct MyWithheldPathsResponse {
+    /// Canonical repository key on the server.
+    pub repository: String,
+    pub withheld_patterns: Vec<String>,
+    pub sparse_checkout_patterns: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct SetPublicKeyRequest<'a> {
     public_key: &'a str,
 }
@@ -478,6 +523,64 @@ impl ScrimClient {
             "/api/v1/branch-rules",
             &[("repo", repository), ("pattern", pattern)],
         )
+    }
+
+    /// Creates or replaces a server-side path withholding rule
+    /// (`PUT /api/v1/path-rules`).
+    pub fn put_path_rule(
+        &self,
+        repository: &str,
+        pattern: &str,
+        groups: &[String],
+    ) -> anyhow::Result<PutPathRuleResponse> {
+        let body = PutPathRuleRequest {
+            repository,
+            pattern,
+            groups,
+        };
+        self.send_json(Method::PUT, "/api/v1/path-rules", &[], &body)
+    }
+
+    /// Lists a repository's server-side path withholding rules
+    /// (`GET /api/v1/path-rules`).
+    pub fn list_path_rules(&self, repository: &str) -> anyhow::Result<ListPathRulesResponse> {
+        self.send_empty(Method::GET, "/api/v1/path-rules", &[("repo", repository)])
+    }
+
+    /// Removes a server-side path withholding rule
+    /// (`DELETE /api/v1/path-rules`).
+    pub fn delete_path_rule(
+        &self,
+        repository: &str,
+        pattern: &str,
+    ) -> anyhow::Result<DeletePathRuleResponse> {
+        self.send_empty(
+            Method::DELETE,
+            "/api/v1/path-rules",
+            &[("repo", repository), ("pattern", pattern)],
+        )
+    }
+
+    /// Fetches the paths withheld from the authenticated member in
+    /// `repository` (`GET /api/v1/path-rules/me`).
+    pub fn get_my_withheld_paths(
+        &self,
+        repository: &str,
+    ) -> anyhow::Result<MyWithheldPathsResponse> {
+        self.send_empty(
+            Method::GET,
+            "/api/v1/path-rules/me",
+            &[("repo", repository)],
+        )
+    }
+
+    /// Returns the `Authorization: Bearer <token>` header line for Git's
+    /// `http.<url>.extraHeader`, zeroized on drop.
+    pub(crate) fn authorization_header(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!(
+            "Authorization: Bearer {}",
+            self.token.expose_secret()
+        ))
     }
 
     pub fn put_secret_scope(

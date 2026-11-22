@@ -32,9 +32,19 @@ struct RecordedRequest {
     target: String,
     authorization: Option<String>,
     body: String,
+    /// Header names are lowercased.
+    headers: BTreeMap<String, String>,
+    body_bytes: Vec<u8>,
 }
 
-type Handler = dyn Fn(&RecordedRequest) -> (u16, String) + Send + Sync;
+/// Response returned by a raw mock handler.
+struct MockResponse {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+type Handler = dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync;
 
 struct MockServer {
     addr: SocketAddr,
@@ -47,6 +57,20 @@ impl MockServer {
     fn start<F>(handler: F) -> Self
     where
         F: Fn(&RecordedRequest) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_raw(move |req| {
+            let (status, body) = handler(req);
+            MockResponse {
+                status,
+                content_type: "application/json".to_owned(),
+                body: body.into_bytes(),
+            }
+        })
+    }
+
+    fn start_raw<F>(handler: F) -> Self
+    where
+        F: Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static,
     {
         let listener = must(
             TcpListener::bind("127.0.0.1:0"),
@@ -158,18 +182,29 @@ fn handle_connection(
         }
     }
 
-    let content_length = match headers.get("content-length") {
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => return,
-        },
-        None => 0,
+    let is_chunked = match headers.get("transfer-encoding") {
+        Some(value) => value.eq_ignore_ascii_case("chunked"),
+        None => false,
     };
-
-    let mut body_bytes = vec![0u8; content_length];
-    if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
-        return;
-    }
+    let body_bytes = if is_chunked {
+        match read_chunked_body(&mut reader) {
+            Some(bytes) => bytes,
+            None => return,
+        }
+    } else {
+        let content_length = match headers.get("content-length") {
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return,
+            },
+            None => 0,
+        };
+        let mut bytes = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut bytes).is_err() {
+            return;
+        }
+        bytes
+    };
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
     let recorded = RecordedRequest {
@@ -177,8 +212,14 @@ fn handle_connection(
         target,
         authorization: headers.get("authorization").cloned(),
         body,
+        headers,
+        body_bytes,
     };
-    let (status, resp_body) = handler(&recorded);
+    let MockResponse {
+        status,
+        content_type,
+        body: resp_body,
+    } = handler(&recorded);
 
     {
         let mut guard = match requests.lock() {
@@ -199,12 +240,41 @@ fn handle_connection(
         _ => "Status",
     };
 
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp_body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&resp_body);
     let _ = stream.flush();
+}
+
+/// Decodes an HTTP/1.1 `Transfer-Encoding: chunked` request body.
+fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        match reader.read_line(&mut size_line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let size_text = match size_line.trim().split(';').next() {
+            Some(text) => text.to_owned(),
+            None => return None,
+        };
+        let size = match usize::from_str_radix(&size_text, 16) {
+            Ok(size) => size,
+            Err(_) => return None,
+        };
+        let mut chunk = vec![0u8; size + 2];
+        if reader.read_exact(&mut chunk).is_err() {
+            return None;
+        }
+        if size == 0 {
+            return Some(body);
+        }
+        body.extend_from_slice(&chunk[..size]);
+    }
 }
 
 fn scrim_bin() -> &'static str {
@@ -2177,4 +2247,657 @@ fn online_private_add_sync_and_revoke_rotate_group_keys() {
             .iter()
             .all(|r| r.authorization.as_deref() == Some("Bearer scrim_admin"))
     );
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Serves a Git smart-HTTP request by running `git http-backend` as a CGI
+/// program over the bare repositories under `project_root`.
+fn serve_git_http_backend(project_root: &Path, req: &RecordedRequest) -> MockResponse {
+    let failure = |message: String| MockResponse {
+        status: 500,
+        content_type: "text/plain".to_owned(),
+        body: message.into_bytes(),
+    };
+    let (path_info, query) = match req.target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (req.target.as_str(), ""),
+    };
+    let mut cmd = Command::new("git");
+    cmd.arg("http-backend")
+        .env("GIT_PROJECT_ROOT", project_root)
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("PATH_INFO", path_info)
+        .env("QUERY_STRING", query)
+        .env("REQUEST_METHOD", &req.method)
+        .env("CONTENT_LENGTH", req.body_bytes.len().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (header, variable) in [
+        ("content-type", "CONTENT_TYPE"),
+        ("content-encoding", "HTTP_CONTENT_ENCODING"),
+        ("git-protocol", "GIT_PROTOCOL"),
+    ] {
+        if let Some(value) = req.headers.get(header) {
+            cmd.env(variable, value);
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => return failure(format!("spawn git http-backend: {err}")),
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(&req.body_bytes)
+    {
+        return failure(format!("write http-backend stdin: {err}"));
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(err) => return failure(format!("wait for git http-backend: {err}")),
+    };
+    let stdout = output.stdout;
+    let (head_end, body_start) = match find_bytes(&stdout, b"\r\n\r\n") {
+        Some(index) => (index, index + 4),
+        None => match find_bytes(&stdout, b"\n\n") {
+            Some(index) => (index, index + 2),
+            None => {
+                return failure(format!(
+                    "malformed CGI output: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        },
+    };
+    let mut status = 200;
+    let mut content_type = "text/plain".to_owned();
+    for line in String::from_utf8_lossy(&stdout[..head_end]).lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "status" => {
+                    if let Some(code) = value.split_whitespace().next()
+                        && let Ok(parsed) = code.parse::<u16>()
+                    {
+                        status = parsed;
+                    }
+                }
+                "content-type" => content_type = value.trim().to_owned(),
+                _ => {}
+            }
+        }
+    }
+    MockResponse {
+        status,
+        content_type,
+        body: stdout[body_start..].to_vec(),
+    }
+}
+
+fn json_response(status: u16, body: &str) -> MockResponse {
+    MockResponse {
+        status,
+        content_type: "application/json".to_owned(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries = must(fs::read_dir(dir), "read dir");
+    for entry in entries {
+        let path = must(entry, "dir entry").path();
+        if path.is_dir() {
+            found.extend(files_containing(&path, needle));
+        } else if contains_bytes(&must(fs::read(&path), "read file"), needle) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+const CLONE_TOKEN: &str = "scrim_clone_tok_9f3a";
+
+#[test]
+fn clone_configures_partial_sparse_checkout_filter_and_never_persists_token() {
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let cfg = tmp.path().join("alice-cfg");
+    must(fs::create_dir_all(&cfg), "mkdir cfg");
+    let config = cfg.join("config.toml");
+    write_identity(
+        &cfg.join("identity.age"),
+        &scrim_crypto::MemberIdentity::generate(),
+    );
+    let origin = committed_private_repo(&harness, tmp.path(), &config);
+
+    let project_root = tmp.path().join("srv");
+    must(fs::create_dir_all(project_root.join("team")), "mkdir srv");
+    let bare = project_root.join("team/app.git");
+    harness.git_ok(
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &origin.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+        tmp.path(),
+        &config,
+        &[],
+    );
+    harness.git_ok(
+        &["config", "uploadpack.allowFilter", "true"],
+        &bare,
+        &config,
+        &[],
+    );
+    harness.git_ok(
+        &[
+            "init",
+            "-q",
+            "--bare",
+            &project_root.join("team/empty.git").to_string_lossy(),
+        ],
+        tmp.path(),
+        &config,
+        &[],
+    );
+
+    let expected_auth = format!("Bearer {CLONE_TOKEN}");
+    let server = MockServer::start_raw(move |req| {
+        let is_authorized = req.authorization.as_deref() == Some(expected_auth.as_str());
+        match req.target.as_str() {
+            "/api/v1/path-rules/me?repo=team%2Fapp.git" if is_authorized => json_response(
+                200,
+                r#"{"repository":"team/app.git","withheld_patterns":["config/billing/**"],"sparse_checkout_patterns":["/*","!/config/billing/**"]}"#,
+            ),
+            "/api/v1/path-rules/me?repo=team%2Fempty.git" if is_authorized => json_response(
+                200,
+                r#"{"repository":"team/empty.git","withheld_patterns":[],"sparse_checkout_patterns":[]}"#,
+            ),
+            target if target.starts_with("/api/") => {
+                json_response(401, r#"{"error":"invalid or missing token"}"#)
+            }
+            _ if !is_authorized => json_response(401, r#"{"error":"git auth required"}"#),
+            _ => serve_git_http_backend(&project_root, req),
+        }
+    });
+
+    let work = tmp.path().join("work");
+    must(fs::create_dir_all(&work), "mkdir work");
+    // The CLI reports paths under its canonical current directory.
+    let work = must(fs::canonicalize(&work), "canonicalize work dir");
+    let source = format!("{}/team/app.git", server.url());
+    // A pre-existing GIT_CONFIG_* entry must survive next to the auth header.
+    let out = harness.scrim(
+        &["clone", &source],
+        &work,
+        &config,
+        &[
+            ("SCRIM_TOKEN", CLONE_TOKEN),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "http.userAgent"),
+            ("GIT_CONFIG_VALUE_0", "scrim-clone-test-agent"),
+        ],
+    );
+    assert_success(&out, "scrim clone");
+    let stdout = stdout_str(&out);
+    let clone = work.join("app");
+    assert!(stdout.contains(&format!("Cloned team/app.git into {}", clone.display())));
+    assert!(stdout.contains(&format!("Remote (origin): {source}")));
+    assert!(stdout.contains("Partial clone: enabled (1 withheld pattern(s))"));
+    assert!(stdout.contains("Private-file filter: enabled"));
+    assert!(stdout.contains("Checkout: done"));
+
+    let requests = server.take_requests();
+    assert_eq!(
+        requests[0].target,
+        "/api/v1/path-rules/me?repo=team%2Fapp.git"
+    );
+    let git_requests: Vec<&RecordedRequest> = requests
+        .iter()
+        .filter(|req| req.target.starts_with("/team/app.git/"))
+        .collect();
+    assert!(git_requests.len() >= 2, "{requests:?}");
+    for req in &git_requests {
+        assert_eq!(
+            req.authorization.as_deref(),
+            Some(format!("Bearer {CLONE_TOKEN}").as_str())
+        );
+        assert_eq!(
+            req.headers.get("user-agent").map(String::as_str),
+            Some("scrim-clone-test-agent")
+        );
+    }
+
+    let config_value = |key: &str| git_stdout(&clone, &["config", "--local", "--get", key]);
+    assert_eq!(config_value("remote.origin.url"), Some(source.clone()));
+    assert_eq!(
+        config_value("remote.origin.promisor").as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        config_value("remote.origin.partialclonefilter").as_deref(),
+        Some("blob:limit=2147483647")
+    );
+    assert_eq!(config_value("scrim.repo").as_deref(), Some("team/app.git"));
+    assert_eq!(config_value("scrim.server"), Some(server.url()));
+    assert_eq!(
+        git_stdout(&clone, &["config", "--get", "core.sparseCheckout"]).as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        config_value("filter.scrim.process").as_deref(),
+        Some("scrim filter-process")
+    );
+    let sparse = must(
+        fs::read_to_string(clone.join(".git/info/sparse-checkout")),
+        "read sparse-checkout",
+    );
+    assert_eq!(sparse, "/*\n!/config/billing/**\n");
+    let leaked = files_containing(&clone.join(".git"), CLONE_TOKEN.as_bytes());
+    assert!(leaked.is_empty(), "token persisted in {leaked:?}");
+
+    assert!(clone.join("README.md").is_file());
+    assert!(!clone.join("config/billing").exists());
+    // Encrypted but not withheld: decrypted by the filter on first checkout.
+    let key_txt = must(
+        fs::read_to_string(clone.join(".billing/key.txt")),
+        "read .billing/key.txt",
+    );
+    assert_eq!(key_txt, format!("{PRIVATE_SECRET}\n"));
+    let status = harness.git_ok(&["status", "--porcelain"], &clone, &config, &[]);
+    assert_eq!(stdout_str(&status), "");
+
+    // Bare repository key on SCRIM_SERVER, --no-checkout, custom remote/dir,
+    // and an empty repository with nothing withheld.
+    let out = harness.scrim(
+        &[
+            "clone",
+            "team/empty.git",
+            "empty-dest",
+            "--remote",
+            "scrim",
+            "--no-checkout",
+        ],
+        &work,
+        &config,
+        &[
+            ("SCRIM_TOKEN", CLONE_TOKEN),
+            ("SCRIM_SERVER", &server.url()),
+        ],
+    );
+    assert_success(&out, "scrim clone empty repo");
+    let stdout = stdout_str(&out);
+    assert!(stdout.contains("Partial clone: not needed"));
+    assert!(stdout.contains("Private-file filter: not needed"));
+    assert!(stdout.contains("Checkout: skipped (--no-checkout)"));
+    let empty = work.join("empty-dest");
+    assert_eq!(
+        git_stdout(&empty, &["config", "--local", "--get", "remote.scrim.url"]),
+        Some(format!("{}/team/empty.git", server.url()))
+    );
+    assert_eq!(
+        git_stdout(
+            &empty,
+            &["config", "--local", "--get", "remote.scrim.promisor"]
+        ),
+        None
+    );
+    let out = harness.scrim(
+        &["clone", "team/empty.git", "empty-checkout"],
+        &work,
+        &config,
+        &[
+            ("SCRIM_TOKEN", CLONE_TOKEN),
+            ("SCRIM_SERVER", &server.url()),
+        ],
+    );
+    assert_success(&out, "scrim clone empty repo with checkout");
+    assert!(stdout_str(&out).contains("Checkout: skipped (empty repository)"));
+    let _ = server.take_requests();
+
+    // Rejected sources, auth failures and token/server mismatches create
+    // nothing; local validation never contacts the server.
+    let wrong_token = harness.scrim(
+        &["clone", &source, "denied"],
+        &work,
+        &config,
+        &[("SCRIM_TOKEN", "wrong")],
+    );
+    assert!(!wrong_token.status.success());
+    assert!(stderr_str(&wrong_token).contains("invalid or missing token"));
+    assert!(!work.join("denied").exists());
+    assert_eq!(server.take_requests().len(), 1);
+
+    let with_credentials = format!("http://alice:pw@{}/team/app.git", server.addr);
+    let other_server = "http://other.invalid:9";
+    for (args, extra, expected) in [
+        (
+            vec!["clone", with_credentials.as_str()],
+            vec![("SCRIM_TOKEN", CLONE_TOKEN)],
+            "embedded credentials",
+        ),
+        (
+            vec!["clone", &source, "--branch=-x"],
+            vec![("SCRIM_TOKEN", CLONE_TOKEN)],
+            "must not start with '-'",
+        ),
+        (
+            vec!["clone", "team/../app.git"],
+            vec![("SCRIM_TOKEN", CLONE_TOKEN), ("SCRIM_SERVER", other_server)],
+            "invalid repository key",
+        ),
+        (
+            vec!["clone", &source],
+            vec![("SCRIM_TOKEN", CLONE_TOKEN), ("SCRIM_SERVER", other_server)],
+            "is not on the server given by --server",
+        ),
+        (
+            vec!["clone", "team/app.git"],
+            vec![("SCRIM_TOKEN", CLONE_TOKEN)],
+            "no server URL configured",
+        ),
+    ] {
+        let out = harness.scrim(&args, &work, &config, &extra);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(
+            stderr_str(&out).contains(expected),
+            "{args:?}: expected {expected:?} in {}",
+            stderr_str(&out)
+        );
+    }
+
+    // A token saved for another server is never sent to the pasted URL's host.
+    let saved_cfg = tmp.path().join("saved-cfg");
+    must(fs::create_dir_all(&saved_cfg), "mkdir saved cfg");
+    let saved_config = saved_cfg.join("config.toml");
+    must(
+        fs::write(
+            &saved_config,
+            format!("server = \"{other_server}\"\ntoken = \"{CLONE_TOKEN}\"\n"),
+        ),
+        "write saved config",
+    );
+    let out = harness.scrim(&["clone", &source, "mismatch"], &work, &saved_config, &[]);
+    assert!(!out.status.success());
+    assert!(stderr_str(&out).contains("the saved token is for http://other.invalid:9"));
+    assert!(server.take_requests().is_empty());
+    assert!(!work.join("mismatch").exists());
+}
+
+#[test]
+fn private_withhold_commands_call_path_rule_endpoints_and_update_sparse_checkout() {
+    let withholds_billing = Arc::new(AtomicBool::new(true));
+    let withholds_billing_bg = Arc::clone(&withholds_billing);
+    let server = MockServer::start(move |req| {
+        match (req.method.as_str(), req.target.as_str()) {
+            ("PUT", "/api/v1/path-rules") => {
+                let parsed: serde_json::Value =
+                    must(serde_json::from_str(&req.body), "parse path rule put");
+                assert_eq!(parsed["repository"], serde_json::json!("org/app.git"));
+                assert_eq!(parsed["pattern"], serde_json::json!("config/billing/**"));
+                assert_eq!(parsed["groups"], serde_json::json!(["finance", "ops"]));
+                (
+                    200,
+                    r#"{"repository":"org/app.git","pattern":"config/billing/**","groups":["finance","ops"]}"#
+                        .to_owned(),
+                )
+            }
+            ("GET", "/api/v1/path-rules?repo=org%2Fapp.git") => (
+                200,
+                r#"{"repository":"org/app.git","rules":[{"pattern":"config/billing/**","groups":["finance","ops"]}]}"#
+                    .to_owned(),
+            ),
+            ("GET", "/api/v1/path-rules?repo=empty%2Fapp.git") => (
+                200,
+                r#"{"repository":"empty/app.git","rules":[]}"#.to_owned(),
+            ),
+            ("DELETE", "/api/v1/path-rules?repo=org%2Fapp.git&pattern=config%2Fbilling%2F**") => (
+                200,
+                r#"{"repository":"org/app.git","pattern":"config/billing/**","removed":true}"#
+                    .to_owned(),
+            ),
+            ("DELETE", "/api/v1/path-rules?repo=org%2Fapp.git&pattern=missing%2F**") => (
+                200,
+                r#"{"repository":"org/app.git","pattern":"missing/**","removed":false}"#
+                    .to_owned(),
+            ),
+            ("GET", "/api/v1/path-rules/me?repo=org%2Fapp.git") => {
+                if withholds_billing_bg.load(Ordering::SeqCst) {
+                    (
+                        200,
+                        r#"{"repository":"org/app.git","withheld_patterns":["config/billing/**"],"sparse_checkout_patterns":["/*","!/config/billing/**"]}"#
+                            .to_owned(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"repository":"org/app.git","withheld_patterns":[],"sparse_checkout_patterns":[]}"#
+                            .to_owned(),
+                    )
+                }
+            }
+            _ => (404, r#"{"error":"not found"}"#.to_owned()),
+        }
+    });
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let harness = GitHarness::new(tmp.path());
+    let config = tmp.path().join("config.toml");
+    must(
+        fs::write(&config, "token = \"scrim_tok\"\n"),
+        "write config.toml",
+    );
+    let repo = harness.init_repo(tmp.path(), "app", &config);
+    harness.git_ok(
+        &["config", "scrim.repo", "org/app.git"],
+        &repo,
+        &config,
+        &[],
+    );
+    harness.git_ok(
+        &["config", "scrim.server", &server.url()],
+        &repo,
+        &config,
+        &[],
+    );
+    must(
+        fs::write(repo.join("README.md"), "public\n"),
+        "write README",
+    );
+    must(
+        fs::create_dir_all(repo.join("config/billing")),
+        "mkdir billing",
+    );
+    must(
+        fs::write(repo.join("config/billing/rates.json"), "{}\n"),
+        "write rates",
+    );
+    harness.git_ok(&["add", "-A"], &repo, &config, &[]);
+    harness.git_ok(&["commit", "-q", "-m", "initial"], &repo, &config, &[]);
+
+    // Local validation and argument conflicts never reach the server.
+    for (args, expected) in [
+        (
+            vec!["private", "add", "../x", "--group", "finance", "--withhold"],
+            "'..'",
+        ),
+        (
+            vec![
+                "private",
+                "add",
+                "config/**",
+                "--group",
+                "bad group",
+                "--withhold",
+            ],
+            "group",
+        ),
+        (
+            vec!["private", "rm", "/abs/**", "--withhold"],
+            "must not start with '/'",
+        ),
+        (
+            vec![
+                "private",
+                "add",
+                "config/**",
+                "--group",
+                "finance",
+                "--withhold",
+                "--offline",
+            ],
+            "cannot be used with",
+        ),
+        (
+            vec![
+                "private",
+                "add",
+                "config/**",
+                "--group",
+                "finance",
+                "--group",
+                "ops",
+            ],
+            "single group key",
+        ),
+        (
+            vec!["private", "status", "--repo", "org/app.git"],
+            "--withhold",
+        ),
+    ] {
+        let out = harness.scrim(&args, &repo, &config, &[]);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(
+            stderr_str(&out).contains(expected),
+            "{args:?}: expected {expected:?} in {}",
+            stderr_str(&out)
+        );
+    }
+    assert!(server.take_requests().is_empty());
+
+    let out = harness.scrim(
+        &[
+            "private",
+            "add",
+            "config/billing/**",
+            "--group",
+            "finance",
+            "--group",
+            "ops",
+            "--withhold",
+        ],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&out, "private add --withhold");
+    assert_eq!(
+        stdout_str(&out),
+        "Withholding 'config/billing/**' in org/app.git from everyone except groups: finance, ops\n"
+    );
+    // Withholding is server-side only: no local encryption state is written.
+    assert!(!repo.join(".scrim").exists());
+    assert!(!repo.join(".gitattributes").exists());
+
+    let out = harness.scrim(&["private", "status", "--withhold"], &repo, &config, &[]);
+    assert_success(&out, "private status --withhold");
+    assert_eq!(
+        stdout_str(&out),
+        "Withholding rules for org/app.git:\n  config/billing/** -> finance, ops\n"
+    );
+    let out = harness.scrim(
+        &["private", "status", "--withhold", "--repo", "empty/app.git"],
+        tmp.path(),
+        &config,
+        &[("SCRIM_SERVER", &server.url())],
+    );
+    assert_success(&out, "private status --withhold --repo");
+    assert_eq!(
+        stdout_str(&out),
+        "Withholding rules for empty/app.git:\n  (none)\n"
+    );
+
+    let out = harness.scrim(
+        &["private", "rm", "config/billing/**", "--withhold"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&out, "private rm --withhold");
+    assert!(
+        stdout_str(&out).contains("Removed withholding rule 'config/billing/**' from org/app.git")
+    );
+    let out = harness.scrim(
+        &["private", "rm", "missing/**", "--withhold"],
+        &repo,
+        &config,
+        &[],
+    );
+    assert_success(&out, "private rm --withhold missing");
+    assert!(stdout_str(&out).contains("No withholding rule 'missing/**' found in org/app.git"));
+
+    let requests = server.take_requests();
+    let targets: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|req| (req.method.as_str(), req.target.as_str()))
+        .collect();
+    assert_eq!(
+        targets,
+        vec![
+            ("PUT", "/api/v1/path-rules"),
+            ("GET", "/api/v1/path-rules?repo=org%2Fapp.git"),
+            ("GET", "/api/v1/path-rules?repo=empty%2Fapp.git"),
+            (
+                "DELETE",
+                "/api/v1/path-rules?repo=org%2Fapp.git&pattern=config%2Fbilling%2F**"
+            ),
+            (
+                "DELETE",
+                "/api/v1/path-rules?repo=org%2Fapp.git&pattern=missing%2F**"
+            ),
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|req| req.authorization.as_deref() == Some("Bearer scrim_tok"))
+    );
+
+    // `setup --withhold` narrows the sparse checkout to exclude withheld paths...
+    let out = harness.scrim(&["private", "setup", "--withhold"], &repo, &config, &[]);
+    assert_success(&out, "private setup --withhold");
+    let stdout = stdout_str(&out);
+    assert!(stdout.contains("Configured Git filter 'scrim' for this repository"));
+    assert!(stdout.contains("Sparse checkout: excluding 1 withheld pattern(s)"));
+    assert!(repo.join("README.md").is_file());
+    assert!(!repo.join("config/billing/rates.json").exists());
+    assert_eq!(
+        git_stdout(&repo, &["config", "--get", "core.sparseCheckout"]).as_deref(),
+        Some("true")
+    );
+
+    // ...and disables it again once nothing is withheld.
+    withholds_billing.store(false, Ordering::SeqCst);
+    let out = harness.scrim(&["private", "setup", "--withhold"], &repo, &config, &[]);
+    assert_success(&out, "private setup --withhold (nothing withheld)");
+    assert!(stdout_str(&out).contains("Sparse checkout: disabled (no paths withheld from you)"));
+    assert!(repo.join("config/billing/rates.json").is_file());
+    let out = harness.scrim(&["private", "setup", "--withhold"], &repo, &config, &[]);
+    assert_success(&out, "private setup --withhold (already full)");
+    assert!(stdout_str(&out).contains("Sparse checkout: not needed (no paths withheld from you)"));
+
+    // Plain `setup` stays offline.
+    let _ = server.take_requests();
+    let out = harness.scrim(&["private", "setup"], &repo, &config, &[]);
+    assert_success(&out, "private setup");
+    assert!(!stdout_str(&out).contains("Sparse checkout"));
+    assert!(server.take_requests().is_empty());
 }

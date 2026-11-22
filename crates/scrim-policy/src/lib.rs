@@ -11,6 +11,12 @@
 //! files. Rules are compiled into a [`PathPolicy`], which resolves the
 //! protecting group for any repository-relative path and fails closed if
 //! overlapping rules map a path to multiple distinct groups.
+//!
+//! A [`WithholdRule`] maps a `.gitattributes`-compatible path glob to one or
+//! more groups whose members may receive matching blobs from `scrim-server`.
+//! Rules are compiled into a [`WithholdPolicy`], which evaluates per-member
+//! withholding by intersection across overlapping rules and generates Git
+//! non-cone sparse-checkout exclusions for partial clones.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
@@ -20,6 +26,7 @@ mod branch_policy;
 mod path_glob;
 mod path_policy;
 mod ref_glob;
+mod withhold_policy;
 
 pub use branch_policy::{BranchPolicy, BranchRule, HiddenRefPlan};
 pub use path_glob::{
@@ -28,6 +35,7 @@ pub use path_glob::{
 };
 pub use path_policy::{PathPolicy, PathRule};
 pub use ref_glob::{MAX_REF_GLOB_BYTES, validate_ref_glob};
+pub use withhold_policy::{WithholdPolicy, WithholdRule};
 
 /// Errors produced while validating or compiling branch and path rules.
 #[derive(Debug, thiserror::Error)]

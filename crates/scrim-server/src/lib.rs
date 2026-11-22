@@ -10,6 +10,10 @@
 //! which authorizes each ref write exactly, refuses hidden objects smuggled in
 //! by ID, blocks merges that would expose private commits, and rejects pushes
 //! introducing plaintext `.env` files or high-confidence credentials.
+//! Members with withheld paths fetch through the server-owned `pack-objects`
+//! hook (see [`run_pack_objects_hook_process`]), which leaves out every blob
+//! reached only at a withheld path, and the `pre-receive` guard keeps them
+//! from writing withheld paths or republishing withheld blobs.
 //!
 //! The same authenticated router serves the admin API under `/api/v1` (see
 //! [`MAX_ADMIN_BODY_BYTES`]), through which admins manage members, tokens,
@@ -22,6 +26,7 @@
 mod admin_api;
 mod auth;
 mod git_service;
+mod pack_withhold;
 mod policy_store;
 mod pre_receive;
 mod repo_path;
@@ -49,14 +54,18 @@ use git_service::{
     GitService, GitVisibilityConfig, advertise_refs, list_repo_refs, sanitize_git_protocol,
     serve_rpc,
 };
+pub use pack_withhold::{
+    PACK_OBJECTS_HOOK_MODE, PACK_OBJECTS_HOOK_MODE_ENV, run_pack_objects_hook_process,
+};
+use pack_withhold::{PackWithholdContext, start_pack_withhold_session};
 pub use policy_store::{
     API_TOKEN_PREFIX, AuditLogEntry, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
     CreatedMember, GroupMembershipChange, GroupRecipientsRecord, GroupRecord, GroupWithMembers,
     IssuedToken, MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES, MAX_SCOPE_NAME_BYTES,
     MAX_TOKEN_LABEL_BYTES, MemberPublicKeyRecord, MemberRecord, MemberRepoPolicy,
-    MemoryPolicyStore, PgPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture,
-    RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult, ScopeRecipient,
-    ScopeRecipientsRecord, SecretScopeRecord, StaticPolicyStore,
+    MemoryPolicyStore, PathRuleRecord, PgPolicyStore, PolicyStore, PolicyStoreError,
+    PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult,
+    ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord, StaticPolicyStore,
 };
 pub use pre_receive::{
     ALLOW_MERGE_LEAK_PUSH_OPTION, ALLOW_SECRET_SCAN_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE,
@@ -129,9 +138,10 @@ pub fn router_with_policy_store(repo_root: PathBuf, policy_store: Arc<dyn Policy
 struct AppState {
     repo_root: PathBuf,
     policy_store: Arc<dyn PolicyStore>,
-    /// Created on the first push rather than with the router, so routers
-    /// that never accept a push (and `cargo test --lib`, where the server
-    /// binary may not be built) do not need the hook binary. Replaced when
+    /// Created on the first push (or fetch with withheld paths) rather than
+    /// with the router, so routers that never need a hook (and `cargo test
+    /// --lib`, where the server binary may not be built) do not need the hook
+    /// binary. Replaced when
     /// its hook is no longer installed; see [`current_hook_dir`].
     hook_dir: Arc<tokio::sync::Mutex<Option<Arc<HookDir>>>>,
 }
@@ -299,6 +309,32 @@ async fn route_request(state: &AppState, request: Request) -> Response {
             .await
             .map(|body| (service, "advertisement", body))
     } else {
+        let pack_withhold = if service == GitService::UploadPack
+            && policy
+                .withhold_policy
+                .has_withheld_rules(&policy.member_groups)
+        {
+            let hook_dir = match current_hook_dir(&state.hook_dir).await {
+                Ok(hook_dir) => hook_dir,
+                Err(error) => {
+                    tracing::error!(%error, "cannot set up the pack-objects hook");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let context = PackWithholdContext {
+                repo_dir: resolved_repo.dir.clone(),
+                policy: policy.clone(),
+            };
+            match start_pack_withhold_session(hook_dir, context).await {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    tracing::error!(%error, "cannot start the pack-objects callback");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        } else {
+            None
+        };
         let pre_receive = if service == GitService::ReceivePack {
             let hook_dir = match current_hook_dir(&state.hook_dir).await {
                 Ok(hook_dir) => hook_dir,
@@ -331,6 +367,7 @@ async fn route_request(state: &AppState, request: Request) -> Response {
             &visibility,
             body,
             pre_receive,
+            pack_withhold,
         )
         .map(|body| (service, "result", body))
     };
@@ -356,8 +393,11 @@ enum Visibility {
 
 /// Decides what `policy`'s member may see in the repository at `repo_dir`.
 ///
-/// A member who satisfies every rule sees everything, at no extra cost.
-/// Otherwise the repository's refs are listed and `HEAD` is re-read (as close
+/// A member who satisfies every branch and withholding rule sees everything,
+/// at no extra cost. A member with withheld paths but no hidden refs gets
+/// `enforce_visibility` alone: git then speaks protocol v0, whose wants are
+/// limited to advertised tips, and `deepen-not` is refused. Otherwise the
+/// repository's refs are listed and `HEAD` is re-read (as close
 /// to starting git as possible), and:
 /// - a symbolic `HEAD` whose chain reaches a hidden ref is refused outright:
 ///   `transfer.hideRefs` cannot hide it, and git would still advertise its
@@ -372,7 +412,13 @@ async fn compute_visibility(
 ) -> std::io::Result<Visibility> {
     let plan = policy.branch_policy.hidden_ref_plan(&policy.member_groups);
     if !plan.has_unsatisfied_rules() {
-        return Ok(Visibility::Allowed(GitVisibilityConfig::default()));
+        let has_withheld_paths = policy
+            .withhold_policy
+            .has_withheld_rules(&policy.member_groups);
+        return Ok(Visibility::Allowed(GitVisibilityConfig {
+            hidden_refs: Vec::new(),
+            enforce_visibility: has_withheld_paths,
+        }));
     }
 
     let repo_refs = match list_repo_refs(repo_dir).await {

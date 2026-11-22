@@ -19,7 +19,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use scrim_policy::{BranchPolicy, BranchRule, PolicyError};
+use scrim_policy::{
+    BranchPolicy, BranchRule, MAX_PATH_RULES, PolicyError, WithholdPolicy, WithholdRule,
+    validate_path_glob,
+};
 use secrecy::SecretString;
 use sqlx::{
     PgConnection, PgPool, Postgres, Transaction,
@@ -78,6 +81,8 @@ pub struct MemberRepoPolicy {
     pub member_groups: BTreeSet<String>,
     /// The repository's compiled branch rules (empty if it has none).
     pub branch_policy: BranchPolicy,
+    /// The repository's compiled path withholding rules (empty if it has none).
+    pub withhold_policy: WithholdPolicy,
 }
 
 /// One append-only entry written to `audit_log`.
@@ -250,6 +255,17 @@ pub struct BranchRuleRecord {
     pub groups: Vec<String>,
 }
 
+/// One server-enforced path withholding rule of a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathRuleRecord {
+    /// Canonical key of the repository the rule belongs to.
+    pub repository: String,
+    /// The rule's repo-relative path glob, e.g. `config/billing/**` or `*.secret`.
+    pub pattern: String,
+    /// Groups allowed to read matching paths, sorted ascending.
+    pub groups: Vec<String>,
+}
+
 /// One secret scope of a repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretScopeRecord {
@@ -312,6 +328,14 @@ pub enum PolicyStoreError {
         /// Why the rule was rejected.
         source: PolicyError,
     },
+    /// A path withholding rule stored for a repository failed validation, so
+    /// the whole policy is rejected rather than served with a rule missing.
+    InvalidPathRule {
+        /// The offending path glob (or empty when the rule set failed policy compilation).
+        path_glob: String,
+        /// Why the rule was rejected.
+        source: PolicyError,
+    },
     /// Any other internal failure, described by the message.
     Internal(String),
     /// An administrative change names a member, group, repository or rule
@@ -337,6 +361,9 @@ impl fmt::Display for PolicyStoreError {
                     "invalid branch rule for repository {repository:?}: {source}"
                 )
             }
+            Self::InvalidPathRule { path_glob, source } => {
+                write!(f, "invalid path rule for glob {path_glob:?}: {source}")
+            }
             Self::Internal(message) => write!(f, "policy store error: {message}"),
             Self::NotFound(message)
             | Self::Conflict(message)
@@ -350,7 +377,9 @@ impl std::error::Error for PolicyStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
-            Self::InvalidBranchRule { source, .. } => Some(source),
+            Self::InvalidBranchRule { source, .. } | Self::InvalidPathRule { source, .. } => {
+                Some(source)
+            }
             Self::Internal(_)
             | Self::NotFound(_)
             | Self::Conflict(_)
@@ -395,12 +424,12 @@ pub trait PolicyStore: Send + Sync + 'static {
         token_hash: &'a [u8; 32],
     ) -> PolicyStoreFuture<'a, Option<AuthenticatedMember>>;
 
-    /// Loads `member_id`'s groups and the branch rules of the repository whose
-    /// canonical key is `repo_key`. A repository without rules yields an empty
-    /// policy, so every ref stays visible.
+    /// Loads `member_id`'s groups and the branch and path withholding rules of
+    /// the repository whose canonical key is `repo_key`. A repository without
+    /// rules yields empty policies, so every ref and path stays visible.
     ///
-    /// Fails with [`PolicyStoreError::InvalidBranchRule`] if any stored rule
-    /// is invalid.
+    /// Fails with [`PolicyStoreError::InvalidBranchRule`] or
+    /// [`PolicyStoreError::InvalidPathRule`] if any stored rule is invalid.
     fn load_member_repo_policy<'a>(
         &'a self,
         member_id: i64,
@@ -560,6 +589,45 @@ pub trait PolicyStore: Send + Sync + 'static {
         unsupported()
     }
 
+    /// Creates or replaces the path withholding rule restricting paths matching
+    /// `pattern` in `repository` to the (non-empty) `groups`.
+    ///
+    /// [`PolicyStoreError::NotFound`] if the repository is not registered or
+    /// a group does not exist; [`PolicyStoreError::InvalidInput`] if adding a
+    /// new pattern would exceed [`MAX_PATH_RULES`].
+    fn set_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, PathRuleRecord> {
+        let _ = (actor_member_id, repository, pattern, groups);
+        unsupported()
+    }
+
+    /// Lists `repository`'s path withholding rules sorted by pattern;
+    /// [`PolicyStoreError::NotFound`] if it is not registered.
+    fn list_path_rules<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<PathRuleRecord>> {
+        let _ = repository;
+        unsupported()
+    }
+
+    /// Removes the path withholding rule `pattern` from `repository`, returning
+    /// `true`; [`PolicyStoreError::NotFound`] if either does not exist.
+    fn remove_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        let _ = (actor_member_id, repository, pattern);
+        unsupported()
+    }
+
     /// Creates the first admin, `name`, with a token labelled `token_label`.
     ///
     /// [`PolicyStoreError::Conflict`] if any active admin already exists (or
@@ -676,6 +744,41 @@ fn compile_branch_policy(
             repository: repo_key.to_owned(),
             source,
         }),
+    }
+}
+
+/// Validates and compiles `(pattern, allowed_groups)` pairs into a
+/// [`WithholdPolicy`], mapping any rejected rule to
+/// [`PolicyStoreError::InvalidPathRule`].
+fn compile_withhold_policy(
+    rules: impl IntoIterator<Item = (String, BTreeSet<String>)>,
+) -> Result<WithholdPolicy, PolicyStoreError> {
+    let mut compiled_input = Vec::new();
+    for (pattern, allowed_groups) in rules {
+        match WithholdRule::new(pattern.clone(), allowed_groups) {
+            Ok(rule) => compiled_input.push(rule),
+            Err(source) => {
+                return Err(PolicyStoreError::InvalidPathRule {
+                    path_glob: pattern,
+                    source,
+                });
+            }
+        }
+    }
+    match WithholdPolicy::compile(compiled_input) {
+        Ok(policy) => Ok(policy),
+        Err(source) => {
+            let path_glob = match &source {
+                PolicyError::InvalidPathGlob { pattern, .. }
+                | PolicyError::DuplicatePathRule { pattern }
+                | PolicyError::GlobCompile { pattern, .. } => pattern.clone(),
+                PolicyError::InvalidRefGlob { .. }
+                | PolicyError::InvalidGroupName { .. }
+                | PolicyError::TooManyPathRules { .. }
+                | PolicyError::AmbiguousPathRule { .. } => String::new(),
+            };
+            Err(PolicyStoreError::InvalidPathRule { path_glob, source })
+        }
     }
 }
 
@@ -865,6 +968,34 @@ fn validate_branch_rule(
     Ok(rule)
 }
 
+/// Validates `pattern` and `groups` as a path withholding rule and returns it.
+fn validate_path_rule(
+    pattern: &str,
+    groups: &BTreeSet<String>,
+) -> Result<WithholdRule, PolicyStoreError> {
+    if groups.is_empty() {
+        return Err(PolicyStoreError::InvalidInput(
+            "a path rule needs at least one group".to_owned(),
+        ));
+    }
+    for group in groups {
+        if let Err(error) = validate_group_name(group) {
+            return Err(error);
+        }
+    }
+    if let Err(error) = validate_path_glob(pattern) {
+        return Err(PolicyStoreError::InvalidInput(error.to_string()));
+    }
+    let rule = match WithholdRule::new(pattern, groups.iter().cloned()) {
+        Ok(rule) => rule,
+        Err(error) => return Err(PolicyStoreError::InvalidInput(error.to_string())),
+    };
+    if let Err(error) = WithholdPolicy::compile([rule.clone()]) {
+        return Err(PolicyStoreError::InvalidInput(error.to_string()));
+    }
+    Ok(rule)
+}
+
 /// Validates `scope` and `groups` for a secret scope.
 fn validate_secret_scope(scope: &str, groups: &BTreeSet<String>) -> Result<(), PolicyStoreError> {
     if let Err(error) = validate_scope_name(scope) {
@@ -980,6 +1111,7 @@ impl PolicyStore for StaticPolicyStore {
                 Ok(branch_policy) => Ok(MemberRepoPolicy {
                     member_groups: BTreeSet::new(),
                     branch_policy,
+                    withhold_policy: WithholdPolicy::empty(),
                 }),
                 Err(error) => Err(error),
             }
@@ -1043,6 +1175,7 @@ struct MemoryState {
     groups_by_member: BTreeMap<i64, BTreeSet<String>>,
     repository_ids: BTreeMap<String, i64>,
     rules_by_repository: BTreeMap<String, Vec<BranchRule>>,
+    path_rules_by_repository: BTreeMap<String, Vec<WithholdRule>>,
     secret_scopes_by_repository: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     audit_log: Vec<AuditLogEntry>,
     /// Highest ID handed out (or inserted), shared by all kinds of rows.
@@ -1262,6 +1395,22 @@ impl MemoryPolicyStore {
             .push(rule);
     }
 
+    /// Attaches path withholding `rule` to the repository with canonical key
+    /// `repo_key`, registering the repository if needed.
+    pub fn insert_path_rule(&mut self, repo_key: impl Into<String>, rule: WithholdRule) {
+        let repo_key = repo_key.into();
+        let mut state = self.setup_state();
+        if !state.repository_ids.contains_key(&repo_key) {
+            let repository_id = state.next_id();
+            state.repository_ids.insert(repo_key.clone(), repository_id);
+        }
+        state
+            .path_rules_by_repository
+            .entry(repo_key)
+            .or_default()
+            .push(rule);
+    }
+
     /// Returns a copy of every audit entry recorded so far (by this store or
     /// any clone of it), oldest first. Reading only copies the log, so a
     /// poisoned lock still returns what was recorded.
@@ -1309,13 +1458,27 @@ impl PolicyStore for MemoryPolicyStore {
                 Some(rules) => rules.clone(),
                 None => Vec::new(),
             };
-            match compile_branch_policy(repo_key, rules) {
-                Ok(branch_policy) => Ok(MemberRepoPolicy {
-                    member_groups: state.member_groups(member_id),
-                    branch_policy,
-                }),
-                Err(error) => Err(error),
-            }
+            let path_rules: Vec<(String, BTreeSet<String>)> =
+                match state.path_rules_by_repository.get(repo_key) {
+                    Some(rules) => rules
+                        .iter()
+                        .map(|rule| (rule.pattern.clone(), rule.allowed_groups.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                };
+            let branch_policy = match compile_branch_policy(repo_key, rules) {
+                Ok(branch_policy) => branch_policy,
+                Err(error) => return Err(error),
+            };
+            let withhold_policy = match compile_withhold_policy(path_rules) {
+                Ok(withhold_policy) => withhold_policy,
+                Err(error) => return Err(error),
+            };
+            Ok(MemberRepoPolicy {
+                member_groups: state.member_groups(member_id),
+                branch_policy,
+                withhold_policy,
+            })
         }))
     }
 
@@ -1731,6 +1894,108 @@ impl PolicyStore for MemoryPolicyStore {
         }))
     }
 
+    fn set_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, PathRuleRecord> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        let rule = match validate_path_rule(pattern, &groups) {
+            Ok(rule) => rule,
+            Err(error) => return ready(Err(error)),
+        };
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            if let Err(error) = state.require_groups(&groups) {
+                return Err(error);
+            }
+            let rules = state
+                .path_rules_by_repository
+                .entry(repository.to_owned())
+                .or_default();
+            let exists = rules.iter().any(|existing| existing.pattern == pattern);
+            if !exists && rules.len() >= MAX_PATH_RULES {
+                return Err(too_many_path_rules_error());
+            }
+            rules.retain(|existing| existing.pattern != pattern);
+            rules.push(rule);
+            let record = PathRuleRecord {
+                repository: repository.to_owned(),
+                pattern: pattern.to_owned(),
+                groups: groups.into_iter().collect(),
+            };
+            state
+                .audit_log
+                .push(set_path_rule_audit(actor_member_id, &record));
+            Ok(record)
+        }))
+    }
+
+    fn list_path_rules<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<PathRuleRecord>> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            let mut rules: Vec<PathRuleRecord> =
+                match state.path_rules_by_repository.get(repository) {
+                    Some(rules) => rules
+                        .iter()
+                        .map(|rule| PathRuleRecord {
+                            repository: repository.to_owned(),
+                            pattern: rule.pattern.clone(),
+                            groups: rule.allowed_groups.iter().cloned().collect(),
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+            rules.sort_by(|left, right| left.pattern.cmp(&right.pattern));
+            Ok(rules)
+        }))
+    }
+
+    fn remove_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        if let Err(error) = validate_repository_path(repository) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if let Err(error) = state.require_repository(repository) {
+                return Err(error);
+            }
+            let removed = match state.path_rules_by_repository.get_mut(repository) {
+                Some(rules) => {
+                    let count_before = rules.len();
+                    rules.retain(|rule| rule.pattern != pattern);
+                    rules.len() != count_before
+                }
+                None => false,
+            };
+            if !removed {
+                return Err(path_rule_not_found_error());
+            }
+            state
+                .audit_log
+                .push(remove_path_rule_audit(actor_member_id, repository, pattern));
+            Ok(true)
+        }))
+    }
+
     fn bootstrap_admin<'a>(
         &'a self,
         name: &'a str,
@@ -2039,6 +2304,16 @@ fn branch_rule_not_found_error() -> PolicyStoreError {
     PolicyStoreError::NotFound("branch rule not found".to_owned())
 }
 
+fn path_rule_not_found_error() -> PolicyStoreError {
+    PolicyStoreError::NotFound("path rule not found".to_owned())
+}
+
+fn too_many_path_rules_error() -> PolicyStoreError {
+    PolicyStoreError::InvalidInput(format!(
+        "too many path rules for repository (maximum is {MAX_PATH_RULES})"
+    ))
+}
+
 fn secret_scope_not_found_error() -> PolicyStoreError {
     PolicyStoreError::NotFound("secret scope not found".to_owned())
 }
@@ -2178,6 +2453,34 @@ fn remove_branch_rule_audit(
         actor_member_id,
         "branch_rule.remove",
         "branch_rule",
+        format!("{repository}:{pattern}"),
+        serde_json::json!({ "repository": repository, "pattern": pattern }),
+    )
+}
+
+fn set_path_rule_audit(actor_member_id: Option<i64>, record: &PathRuleRecord) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "path_rule.set",
+        "path_rule",
+        format!("{}:{}", record.repository, record.pattern),
+        serde_json::json!({
+            "repository": record.repository,
+            "pattern": record.pattern,
+            "groups": record.groups,
+        }),
+    )
+}
+
+fn remove_path_rule_audit(
+    actor_member_id: Option<i64>,
+    repository: &str,
+    pattern: &str,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "path_rule.remove",
+        "path_rule",
         format!("{repository}:{pattern}"),
         serde_json::json!({ "repository": repository, "pattern": pattern }),
     )
@@ -2549,6 +2852,23 @@ impl PolicyStore for PgPolicyStore {
                 Ok(rows) => rows,
                 Err(error) => return Err(PolicyStoreError::Database(error)),
             };
+
+            let path_rule_rows = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT pr.path_glob, g.name \
+                 FROM repositories r \
+                 JOIN path_rules pr ON pr.repository_id = r.id \
+                 LEFT JOIN path_rule_groups prg ON prg.path_rule_id = pr.id \
+                 LEFT JOIN groups g ON g.id = prg.group_id \
+                 WHERE r.path = $1",
+            )
+            .bind(repo_key)
+            .fetch_all(&mut *transaction)
+            .await;
+            let path_rule_rows = match path_rule_rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+
             if let Err(error) = commit(transaction).await {
                 return Err(error);
             }
@@ -2567,13 +2887,28 @@ impl PolicyStore for PgPolicyStore {
                     pattern,
                     allowed_groups,
                 });
-            match compile_branch_policy(repo_key, rules) {
-                Ok(branch_policy) => Ok(MemberRepoPolicy {
-                    member_groups,
-                    branch_policy,
-                }),
-                Err(error) => Err(error),
+            let branch_policy = match compile_branch_policy(repo_key, rules) {
+                Ok(branch_policy) => branch_policy,
+                Err(error) => return Err(error),
+            };
+
+            let mut path_groups_by_pattern: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (pattern, group) in path_rule_rows {
+                let allowed_groups = path_groups_by_pattern.entry(pattern).or_default();
+                if let Some(group) = group {
+                    allowed_groups.insert(group);
+                }
             }
+            let withhold_policy = match compile_withhold_policy(path_groups_by_pattern) {
+                Ok(withhold_policy) => withhold_policy,
+                Err(error) => return Err(error),
+            };
+
+            Ok(MemberRepoPolicy {
+                member_groups,
+                branch_policy,
+                withhold_policy,
+            })
         })
     }
 
@@ -3254,6 +3589,215 @@ impl PolicyStore for PgPolicyStore {
         })
     }
 
+    fn set_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+        groups: BTreeSet<String>,
+    ) -> PolicyStoreFuture<'a, PathRuleRecord> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            if let Err(error) = validate_path_rule(pattern, &groups) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            // Lock the repository row `FOR UPDATE` so concurrent inserts into
+            // `path_rules` serialize their `MAX_PATH_RULES` check.
+            let repository_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM repositories WHERE path = $1 FOR UPDATE",
+            )
+            .bind(repository)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let repository_id = match repository_id {
+                Ok(Some(repository_id)) => repository_id,
+                Ok(None) => return Err(repository_not_registered_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let group_ids = match find_group_ids(&mut transaction, &groups).await {
+                Ok(group_ids) => group_ids,
+                Err(error) => return Err(error),
+            };
+            let existing_rule_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM path_rules WHERE repository_id = $1 AND path_glob = $2",
+            )
+            .bind(repository_id)
+            .bind(pattern)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let existing_rule_id = match existing_rule_id {
+                Ok(id) => id,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if existing_rule_id.is_none() {
+                let rule_count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM path_rules WHERE repository_id = $1",
+                )
+                .bind(repository_id)
+                .fetch_one(&mut *transaction)
+                .await;
+                let rule_count = match rule_count {
+                    Ok(count) => count,
+                    Err(error) => return Err(PolicyStoreError::Database(error)),
+                };
+                let count = match usize::try_from(rule_count) {
+                    Ok(count) => count,
+                    Err(_) => return Err(too_many_path_rules_error()),
+                };
+                if count >= MAX_PATH_RULES {
+                    return Err(too_many_path_rules_error());
+                }
+            }
+            // The no-op update makes `RETURNING` yield the existing row's ID.
+            let rule_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO path_rules (repository_id, path_glob) VALUES ($1, $2) \
+                 ON CONFLICT (repository_id, path_glob) DO UPDATE SET path_glob = EXCLUDED.path_glob \
+                 RETURNING id",
+            )
+            .bind(repository_id)
+            .bind(pattern)
+            .fetch_one(&mut *transaction)
+            .await;
+            let rule_id = match rule_id {
+                Ok(rule_id) => rule_id,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if let Err(error) = sqlx::query("DELETE FROM path_rule_groups WHERE path_rule_id = $1")
+                .bind(rule_id)
+                .execute(&mut *transaction)
+                .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            if let Err(error) = sqlx::query(
+                "INSERT INTO path_rule_groups (path_rule_id, group_id) \
+                 SELECT $1, UNNEST($2::BIGINT[])",
+            )
+            .bind(rule_id)
+            .bind(group_ids)
+            .execute(&mut *transaction)
+            .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            let record = PathRuleRecord {
+                repository: repository.to_owned(),
+                pattern: pattern.to_owned(),
+                groups: groups.into_iter().collect(),
+            };
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                set_path_rule_audit(actor_member_id, &record),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(record)
+        })
+    }
+
+    fn list_path_rules<'a>(
+        &'a self,
+        repository: &'a str,
+    ) -> PolicyStoreFuture<'a, Vec<PathRuleRecord>> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT pr.path_glob, g.name \
+                 FROM repositories r \
+                 LEFT JOIN path_rules pr ON pr.repository_id = r.id \
+                 LEFT JOIN path_rule_groups prg ON prg.path_rule_id = pr.id \
+                 LEFT JOIN groups g ON g.id = prg.group_id \
+                 WHERE r.path = $1 \
+                 ORDER BY pr.path_glob COLLATE \"C\", g.name COLLATE \"C\"",
+            )
+            .bind(repository)
+            .fetch_all(&self.pool)
+            .await;
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if rows.is_empty() {
+                return Err(repository_not_registered_error());
+            }
+            let mut rules: Vec<PathRuleRecord> = Vec::new();
+            for (pattern, group) in rows {
+                let Some(pattern) = pattern else {
+                    continue;
+                };
+                let is_same_rule = rules.last().is_some_and(|rule| rule.pattern == pattern);
+                if !is_same_rule {
+                    rules.push(PathRuleRecord {
+                        repository: repository.to_owned(),
+                        pattern,
+                        groups: Vec::new(),
+                    });
+                }
+                if let (Some(group), Some(rule)) = (group, rules.last_mut()) {
+                    rule.groups.push(group);
+                }
+            }
+            Ok(rules)
+        })
+    }
+
+    fn remove_path_rule<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        repository: &'a str,
+        pattern: &'a str,
+    ) -> PolicyStoreFuture<'a, bool> {
+        Box::pin(async move {
+            if let Err(error) = validate_repository_path(repository) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            let repository_id = match find_repository_id(&mut transaction, repository).await {
+                Ok(repository_id) => repository_id,
+                Err(error) => return Err(error),
+            };
+            let deleted =
+                sqlx::query("DELETE FROM path_rules WHERE repository_id = $1 AND path_glob = $2")
+                    .bind(repository_id)
+                    .bind(pattern)
+                    .execute(&mut *transaction)
+                    .await;
+            match deleted {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => return Err(path_rule_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            }
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                remove_path_rule_audit(actor_member_id, repository, pattern),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            if let Err(error) = commit(transaction).await {
+                return Err(error);
+            }
+            Ok(true)
+        })
+    }
+
     fn bootstrap_admin<'a>(
         &'a self,
         name: &'a str,
@@ -3700,10 +4244,11 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{
-        AGE_HRP_EXPANDED, API_TOKEN_PREFIX, AuditLogEntry, BECH32_CHARSET, MemoryPolicyStore,
-        PolicyStore, PolicyStoreError, bech32_decode_char, bech32_polymod, generate_api_token,
-        validate_age_public_key, validate_branch_rule, validate_group_name, validate_member_name,
-        validate_repository_path, validate_scope_name, validate_token_label,
+        AGE_HRP_EXPANDED, API_TOKEN_PREFIX, AuditLogEntry, BECH32_CHARSET, MAX_PATH_RULES,
+        MemoryPolicyStore, PolicyStore, PolicyStoreError, WithholdRule, bech32_decode_char,
+        bech32_polymod, generate_api_token, validate_age_public_key, validate_branch_rule,
+        validate_group_name, validate_member_name, validate_path_rule, validate_repository_path,
+        validate_scope_name, validate_token_label,
     };
     use crate::auth::sha256_zeroizing;
 
@@ -3940,6 +4485,89 @@ mod tests {
                 is_invalid_input(validate_age_public_key(invalid)),
                 "{invalid:?}"
             );
+        }
+    }
+
+    #[test]
+    fn path_rules_need_a_valid_glob_and_groups() {
+        let groups = ["core".to_owned()].into_iter().collect();
+        assert!(validate_path_rule("config/billing/**", &groups).is_ok());
+        assert!(validate_path_rule("*.secret", &groups).is_ok());
+        assert!(is_invalid_input(validate_path_rule("/abs/path", &groups)));
+        assert!(is_invalid_input(validate_path_rule(".scrim/**", &groups)));
+        assert!(is_invalid_input(validate_path_rule(
+            "config/[oops",
+            &groups
+        )));
+        assert!(is_invalid_input(validate_path_rule(
+            "config/**",
+            &Default::default()
+        )));
+        let bad_groups = ["not a group".to_owned()].into_iter().collect();
+        assert!(is_invalid_input(validate_path_rule(
+            "config/**",
+            &bad_groups
+        )));
+    }
+
+    #[tokio::test]
+    async fn memory_store_enforces_max_path_rules_and_allows_updates() {
+        let store = MemoryPolicyStore::new();
+        if let Err(error) = store.create_group(None, "core").await {
+            panic!("create_group failed: {error}");
+        }
+        if let Err(error) = store.create_group(None, "security").await {
+            panic!("create_group failed: {error}");
+        }
+        if let Err(error) = store.register_repository(None, "app.git").await {
+            panic!("register_repository failed: {error}");
+        }
+
+        let core: std::collections::BTreeSet<String> = ["core".to_owned()].into_iter().collect();
+        let security: std::collections::BTreeSet<String> =
+            ["security".to_owned()].into_iter().collect();
+        for i in 0..MAX_PATH_RULES {
+            if let Err(error) = store
+                .set_path_rule(None, "app.git", &format!("dir/file-{i}.txt"), core.clone())
+                .await
+            {
+                panic!("set_path_rule {i} failed: {error}");
+            }
+        }
+
+        // Inserting one more distinct pattern fails with InvalidInput.
+        assert!(is_invalid_input(
+            store
+                .set_path_rule(None, "app.git", "dir/overflow.txt", core.clone())
+                .await
+        ));
+
+        // Updating an existing pattern at MAX_PATH_RULES succeeds.
+        match store
+            .set_path_rule(None, "app.git", "dir/file-0.txt", security)
+            .await
+        {
+            Ok(record) => assert_eq!(record.groups, vec!["security".to_owned()]),
+            Err(error) => panic!("updating existing rule at limit failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_corrupt_path_rule_fails_closed() {
+        let mut store = MemoryPolicyStore::new();
+        store.insert_path_rule(
+            "app.git",
+            WithholdRule {
+                pattern: ".scrim/**".to_owned(),
+                allowed_groups: ["core".to_owned()].into_iter().collect(),
+            },
+        );
+        match store.load_member_repo_policy(1, "app.git").await {
+            Err(PolicyStoreError::InvalidPathRule { path_glob, .. }) => {
+                assert_eq!(path_glob, ".scrim/**");
+            }
+            Err(error) => panic!("expected InvalidPathRule, got: {error}"),
+            Ok(_) => panic!("corrupt path rule must fail closed"),
         }
     }
 }

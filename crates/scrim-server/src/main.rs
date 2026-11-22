@@ -5,7 +5,9 @@
 //!
 //! The same binary is git's `pre-receive` hook: started by `git receive-pack`
 //! with `SCRIM_HOOK_MODE=pre-receive`, it asks the running server for its
-//! verdict instead of serving.
+//! verdict instead of serving. Started by `git upload-pack` as
+//! `uploadpack.packObjectsHook` with `SCRIM_HOOK_MODE=pack-objects`, it builds
+//! the fetch's pack without the member's withheld blobs.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
@@ -21,8 +23,9 @@ use std::{
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use scrim_server::{
-    MAX_TOKEN_BYTES, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore,
-    SecretString, TokenAuth, run_pre_receive_hook_process,
+    MAX_TOKEN_BYTES, PACK_OBJECTS_HOOK_MODE, PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV,
+    PgPolicyStore, PolicyStore, SecretString, TokenAuth, run_pack_objects_hook_process,
+    run_pre_receive_hook_process,
 };
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
@@ -117,9 +120,13 @@ fn main() -> anyhow::Result<()> {
     // Checked before logging or argument parsing: in hook mode, stderr goes
     // to the pusher and git passes the hook no server arguments. The hook is
     // synchronous, so no async runtime is started for it.
-    if std::env::var_os(PRE_RECEIVE_HOOK_MODE_ENV).is_some_and(|mode| mode == PRE_RECEIVE_HOOK_MODE)
-    {
-        std::process::exit(run_pre_receive_hook_process());
+    if let Some(hook_mode) = std::env::var_os(PRE_RECEIVE_HOOK_MODE_ENV) {
+        if hook_mode == PRE_RECEIVE_HOOK_MODE {
+            std::process::exit(run_pre_receive_hook_process());
+        }
+        if hook_mode == PACK_OBJECTS_HOOK_MODE {
+            std::process::exit(run_pack_objects_hook_process());
+        }
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

@@ -26,8 +26,8 @@ use common::{GitSandbox, bearer_header};
 use http_body_util::BodyExt;
 use scrim_server::{
     AuditLogEntry, AuthenticatedMember, CreateMemberRequest, CreatedMember, GroupRecipientsRecord,
-    MemberPublicKeyRecord, PgPolicyStore, PolicyStore, PolicyStoreError, ScopeRecipient,
-    ScopeRecipientsRecord, SecretScopeRecord,
+    MemberPublicKeyRecord, PathRuleRecord, PgPolicyStore, PolicyStore, PolicyStoreError,
+    ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
 };
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -1322,6 +1322,254 @@ async fn administers_member_public_keys_and_secret_scopes() {
             && target_type == "secret_scope"
             && target_name == "team/app.git:prod"
     }));
+
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn administers_path_rules_and_loads_withhold_policy() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+    let admin = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let admin_id = Some(admin.member.id);
+
+    for group in ["core", "finance", "security"] {
+        if let Err(error) = store.create_group(admin_id, group).await {
+            panic!("create_group {group} failed: {error}");
+        }
+    }
+    let alice = create_member_ok(store, member_request("alice", false, &["finance"])).await;
+    let bob = create_member_ok(store, member_request("bob", false, &["core"])).await;
+
+    if let Err(error) = store.register_repository(admin_id, "team/app.git").await {
+        panic!("register team/app.git failed: {error}");
+    }
+    if let Err(error) = store.register_repository(admin_id, "alpha.git").await {
+        panic!("register alpha.git failed: {error}");
+    }
+
+    assert_not_found(
+        store
+            .set_path_rule(admin_id, "missing.git", "config/**", group_set(&["core"]))
+            .await,
+    );
+    assert_not_found(
+        store
+            .set_path_rule(
+                admin_id,
+                "team/app.git",
+                "config/**",
+                group_set(&["ghosts"]),
+            )
+            .await,
+    );
+    for invalid_pattern in ["/abs/secret", ".scrim/**", "config/[oops", ""] {
+        match store
+            .set_path_rule(
+                admin_id,
+                "team/app.git",
+                invalid_pattern,
+                group_set(&["core"]),
+            )
+            .await
+        {
+            Err(PolicyStoreError::InvalidInput(_)) => {}
+            Err(error) => panic!("expected InvalidInput for {invalid_pattern:?}: {error}"),
+            Ok(_) => panic!("invalid glob {invalid_pattern:?} was accepted"),
+        }
+    }
+    match store
+        .set_path_rule(admin_id, "team/app.git", "config/**", BTreeSet::new())
+        .await
+    {
+        Err(PolicyStoreError::InvalidInput(_)) => {}
+        Err(error) => panic!("expected InvalidInput for empty groups: {error}"),
+        Ok(_) => panic!("empty groups were accepted"),
+    }
+
+    match store
+        .set_path_rule(
+            admin_id,
+            "team/app.git",
+            "config/billing/**",
+            group_set(&["security", "finance"]),
+        )
+        .await
+    {
+        Ok(record) => assert_eq!(
+            record,
+            PathRuleRecord {
+                repository: "team/app.git".to_owned(),
+                pattern: "config/billing/**".to_owned(),
+                groups: vec!["finance".to_owned(), "security".to_owned()],
+            }
+        ),
+        Err(error) => panic!("set_path_rule failed: {error}"),
+    }
+    if let Err(error) = store
+        .set_path_rule(
+            admin_id,
+            "team/app.git",
+            "*.secret",
+            group_set(&["security"]),
+        )
+        .await
+    {
+        panic!("set_path_rule *.secret failed: {error}");
+    }
+
+    match store.list_path_rules("team/app.git").await {
+        Ok(rules) => assert_eq!(
+            rules,
+            vec![
+                PathRuleRecord {
+                    repository: "team/app.git".to_owned(),
+                    pattern: "*.secret".to_owned(),
+                    groups: vec!["security".to_owned()],
+                },
+                PathRuleRecord {
+                    repository: "team/app.git".to_owned(),
+                    pattern: "config/billing/**".to_owned(),
+                    groups: vec!["finance".to_owned(), "security".to_owned()],
+                },
+            ]
+        ),
+        Err(error) => panic!("list_path_rules failed: {error}"),
+    }
+    match store.list_path_rules("alpha.git").await {
+        Ok(rules) => assert!(rules.is_empty()),
+        Err(error) => panic!("list_path_rules alpha.git failed: {error}"),
+    }
+    assert_not_found(store.list_path_rules("missing.git").await);
+
+    let alice_policy = match store
+        .load_member_repo_policy(alice.member.id, "team/app.git")
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => panic!("load_member_repo_policy alice failed: {error}"),
+    };
+    assert_eq!(
+        alice_policy
+            .withhold_policy
+            .withheld_patterns(&alice_policy.member_groups),
+        vec!["*.secret"]
+    );
+    assert!(
+        !alice_policy
+            .withhold_policy
+            .is_path_withheld("config/billing/keys.json", &alice_policy.member_groups)
+    );
+    assert!(
+        alice_policy
+            .withhold_policy
+            .is_path_withheld("app/api.secret", &alice_policy.member_groups)
+    );
+
+    let bob_policy = match store
+        .load_member_repo_policy(bob.member.id, "team/app.git")
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => panic!("load_member_repo_policy bob failed: {error}"),
+    };
+    assert_eq!(
+        bob_policy
+            .withhold_policy
+            .sparse_checkout_patterns(&bob_policy.member_groups),
+        vec!["/*", "!*.secret", "!/config/billing/**"]
+    );
+
+    // Replace `config/billing/**` groups -> `["core"]`.
+    if let Err(error) = store
+        .set_path_rule(
+            admin_id,
+            "team/app.git",
+            "config/billing/**",
+            group_set(&["core"]),
+        )
+        .await
+    {
+        panic!("updating path_rule failed: {error}");
+    }
+    let alice_after = match store
+        .load_member_repo_policy(alice.member.id, "team/app.git")
+        .await
+    {
+        Ok(policy) => policy,
+        Err(error) => panic!("load_member_repo_policy alice failed: {error}"),
+    };
+    assert_eq!(
+        alice_after
+            .withhold_policy
+            .withheld_patterns(&alice_after.member_groups),
+        vec!["*.secret", "config/billing/**"]
+    );
+
+    // Delete `*.secret`.
+    match store
+        .remove_path_rule(admin_id, "team/app.git", "*.secret")
+        .await
+    {
+        Ok(removed) => assert!(removed),
+        Err(error) => panic!("remove_path_rule failed: {error}"),
+    }
+    assert_not_found(
+        store
+            .remove_path_rule(admin_id, "team/app.git", "*.secret")
+            .await,
+    );
+    assert_eq!(
+        isolated
+            .count("SELECT COUNT(*) FROM path_rule_groups")
+            .await,
+        1
+    );
+
+    let audit_rows = isolated.audit_rows().await;
+    assert!(audit_rows.iter().any(|(action, target_type, target_name)| {
+        action == "path_rule.set"
+            && target_type == "path_rule"
+            && target_name == "team/app.git:config/billing/**"
+    }));
+    assert!(audit_rows.iter().any(|(action, target_type, target_name)| {
+        action == "path_rule.remove"
+            && target_type == "path_rule"
+            && target_name == "team/app.git:*.secret"
+    }));
+
+    // Fail-closed: a corrupt path_rules row in PostgreSQL triggers InvalidPathRule.
+    let repo_id: i64 = match sqlx::query_scalar("SELECT id FROM repositories WHERE path = $1")
+        .bind("alpha.git")
+        .fetch_one(&isolated.pool)
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => panic!("failed to fetch alpha.git id: {error}"),
+    };
+    if let Err(error) =
+        sqlx::query("INSERT INTO path_rules (repository_id, path_glob) VALUES ($1, $2)")
+            .bind(repo_id)
+            .bind(".scrim/**")
+            .execute(&isolated.pool)
+            .await
+    {
+        panic!("failed to insert bad path_rule row: {error}");
+    }
+    match store
+        .load_member_repo_policy(alice.member.id, "alpha.git")
+        .await
+    {
+        Err(PolicyStoreError::InvalidPathRule { path_glob, .. }) => {
+            assert_eq!(path_glob, ".scrim/**");
+        }
+        Err(error) => panic!("expected InvalidPathRule, got: {error}"),
+        Ok(_) => panic!("corrupt path_rules row must fail closed"),
+    }
 
     isolated.drop_schema().await;
 }

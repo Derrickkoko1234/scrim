@@ -11,6 +11,7 @@
 
 mod cli;
 pub mod client;
+mod clone_cmd;
 pub mod config;
 mod filter;
 mod git;
@@ -270,6 +271,14 @@ where
             };
             handle_init(init_args, &client, env)
         }
+        Command::Clone(clone_args) => clone_cmd::handle_clone(
+            clone_args,
+            key_file.as_deref(),
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
         Command::Group(group_args) => {
             let client = match build_authenticated_client(
                 server_flag,
