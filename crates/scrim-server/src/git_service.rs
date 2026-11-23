@@ -769,6 +769,7 @@ pub async fn list_repo_refs(repo_dir: &Path) -> io::Result<Vec<RepoRefEntry>> {
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(Stdio::null())
         .kill_on_drop(true);
 

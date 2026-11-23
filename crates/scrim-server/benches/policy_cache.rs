@@ -142,6 +142,15 @@ fn policy_cache_memory(criterion: &mut Criterion) {
         });
     });
 
+    group.bench_function("memory_store_baseline", |bencher| {
+        bencher.iter(|| {
+            black_box(must(
+                runtime.block_on(store.load_member_repo_policy(MEMBER_ID, REPO_KEY)),
+                "memory store baseline",
+            ))
+        });
+    });
+
     group.bench_function("memory_cache_hit", |bencher| {
         bencher.iter(|| {
             black_box(must(

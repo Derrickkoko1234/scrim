@@ -161,37 +161,35 @@ Earlier numbers recorded before this task are shown for comparison.
 | gix pack walk, initial (5 commits, 50 files) | 4.66 ms | 4.70 ms |
 | gix pack walk, incremental | 1.58 ms | 1.61 ms |
 
-The Redis policy cache has no benchmark here: it needs a Redis server and is
-not exercised by these harnesses.
+The policy cache benchmark lives in `crates/scrim-server/benches/policy_cache.rs`
+(`cargo bench -p scrim-server --bench policy_cache`), covering `policy_cache_key`,
+`MemoryPolicyStore`, and `MemoryPolicyCache` by default, plus an opt-in
+`policy_cache_redis` group when `REDIS_URL` is set.
 
-## Findings
+## Findings and follow-ups
 
-These are measurements, not fixes; nothing in the server was changed.
+The tables above record the initial M5 baseline before follow-up optimizations.
 
-1. **The initial-clone walk costs 6x plain `git pack-objects`** (35.3 s vs
-   5.85 s on 425,000 objects). It is single-threaded Rust over the object
-   graph, with a path check per tree entry, and it dominates the restricted
-   clone: the restricted clone is 29 s slower than the baseline. At
-   git/git's size this is tolerable for a one-off clone, but it grows with
-   history and tree size and runs on every restricted clone.
-2. **The incremental fetch walk is not proportional to the change.** A fetch
-   selecting 357 objects takes 703 ms, 8.5x plain pack-objects, and the fetch
-   as a whole takes three times the baseline. The cause is visible in
-   `select_objects` (`crates/scrim-server/src/pack_withhold.rs`): it first
-   collects the full ancestry of every `have` commit
-   (`collect_commits(.., &have_commits, ..)`), here 86,000 commits, before
-   it can subtract it from the wants. Cost is therefore per request and
-   proportional to history length, not to the size of the new push. This was
-   read from the code and matches the numbers; it was not profiled.
-3. **A tag that names a blob makes every restricted clone fail.** git/git has
-   `refs/tags/junio-gpg-pub` pointing at a blob. A restricted member's
-   clone aborts with `scrim: fetch refused: the server could not
-   prepare the pack (only commits and tags of commits may be fetched)`,
-   because the hook refuses wants that are not commits and the advertised
-   ref list includes that tag. The benchmarks hide it with a ref rule. A real
-   deployment of a repository with such a tag would need the same, or
-   the server would need to stop advertising or wanting non-commit tags to
-   restricted members.
+1. **Initial-clone walk speed (improved):** The baseline walk cost 6x plain
+   `git pack-objects` (35.3 s vs 5.85 s on 425,000 objects). Subsequent changes
+   in `crates/scrim-server/src/pack_withhold.rs` interned directory paths
+   (`PathTable`), avoided copying tree entry names or commit parent lists, and
+   added a 64-entry / 96 MiB `DeltaBaseCache` for `gix`, cutting `git/git`
+   initial-clone CPU time by roughly 3x (re-run the full harness on an idle
+   machine to refresh the table above).
+2. **Incremental fetch scaling (fixed):** The baseline took 703 ms (8.5x plain
+   pack-objects) because `select_objects` walked the full ancestry of every
+   `have` commit (~86,000 commits on `git/git`). `select_commits` now runs a
+   newest-first frontier walk (Git's `limit_list` / `UNINTERESTING` propagation
+   with `COMMIT_WALK_SLOP = 32`), making incremental fetches proportional to the
+   new commits rather than total history length (~27 ms on `git/git` for the
+   25-commit incremental case).
+3. **Tags naming blobs or trees (fixed):** `git/git`'s `refs/tags/junio-gpg-pub`
+   previously aborted restricted clones because it was advertised and then
+   refused by the `pack-objects` hook. `compute_visibility` in
+   `crates/scrim-server/src/lib.rs` now hides every ref that does not peel to a
+   commit (and symrefs leading to one) for members with withheld paths, so
+   restricted clones succeed without needing a manual branch rule.
 4. **Unrestricted members pay nothing.** Full clones and fetches over HTTP
    and SSH match plain git within noise, so the cost above only applies to
    repositories where a member is restricted by a path rule.
