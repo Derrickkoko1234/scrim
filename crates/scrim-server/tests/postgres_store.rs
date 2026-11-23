@@ -1614,7 +1614,7 @@ async fn lists_audit_log_with_filters_and_keyset_pagination() {
         panic!("set_member_public_key failed: {error}");
     }
 
-    // Total audit rows: admin.bootstrap (1), group.create (2), member.create (3),
+    // Total audit rows: member.bootstrap_admin (1), group.create (2), member.grant (3),
     // repository.register (4), path_rule.set (5), member.public_key_set (6).
     let page1 = match store
         .list_audit_log(AuditLogQuery {
@@ -1655,10 +1655,10 @@ async fn lists_audit_log_with_filters_and_keyset_pagination() {
         Err(error) => panic!("list_audit_log page 2 failed: {error}"),
     };
     assert_eq!(page2.entries.len(), 3);
-    assert_eq!(page2.entries[0].action, "member.create");
+    assert_eq!(page2.entries[0].action, "member.grant");
     assert_eq!(page2.entries[0].actor_name, None);
     assert_eq!(page2.entries[1].action, "group.create");
-    assert_eq!(page2.entries[2].action, "admin.bootstrap");
+    assert_eq!(page2.entries[2].action, "member.bootstrap_admin");
     assert_eq!(page2.next_before_id, None);
 
     let filtered = match store
