@@ -40,16 +40,19 @@
 //! byte is written, so `git upload-pack` aborts the fetch.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
+    rc::Rc,
     sync::Arc,
 };
 
 use gix::{
     ObjectId,
+    date::SecondsSinceUnixEpoch,
     objs::{Kind, tree::EntryKind},
 };
 use scrim_policy::{WithholdPolicy, WithholdRule};
@@ -835,11 +838,17 @@ fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
-/// A commit's tree and parents.
+/// A commit's tree, parents and committer time.
 #[derive(Clone)]
 struct CommitInfo {
     tree: ObjectId,
-    parents: Vec<ObjectId>,
+    /// Shared with the memo in [`ObjectGraph`], so handing a commit out costs
+    /// a reference-count bump instead of a copy.
+    parents: Rc<[ObjectId]>,
+    /// Committer time in seconds since the epoch, or 0 if it cannot be
+    /// parsed (as Git does). It only orders the commit walk; see
+    /// [`select_commits`].
+    committer_time: SecondsSinceUnixEpoch,
 }
 
 /// An object reached by peeling annotated tags.
@@ -850,11 +859,86 @@ struct PeeledObject {
     kind: Kind,
 }
 
-/// One entry of a tree.
-struct TreeEntry {
-    name: Vec<u8>,
-    kind: EntryKind,
-    object_id: ObjectId,
+/// Most decoded objects [`DeltaBaseCache`] keeps.
+const DELTA_BASE_CACHE_ENTRIES: usize = 64;
+
+/// Most bytes [`DeltaBaseCache`] keeps.
+const DELTA_BASE_CACHE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Recently decoded pack objects, so reading a tree whose delta base was
+/// just read does not inflate its whole delta chain again.
+///
+/// The walks read neighbouring versions of the same trees one after the
+/// other, so without it most of their time went to zlib. gix only ships such
+/// a cache behind features this crate does not enable; this is the same
+/// most-recently-used list as its `StaticLinkedList`, capped at
+/// [`DELTA_BASE_CACHE_ENTRIES`] objects and [`DELTA_BASE_CACHE_BYTES`].
+/// Entries are keyed by pack and offset, as gix requires, and live only as
+/// long as one [`ObjectGraph`].
+#[derive(Default)]
+struct DeltaBaseCache {
+    /// Most recently used first.
+    entries: VecDeque<CachedPackObject>,
+    total_bytes: usize,
+}
+
+struct CachedPackObject {
+    pack_id: u32,
+    offset: u64,
+    kind: Kind,
+    data: Vec<u8>,
+    /// Size of the entry in the pack, which gix expects back from `get`.
+    compressed_size: usize,
+}
+
+impl gix::odb::pack::cache::DecodeEntry for DeltaBaseCache {
+    fn put(&mut self, pack_id: u32, offset: u64, data: &[u8], kind: Kind, compressed_size: usize) {
+        if data.len() > DELTA_BASE_CACHE_BYTES / 4 {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.pack_id == pack_id && entry.offset == offset)
+            && let Some(stale) = self.entries.remove(index)
+        {
+            self.total_bytes -= stale.data.len();
+        }
+        while self.entries.len() >= DELTA_BASE_CACHE_ENTRIES
+            || self.total_bytes + data.len() > DELTA_BASE_CACHE_BYTES
+        {
+            match self.entries.pop_back() {
+                Some(evicted) => self.total_bytes -= evicted.data.len(),
+                None => break,
+            }
+        }
+        self.total_bytes += data.len();
+        self.entries.push_front(CachedPackObject {
+            pack_id,
+            offset,
+            kind,
+            data: data.to_vec(),
+            compressed_size,
+        });
+    }
+
+    fn get(&mut self, pack_id: u32, offset: u64, out: &mut Vec<u8>) -> Option<(Kind, usize)> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.pack_id == pack_id && entry.offset == offset);
+        let Some(entry) = (match index {
+            Some(index) => self.entries.remove(index),
+            None => None,
+        }) else {
+            return None;
+        };
+        out.clear();
+        out.extend_from_slice(&entry.data);
+        let hit = (entry.kind, entry.compressed_size);
+        self.entries.push_front(entry);
+        Some(hit)
+    }
 }
 
 /// Read access to a repository's objects plus the member's withholding view.
@@ -877,10 +961,12 @@ impl<'policy> ObjectGraph<'policy> {
         let options = gix::open::Options::isolated()
             .open_path_as_is(true)
             .cli_overrides(["core.useReplaceRefs=false"]);
-        let repo = match gix::open_opts(repo_dir, options) {
+        let mut repo = match gix::open_opts(repo_dir, options) {
             Ok(repo) => repo,
             Err(_) => return Err(io::Error::other("cannot open the repository")),
         };
+        repo.objects
+            .set_pack_cache(|| Box::new(DeltaBaseCache::default()));
         let hash_kind = repo.object_hash();
         Ok(Self {
             repo,
@@ -910,7 +996,7 @@ impl<'policy> ObjectGraph<'policy> {
         }
     }
 
-    /// The tree and parents of `commit`, memoized.
+    /// The tree, parents and committer time of `commit`, memoized.
     fn commit(&mut self, commit: ObjectId) -> io::Result<CommitInfo> {
         if let Some(info) = self.commits.get(&commit) {
             return Ok(info.clone());
@@ -926,6 +1012,10 @@ impl<'policy> ObjectGraph<'policy> {
             Ok(parsed) => CommitInfo {
                 tree: parsed.tree(),
                 parents: parsed.parents().collect(),
+                committer_time: match parsed.committer() {
+                    Ok(committer) => committer.seconds(),
+                    Err(_) => 0,
+                },
             },
             Err(_) => return Err(invalid_data("malformed commit")),
         };
@@ -962,8 +1052,9 @@ impl<'policy> ObjectGraph<'policy> {
         }
     }
 
-    /// The entries of the tree `tree`, which must be stored as a tree.
-    fn tree_entries(&self, tree: ObjectId) -> io::Result<Vec<TreeEntry>> {
+    /// The raw data of the tree `tree`, which must be stored as a tree. Its
+    /// entries are read with [`Self::tree_entries`].
+    fn read_tree(&self, tree: ObjectId) -> io::Result<Vec<u8>> {
         let (kind, data) = match self.read(tree) {
             Ok(object) => object,
             Err(error) => return Err(error),
@@ -971,18 +1062,13 @@ impl<'policy> ObjectGraph<'policy> {
         if kind != Kind::Tree {
             return Err(invalid_data("expected a tree"));
         }
-        let mut entries = Vec::new();
-        for entry in gix::objs::TreeRefIter::from_bytes(&data, self.hash_kind) {
-            match entry {
-                Ok(entry) => entries.push(TreeEntry {
-                    name: entry.filename.to_vec(),
-                    kind: entry.mode.kind(),
-                    object_id: entry.oid.to_owned(),
-                }),
-                Err(_) => return Err(invalid_data("malformed tree")),
-            }
-        }
-        Ok(entries)
+        Ok(data)
+    }
+
+    /// The entries of tree data read by [`Self::read_tree`], borrowing their
+    /// names from it instead of copying them.
+    fn tree_entries<'data>(&self, data: &'data [u8]) -> gix::objs::TreeRefIter<'data> {
+        gix::objs::TreeRefIter::from_bytes(data, self.hash_kind)
     }
 
     /// Whether a blob at `path` (`None` for a non-UTF-8 path, or one below a
@@ -1013,33 +1099,261 @@ impl<'policy> ObjectGraph<'policy> {
     }
 }
 
-/// Lists the commits reachable from `starts` (in walk order) without
-/// passing `stop` commits and without following the parents of `shallow`
-/// commits.
-fn collect_commits(
-    graph: &mut ObjectGraph<'_>,
-    starts: &[ObjectId],
-    stop: &HashSet<ObjectId>,
-    shallow: &HashSet<ObjectId>,
-) -> io::Result<(Vec<ObjectId>, HashSet<ObjectId>)> {
-    let mut order = Vec::new();
-    let mut visited = HashSet::new();
-    let mut pending: Vec<ObjectId> = starts.iter().rev().copied().collect();
-    while let Some(commit) = pending.pop() {
-        if stop.contains(&commit) || !visited.insert(commit) {
-            continue;
+/// Uninteresting commits [`select_commits`] still pops once none queued can
+/// reach a selected commit by committer time, like the `SLOP` of Git's
+/// `limit_list`. It only matters when committer times are skewed, and only
+/// makes the walk notice more of what the client has.
+const COMMIT_WALK_SLOP: usize = 32;
+
+/// The commits [`select_commits`] chose.
+struct CommitSelection {
+    /// Commits to send, in walk order (newest committer time first).
+    send_commits: Vec<ObjectId>,
+    send_commit_set: HashSet<ObjectId>,
+    /// Parents of the non-shallow `send_commits` that the client has.
+    boundary_commits: BTreeSet<ObjectId>,
+}
+
+/// What [`select_commits`] knows about one commit it reached.
+#[derive(Clone, Copy)]
+struct CommitWalkState {
+    /// Reachable from a have (so the client has it). Never cleared.
+    is_uninteresting: bool,
+    /// Taken off the queue: its parents were queued or marked.
+    is_popped: bool,
+}
+
+/// A queued commit; the queue pops the newest committer time first and, on a
+/// tie, the commit queued first.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct QueuedCommit {
+    committer_time: SecondsSinceUnixEpoch,
+    sequence: Reverse<u64>,
+    commit: ObjectId,
+}
+
+/// The state of one [`select_commits`] walk.
+struct CommitWalk<'walk, 'policy> {
+    graph: &'walk mut ObjectGraph<'policy>,
+    shallow_commits: &'walk HashSet<ObjectId>,
+    states: HashMap<ObjectId, CommitWalkState>,
+    queue: BinaryHeap<QueuedCommit>,
+    next_sequence: u64,
+    /// Queued commits not marked uninteresting.
+    interesting_in_queue: usize,
+}
+
+impl CommitWalk<'_, '_> {
+    /// The parents of `commit` the walk follows: none for a shallow commit,
+    /// whose parents the client does not have.
+    fn parents(&mut self, commit: ObjectId) -> io::Result<Rc<[ObjectId]>> {
+        if self.shallow_commits.contains(&commit) {
+            return Ok(Rc::from([]));
         }
-        order.push(commit);
-        if shallow.contains(&commit) {
-            continue;
+        match self.graph.commit(commit) {
+            Ok(info) => Ok(info.parents),
+            Err(error) => Err(error),
         }
-        let info = match graph.commit(commit) {
+    }
+
+    /// Queues `commit`, which the walk has not reached before.
+    fn enqueue(&mut self, commit: ObjectId, is_uninteresting: bool) -> io::Result<()> {
+        let info = match self.graph.commit(commit) {
             Ok(info) => info,
             Err(error) => return Err(error),
         };
-        pending.extend(info.parents.iter().rev().copied());
+        self.states.insert(
+            commit,
+            CommitWalkState {
+                is_uninteresting,
+                is_popped: false,
+            },
+        );
+        if !is_uninteresting {
+            self.interesting_in_queue += 1;
+        }
+        self.queue.push(QueuedCommit {
+            committer_time: info.committer_time,
+            sequence: Reverse(self.next_sequence),
+            commit,
+        });
+        self.next_sequence += 1;
+        Ok(())
     }
-    Ok((order, visited))
+
+    /// Marks `commit` uninteresting. A queued commit passes the mark on to its
+    /// parents when popped; a popped one passes it on now, down through every
+    /// popped ancestor (Git's `mark_parents_uninteresting`).
+    fn mark_uninteresting(&mut self, commit: ObjectId) -> io::Result<()> {
+        let mut pending = vec![commit];
+        while let Some(commit) = pending.pop() {
+            let Some(state) = self.states.get_mut(&commit) else {
+                if let Err(error) = self.enqueue(commit, true) {
+                    return Err(error);
+                }
+                continue;
+            };
+            if state.is_uninteresting {
+                continue;
+            }
+            state.is_uninteresting = true;
+            if !state.is_popped {
+                self.interesting_in_queue -= 1;
+                continue;
+            }
+            match self.parents(commit) {
+                Ok(parents) => pending.extend(parents.iter().copied()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn is_uninteresting(&self, commit: &ObjectId) -> bool {
+        matches!(
+            self.states.get(commit),
+            Some(CommitWalkState {
+                is_uninteresting: true,
+                ..
+            })
+        )
+    }
+}
+
+/// Selects the commits reachable from `want_commits` that are not reachable
+/// from `have_commits`, never following the parents of `shallow_commits`.
+///
+/// Like Git's `limit_list`, the walk pops commits newest committer time
+/// first from one queue holding both sides, and marks everything below a
+/// have uninteresting as it meets it, so an incremental fetch only reads
+/// the commits near the boundary instead of the haves' whole history.
+///
+/// - A commit is only marked uninteresting by a chain of parent links from a
+///   have, so the client has every commit left out. The walk only stops when
+///   no interesting commit is queued (and checks that at the end), so every
+///   interesting commit's parents were reached: nothing the client lacks is
+///   left out.
+/// - The walk keeps going while a queued uninteresting commit is at least
+///   as new as the oldest selected commit, then for [`COMMIT_WALK_SLOP`] more
+///   pops. If no parent is newer than its child, a queued commit cannot reach
+///   an older selected commit, so the selection is then exactly the one a
+///   full walk of the haves' history gives. With skewed times, a commit the
+///   client has may still be selected; that sends it again (as Git does),
+///   never anything withheld, since blobs are judged by path alone.
+fn select_commits(
+    graph: &mut ObjectGraph<'_>,
+    want_commits: &[ObjectId],
+    have_commits: &[ObjectId],
+    shallow_commits: &HashSet<ObjectId>,
+) -> io::Result<CommitSelection> {
+    let mut walk = CommitWalk {
+        graph,
+        shallow_commits,
+        states: HashMap::new(),
+        queue: BinaryHeap::new(),
+        next_sequence: 0,
+        interesting_in_queue: 0,
+    };
+    for have in have_commits {
+        if let Err(error) = walk.mark_uninteresting(*have) {
+            return Err(error);
+        }
+    }
+    for want in want_commits {
+        if !walk.states.contains_key(want)
+            && let Err(error) = walk.enqueue(*want, false)
+        {
+            return Err(error);
+        }
+    }
+
+    let mut send_commits = Vec::new();
+    let mut oldest_send_time: Option<SecondsSinceUnixEpoch> = None;
+    let mut slop = COMMIT_WALK_SLOP;
+    loop {
+        if walk.interesting_in_queue == 0 {
+            // Only uninteresting commits are queued: they can still turn a
+            // selected commit uninteresting, but nothing new can be selected.
+            let (Some(oldest_send_time), Some(newest_queued)) =
+                (oldest_send_time, walk.queue.peek())
+            else {
+                break;
+            };
+            if newest_queued.committer_time >= oldest_send_time {
+                slop = COMMIT_WALK_SLOP;
+            } else if slop == 0 {
+                break;
+            } else {
+                slop -= 1;
+            }
+        }
+        let Some(queued) = walk.queue.pop() else {
+            break;
+        };
+        let commit = queued.commit;
+        let Some(state) = walk.states.get_mut(&commit) else {
+            return Err(io::Error::other("commit walk lost track of a commit"));
+        };
+        state.is_popped = true;
+        let is_uninteresting = state.is_uninteresting;
+        let parents = match walk.parents(commit) {
+            Ok(parents) => parents,
+            Err(error) => return Err(error),
+        };
+        if is_uninteresting {
+            for parent in parents.iter() {
+                if let Err(error) = walk.mark_uninteresting(*parent) {
+                    return Err(error);
+                }
+            }
+            continue;
+        }
+        walk.interesting_in_queue -= 1;
+        send_commits.push(commit);
+        oldest_send_time = Some(match oldest_send_time {
+            Some(oldest) => oldest.min(queued.committer_time),
+            None => queued.committer_time,
+        });
+        for parent in parents.iter() {
+            if !walk.states.contains_key(parent)
+                && let Err(error) = walk.enqueue(*parent, false)
+            {
+                return Err(error);
+            }
+        }
+    }
+    // Never stop with an interesting commit unexpanded: its parents might be
+    // missing from the pack. The loop guarantees this; checked so a bug fails
+    // the fetch instead of sending an incomplete pack.
+    if walk
+        .queue
+        .iter()
+        .any(|queued| !walk.is_uninteresting(&queued.commit))
+    {
+        return Err(io::Error::other("commit walk stopped early"));
+    }
+
+    // Commits marked uninteresting after they were popped are not sent.
+    send_commits.retain(|commit| !walk.is_uninteresting(commit));
+    let mut boundary_commits = BTreeSet::new();
+    for commit in &send_commits {
+        let parents = match walk.parents(*commit) {
+            Ok(parents) => parents,
+            Err(error) => return Err(error),
+        };
+        boundary_commits.extend(
+            parents
+                .iter()
+                .filter(|parent| walk.is_uninteresting(parent))
+                .copied(),
+        );
+    }
+    let send_commit_set = send_commits.iter().copied().collect();
+    Ok(CommitSelection {
+        send_commits,
+        send_commit_set,
+        boundary_commits,
+    })
 }
 
 /// Joins a tree path and an entry name; `None` if either is not UTF-8.
@@ -1054,10 +1368,157 @@ fn child_path(prefix: Option<&str>, name: &[u8]) -> Option<String> {
     }
 }
 
-/// Memo key of one walked subtree: the tree, its path (`None` below a
-/// non-UTF-8 name, where everything is withheld), so a tree reused at a
-/// withheld and a visible path is judged at each.
-type SubtreeKey = (ObjectId, Option<String>);
+/// Index of a directory in a [`PathTable`].
+type DirectoryId = usize;
+
+/// The repository root.
+const ROOT_DIRECTORY: DirectoryId = 0;
+
+/// Every directory at or below a non-UTF-8 name: paths there cannot be
+/// judged, so every blob in it is withheld.
+const NON_UTF8_DIRECTORY: DirectoryId = 1;
+
+/// The repository paths one tree walk met, each judged by
+/// [`ObjectGraph::is_withheld`] at most once.
+///
+/// Walks name a directory by its [`DirectoryId`] and look entries up by
+/// their raw name in it, so no path string is built or hashed per tree
+/// entry: only when a directory or a name in it is met for the first time,
+/// and for the path hints of emitted objects. Directories are interned by
+/// full path, so two routes to the same path share one id exactly as equal
+/// path strings would.
+struct PathTable {
+    directories: Vec<Directory>,
+    directory_ids: HashMap<String, DirectoryId>,
+}
+
+/// One directory of a [`PathTable`].
+struct Directory {
+    /// Full path, empty at the root; `None` for [`NON_UTF8_DIRECTORY`].
+    path: Option<String>,
+    names: HashMap<Box<[u8]>, NameInfo>,
+}
+
+/// What is known about one name in one [`Directory`].
+#[derive(Clone, Copy, Default)]
+struct NameInfo {
+    /// The directory of a tree at this name, once one was met.
+    directory: Option<DirectoryId>,
+    /// Whether a blob at this name is withheld, once one was met.
+    is_withheld: Option<bool>,
+}
+
+impl PathTable {
+    fn new() -> Self {
+        Self {
+            directories: vec![
+                Directory {
+                    path: Some(String::new()),
+                    names: HashMap::new(),
+                },
+                Directory {
+                    path: None,
+                    names: HashMap::new(),
+                },
+            ],
+            directory_ids: HashMap::from([(String::new(), ROOT_DIRECTORY)]),
+        }
+    }
+
+    /// The full path of `directory` (`None` if not UTF-8).
+    fn directory_path(&self, directory: DirectoryId) -> Option<&str> {
+        match self.directories.get(directory) {
+            Some(entry) => entry.path.as_deref(),
+            None => None,
+        }
+    }
+
+    /// The full path of `name` in `directory` (`None` if not UTF-8).
+    fn entry_path(&self, directory: DirectoryId, name: &[u8]) -> Option<String> {
+        child_path(self.directory_path(directory), name)
+    }
+
+    fn cached(&self, directory: DirectoryId, name: &[u8]) -> Option<NameInfo> {
+        match self.directories.get(directory) {
+            Some(entry) => entry.names.get(name).copied(),
+            None => None,
+        }
+    }
+
+    /// Records `update` for `name` in `directory`.
+    fn remember(
+        &mut self,
+        directory: DirectoryId,
+        name: &[u8],
+        update: impl FnOnce(&mut NameInfo),
+    ) {
+        if let Some(entry) = self.directories.get_mut(directory) {
+            update(
+                entry
+                    .names
+                    .entry(Box::from(name))
+                    .or_insert(NameInfo::default()),
+            );
+        }
+    }
+
+    /// The directory of a tree at `name` in `directory`.
+    fn subdirectory(&mut self, directory: DirectoryId, name: &[u8]) -> DirectoryId {
+        if directory == NON_UTF8_DIRECTORY {
+            return NON_UTF8_DIRECTORY;
+        }
+        if let Some(NameInfo {
+            directory: Some(subdirectory),
+            ..
+        }) = self.cached(directory, name)
+        {
+            return subdirectory;
+        }
+        let subdirectory = match self.entry_path(directory, name) {
+            Some(path) => match self.directory_ids.get(&path) {
+                Some(subdirectory) => *subdirectory,
+                None => {
+                    let subdirectory = self.directories.len();
+                    self.directories.push(Directory {
+                        path: Some(path.clone()),
+                        names: HashMap::new(),
+                    });
+                    self.directory_ids.insert(path, subdirectory);
+                    subdirectory
+                }
+            },
+            None => NON_UTF8_DIRECTORY,
+        };
+        self.remember(directory, name, |info| info.directory = Some(subdirectory));
+        subdirectory
+    }
+
+    /// Whether a blob at `name` in `directory` is withheld from the member.
+    fn is_blob_withheld(
+        &mut self,
+        graph: &ObjectGraph<'_>,
+        directory: DirectoryId,
+        name: &[u8],
+    ) -> bool {
+        if directory == NON_UTF8_DIRECTORY {
+            return true;
+        }
+        if let Some(NameInfo {
+            is_withheld: Some(is_withheld),
+            ..
+        }) = self.cached(directory, name)
+        {
+            return is_withheld;
+        }
+        let is_withheld = graph.is_withheld(self.entry_path(directory, name).as_deref());
+        self.remember(directory, name, |info| info.is_withheld = Some(is_withheld));
+        is_withheld
+    }
+}
+
+/// Memo key of one walked subtree: the tree and its directory, so a tree
+/// reused at a withheld and a visible path is judged at each.
+type SubtreeKey = (ObjectId, DirectoryId);
 
 /// What the client already has, from the trees of the commits on the
 /// boundary between what it has and what it wants.
@@ -1075,33 +1536,42 @@ impl ClientObjects {
     fn walk(
         &mut self,
         graph: &ObjectGraph<'_>,
+        paths: &mut PathTable,
         tree: ObjectId,
-        path: Option<String>,
+        directory: DirectoryId,
         depth: usize,
     ) -> io::Result<()> {
         if depth > MAX_TREE_DEPTH {
             return Err(invalid_data("trees nested too deeply"));
         }
-        if !self.walked.insert((tree, path.clone())) {
+        if !self.walked.insert((tree, directory)) {
             return Ok(());
         }
         self.trees.insert(tree);
-        let entries = match graph.tree_entries(tree) {
-            Ok(entries) => entries,
+        let data = match graph.read_tree(tree) {
+            Ok(data) => data,
             Err(error) => return Err(error),
         };
-        for entry in entries {
-            let entry_path = child_path(path.as_deref(), &entry.name);
-            match entry.kind {
+        for entry in graph.tree_entries(&data) {
+            let Ok(entry) = entry else {
+                return Err(invalid_data("malformed tree"));
+            };
+            match entry.mode.kind() {
                 EntryKind::Tree => {
-                    if let Err(error) = self.walk(graph, entry.object_id, entry_path, depth + 1) {
+                    let subdirectory = paths.subdirectory(directory, entry.filename);
+                    if let Err(error) =
+                        self.walk(graph, paths, entry.oid.to_owned(), subdirectory, depth + 1)
+                    {
                         return Err(error);
                     }
                 }
                 EntryKind::Commit => {}
                 EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    if !graph.is_withheld(entry_path.as_deref()) {
-                        self.visible_blobs.insert(entry.object_id);
+                    let blob = entry.oid.to_owned();
+                    if !self.visible_blobs.contains(&blob)
+                        && !paths.is_blob_withheld(graph, directory, entry.filename)
+                    {
+                        self.visible_blobs.insert(blob);
                     }
                 }
             }
@@ -1135,49 +1605,61 @@ impl PackObjectCollector<'_> {
     fn walk(
         &mut self,
         graph: &ObjectGraph<'_>,
+        paths: &mut PathTable,
         tree: ObjectId,
-        path: Option<String>,
+        directory: DirectoryId,
         depth: usize,
     ) -> io::Result<()> {
         if depth > MAX_TREE_DEPTH {
             return Err(invalid_data("trees nested too deeply"));
         }
-        let key = (tree, path.clone());
+        let key = (tree, directory);
         // A subtree the client has at this very path holds nothing new: its
         // visible blobs are had and its withheld blobs stay withheld.
         if self.client.walked.contains(&key) || !self.walked.insert(key) {
             return Ok(());
         }
         if !self.client.trees.contains(&tree) {
-            self.emit(tree, path.as_deref());
+            self.emit(tree, paths.directory_path(directory));
         }
-        let entries = match graph.tree_entries(tree) {
-            Ok(entries) => entries,
+        let data = match graph.read_tree(tree) {
+            Ok(data) => data,
             Err(error) => return Err(error),
         };
-        for entry in entries {
-            let entry_path = child_path(path.as_deref(), &entry.name);
-            match entry.kind {
+        for entry in graph.tree_entries(&data) {
+            let Ok(entry) = entry else {
+                return Err(invalid_data("malformed tree"));
+            };
+            match entry.mode.kind() {
                 EntryKind::Tree => {
-                    if let Err(error) = self.walk(graph, entry.object_id, entry_path, depth + 1) {
+                    let subdirectory = paths.subdirectory(directory, entry.filename);
+                    if let Err(error) =
+                        self.walk(graph, paths, entry.oid.to_owned(), subdirectory, depth + 1)
+                    {
                         return Err(error);
                     }
                 }
                 // A submodule commit lives in another repository.
                 EntryKind::Commit => {}
                 EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    if graph.is_withheld(entry_path.as_deref()) {
+                    let blob = entry.oid.to_owned();
+                    let is_had_or_sent =
+                        self.client.visible_blobs.contains(&blob) || self.emitted.contains(&blob);
+                    // Such a blob is never emitted here, so once a withheld
+                    // blob was seen the path check cannot change anything.
+                    if is_had_or_sent && self.withheld_any_blob {
+                        continue;
+                    }
+                    if paths.is_blob_withheld(graph, directory, entry.filename) {
                         self.withheld_any_blob = true;
                         continue;
                     }
-                    if self.client.visible_blobs.contains(&entry.object_id)
-                        || self.emitted.contains(&entry.object_id)
-                    {
+                    if is_had_or_sent {
                         continue;
                     }
                     // The stored type is checked so a crafted entry cannot
                     // smuggle a commit or tag out under a blob mode.
-                    let (kind, size) = match graph.header(entry.object_id) {
+                    let (kind, size) = match graph.header(blob) {
                         Ok(header) => header,
                         Err(error) => return Err(error),
                     };
@@ -1190,7 +1672,8 @@ impl PackObjectCollector<'_> {
                         ClientObjectFilter::BlobLimit(limit) => size >= limit,
                     };
                     if !is_filtered {
-                        self.emit(entry.object_id, entry_path.as_deref());
+                        let path_hint = paths.entry_path(directory, entry.filename);
+                        self.emit(blob, path_hint.as_deref());
                     }
                 }
             }
@@ -1235,50 +1718,23 @@ fn select_objects(
         }
     }
 
-    let (_, have_commit_set) = match collect_commits(
-        graph,
-        &have_commits,
-        &HashSet::new(),
-        &input.shallow_commits,
-    ) {
-        Ok(walk) => walk,
-        Err(error) => return Err(error),
-    };
-    let (send_commits, send_commit_set) = match collect_commits(
-        graph,
-        &want_commits,
-        &have_commit_set,
-        &input.shallow_commits,
-    ) {
-        Ok(walk) => walk,
+    let commits = match select_commits(graph, &want_commits, &have_commits, &input.shallow_commits)
+    {
+        Ok(commits) => commits,
         Err(error) => return Err(error),
     };
 
     // Like `git pack-objects --revs` without `--thin`, only the trees of the
     // boundary commits count as had. Missing some had objects only sends
     // more, never anything withheld.
+    let mut paths = PathTable::new();
     let mut client = ClientObjects::default();
-    let mut boundary_commits = BTreeSet::new();
-    for commit in &send_commits {
-        if input.shallow_commits.contains(commit) {
-            continue;
-        }
+    for commit in &commits.boundary_commits {
         let info = match graph.commit(*commit) {
             Ok(info) => info,
             Err(error) => return Err(error),
         };
-        boundary_commits.extend(
-            info.parents
-                .into_iter()
-                .filter(|parent| have_commit_set.contains(parent)),
-        );
-    }
-    for commit in boundary_commits {
-        let info = match graph.commit(commit) {
-            Ok(info) => info,
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = client.walk(graph, info.tree, Some(String::new()), 0) {
+        if let Err(error) = client.walk(graph, &mut paths, info.tree, ROOT_DIRECTORY, 0) {
             return Err(error);
         }
     }
@@ -1308,22 +1764,22 @@ fn select_objects(
                 Ok(peeled) => peeled,
                 Err(error) => return Err(error),
             };
-            if peeled.kind == Kind::Commit && send_commit_set.contains(&peeled.target) {
+            if peeled.kind == Kind::Commit && commits.send_commit_set.contains(&peeled.target) {
                 for tag in peeled.tags {
                     collector.emit(tag, None);
                 }
             }
         }
     }
-    for commit in &send_commits {
+    for commit in &commits.send_commits {
         collector.emit(*commit, None);
     }
-    for commit in &send_commits {
+    for commit in &commits.send_commits {
         let info = match graph.commit(*commit) {
             Ok(info) => info,
             Err(error) => return Err(error),
         };
-        if let Err(error) = collector.walk(graph, info.tree, Some(String::new()), 0) {
+        if let Err(error) = collector.walk(graph, &mut paths, info.tree, ROOT_DIRECTORY, 0) {
             return Err(error);
         }
     }
@@ -1391,6 +1847,7 @@ pub(crate) fn find_withheld_only_blobs(
             tips.push(peeled.target);
         }
     }
+    let mut paths = PathTable::new();
     let mut classifier = BlobClassifier {
         candidates: &candidates,
         walked: HashSet::new(),
@@ -1412,7 +1869,7 @@ pub(crate) fn find_withheld_only_blobs(
             Ok(info) => info,
             Err(error) => return Err(error),
         };
-        if let Err(error) = classifier.walk(&graph, info.tree, Some(String::new()), 0) {
+        if let Err(error) = classifier.walk(&graph, &mut paths, info.tree, ROOT_DIRECTORY, 0) {
             return Err(error);
         }
         pending.extend(info.parents.iter().rev().copied());
@@ -1436,37 +1893,44 @@ impl BlobClassifier<'_> {
     fn walk(
         &mut self,
         graph: &ObjectGraph<'_>,
+        paths: &mut PathTable,
         tree: ObjectId,
-        path: Option<String>,
+        directory: DirectoryId,
         depth: usize,
     ) -> io::Result<()> {
         if depth > MAX_TREE_DEPTH {
             return Err(invalid_data("trees nested too deeply"));
         }
-        if !self.walked.insert((tree, path.clone())) {
+        if !self.walked.insert((tree, directory)) {
             return Ok(());
         }
-        let entries = match graph.tree_entries(tree) {
-            Ok(entries) => entries,
+        let data = match graph.read_tree(tree) {
+            Ok(data) => data,
             Err(error) => return Err(error),
         };
-        for entry in entries {
-            let entry_path = child_path(path.as_deref(), &entry.name);
-            match entry.kind {
+        for entry in graph.tree_entries(&data) {
+            let Ok(entry) = entry else {
+                return Err(invalid_data("malformed tree"));
+            };
+            match entry.mode.kind() {
                 EntryKind::Tree => {
-                    if let Err(error) = self.walk(graph, entry.object_id, entry_path, depth + 1) {
+                    let subdirectory = paths.subdirectory(directory, entry.filename);
+                    if let Err(error) =
+                        self.walk(graph, paths, entry.oid.to_owned(), subdirectory, depth + 1)
+                    {
                         return Err(error);
                     }
                 }
                 EntryKind::Commit => {}
                 EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
-                    if !self.candidates.contains(&entry.object_id) {
+                    let blob = entry.oid.to_owned();
+                    if !self.candidates.contains(&blob) {
                         continue;
                     }
-                    if graph.is_withheld(entry_path.as_deref()) {
-                        self.at_withheld_path.insert(entry.object_id);
+                    if paths.is_blob_withheld(graph, directory, entry.filename) {
+                        self.at_withheld_path.insert(blob);
                     } else {
-                        self.at_visible_path.insert(entry.object_id);
+                        self.at_visible_path.insert(blob);
                     }
                 }
             }
@@ -1479,6 +1943,7 @@ impl BlobClassifier<'_> {
 mod tests {
     use std::{
         collections::{BTreeSet, HashSet},
+        io::Write,
         path::PathBuf,
         process::{Command, Stdio},
     };
@@ -1488,9 +1953,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ClientObjectFilter, PackObjectsArgs, PackSelection, compute_allowed_pack_objects,
-        find_withheld_only_blobs, parse_filter_spec, parse_pack_args, parse_pack_stdin,
-        shell_quote,
+        COMMIT_WALK_SLOP, ClientObjectFilter, CommitSelection, DELTA_BASE_CACHE_BYTES,
+        DELTA_BASE_CACHE_ENTRIES, DeltaBaseCache, ObjectGraph, PackObjectsArgs, PackSelection,
+        compute_allowed_pack_objects, find_withheld_only_blobs, parse_filter_spec, parse_pack_args,
+        parse_pack_stdin, select_commits, shell_quote,
     };
 
     const COMMIT_A: &str = "1111111111111111111111111111111111111111";
@@ -1714,12 +2180,19 @@ mod tests {
 
         /// Runs `git <args>` in the work tree and returns its trimmed stdout.
         fn git(&self, args: &[&str]) -> String {
+            self.git_with_stdin(args, "")
+        }
+
+        /// Runs `git <args>` with `stdin` and returns its trimmed stdout.
+        fn git_with_stdin(&self, args: &[&str], stdin: &str) -> String {
             let mut command = Command::new("git");
             command
                 .args(args)
                 .current_dir(&self.work)
                 .env_clear()
-                .stdin(Stdio::null());
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             if let Some(path) = std::env::var_os("PATH") {
                 command.env("PATH", path);
             }
@@ -1730,7 +2203,19 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "test@scrim.invalid")
                 .env("GIT_COMMITTER_NAME", "Scrim Test")
                 .env("GIT_COMMITTER_EMAIL", "test@scrim.invalid");
-            let output = match command.output() {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => panic!("failed to run git {args:?}: {error}"),
+            };
+            match child.stdin.take() {
+                Some(mut child_stdin) => {
+                    if let Err(error) = child_stdin.write_all(stdin.as_bytes()) {
+                        panic!("failed to feed git {args:?}: {error}");
+                    }
+                }
+                None => panic!("git {args:?} stdin was not piped"),
+            }
+            let output = match child.wait_with_output() {
                 Ok(output) => output,
                 Err(error) => panic!("failed to run git {args:?}: {error}"),
             };
@@ -2161,5 +2646,592 @@ mod tests {
         assert!(find(&[], &[]).is_empty());
         assert!(find(&[], &["refs/heads/missing"]).is_empty());
         assert!(find(&["billing"], &["refs/heads/main"]).is_empty());
+    }
+
+    /// One commit of a history built with `git fast-import`.
+    struct DagCommit {
+        /// Committer time in seconds since the epoch.
+        time: i64,
+        /// Indexes of earlier commits; the first is the first parent.
+        parents: Vec<usize>,
+        /// `(path, contents)` to write, or `(path, None)` to delete; `path`
+        /// may be C-style quoted for fast-import.
+        files: Vec<(String, Option<String>)>,
+    }
+
+    fn dag_commit(time: i64, parents: &[usize]) -> DagCommit {
+        DagCommit {
+            time,
+            parents: parents.to_vec(),
+            files: Vec::new(),
+        }
+    }
+
+    /// Imports `commits` (each on its own branch `refs/heads/c<index>`, so
+    /// every one is a ref tip) and returns their IDs in order.
+    fn import_dag(repo: &TestRepo, commits: &[DagCommit]) -> Vec<ObjectId> {
+        let mut stream = String::new();
+        for (index, commit) in commits.iter().enumerate() {
+            let message = format!("commit {index}\n");
+            stream.push_str(&format!(
+                "commit refs/heads/c{index}\nmark :{}\ncommitter Scrim Test <test@scrim.invalid> {} +0000\ndata {}\n{message}",
+                index + 1,
+                commit.time,
+                message.len()
+            ));
+            for (position, parent) in commit.parents.iter().enumerate() {
+                let verb = if position == 0 { "from" } else { "merge" };
+                stream.push_str(&format!("{verb} :{}\n", parent + 1));
+            }
+            for (path, contents) in &commit.files {
+                match contents {
+                    Some(contents) => stream.push_str(&format!(
+                        "M 100644 inline {path}\ndata {}\n{contents}\n",
+                        contents.len()
+                    )),
+                    None => stream.push_str(&format!("D {path}\n")),
+                }
+            }
+            stream.push('\n');
+        }
+        let marks_path = repo.git_dir().join("scrim-test-marks");
+        let Some(marks) = marks_path.to_str() else {
+            panic!("marks path is not UTF-8");
+        };
+        repo.git_with_stdin(
+            &["fast-import", "--quiet", &format!("--export-marks={marks}")],
+            &stream,
+        );
+        let marks_text = match std::fs::read_to_string(&marks_path) {
+            Ok(text) => text,
+            Err(error) => panic!("failed to read marks: {error}"),
+        };
+        let mut ids = vec![None; commits.len()];
+        for line in marks_text.lines() {
+            let Some((mark, hex)) = line.split_once(' ') else {
+                panic!("unexpected marks line {line:?}");
+            };
+            let Ok(mark) = mark.trim_start_matches(':').parse::<usize>() else {
+                panic!("unexpected mark {mark:?}");
+            };
+            if let Some(slot) = ids.get_mut(mark - 1) {
+                *slot = Some(object_id(hex));
+            }
+        }
+        ids.into_iter()
+            .enumerate()
+            .map(|(index, id)| match id {
+                Some(id) => id,
+                None => panic!("commit {index} has no mark"),
+            })
+            .collect()
+    }
+
+    fn open_graph<'policy>(
+        repo: &TestRepo,
+        policy: &'policy WithholdPolicy,
+        member_groups: &'policy BTreeSet<String>,
+    ) -> ObjectGraph<'policy> {
+        match ObjectGraph::open(&repo.git_dir(), policy, member_groups) {
+            Ok(graph) => graph,
+            Err(error) => panic!("failed to open the repository: {error}"),
+        }
+    }
+
+    /// Commits reachable from `starts` without passing `stop` or the parents
+    /// of `shallow`: the full walk `select_commits` replaced.
+    fn reachable(
+        graph: &mut ObjectGraph<'_>,
+        starts: &[ObjectId],
+        stop: &HashSet<ObjectId>,
+        shallow: &HashSet<ObjectId>,
+    ) -> HashSet<ObjectId> {
+        let mut visited = HashSet::new();
+        let mut pending = starts.to_vec();
+        while let Some(commit) = pending.pop() {
+            if stop.contains(&commit) || !visited.insert(commit) || shallow.contains(&commit) {
+                continue;
+            }
+            match graph.commit(commit) {
+                Ok(info) => pending.extend(info.parents.iter().copied()),
+                Err(error) => panic!("failed to read commit {commit}: {error}"),
+            }
+        }
+        visited
+    }
+
+    /// Runs `select_commits` for the given commit indexes, checks it against
+    /// the full walk and returns its selection plus how many commits it read.
+    ///
+    /// Always: every commit the full walk sends is sent, every extra commit
+    /// is one the client has, nothing outside the wants' history is sent, and
+    /// every boundary commit is had. With `expect_exact`, the selection must
+    /// equal the full walk's.
+    fn check_commit_walk(
+        repo: &TestRepo,
+        ids: &[ObjectId],
+        wants: &[usize],
+        haves: &[usize],
+        shallow: &[usize],
+        expect_exact: bool,
+    ) -> (CommitSelection, usize) {
+        let pick = |indexes: &[usize]| -> Vec<ObjectId> {
+            indexes
+                .iter()
+                .map(|index| match ids.get(*index) {
+                    Some(id) => *id,
+                    None => panic!("no commit {index}"),
+                })
+                .collect()
+        };
+        let want_ids = pick(wants);
+        let have_ids = pick(haves);
+        let shallow_ids: HashSet<ObjectId> = pick(shallow).into_iter().collect();
+        let policy = billing_policy();
+        let member_groups = groups(&[]);
+        let context = format!("wants {wants:?}, haves {haves:?}, shallow {shallow:?}");
+
+        let mut graph = open_graph(repo, &policy, &member_groups);
+        let selection = match select_commits(&mut graph, &want_ids, &have_ids, &shallow_ids) {
+            Ok(selection) => selection,
+            Err(error) => panic!("commit walk failed for {context}: {error}"),
+        };
+        let commits_read = graph.commits.len();
+
+        let mut reference_graph = open_graph(repo, &policy, &member_groups);
+        let had = reachable(
+            &mut reference_graph,
+            &have_ids,
+            &HashSet::new(),
+            &shallow_ids,
+        );
+        let wanted = reachable(
+            &mut reference_graph,
+            &want_ids,
+            &HashSet::new(),
+            &shallow_ids,
+        );
+        let expected_send = reachable(&mut reference_graph, &want_ids, &had, &shallow_ids);
+        let mut expected_boundary = BTreeSet::new();
+        for commit in &expected_send {
+            if shallow_ids.contains(commit) {
+                continue;
+            }
+            match reference_graph.commit(*commit) {
+                Ok(info) => expected_boundary
+                    .extend(info.parents.iter().filter(|parent| had.contains(*parent))),
+                Err(error) => panic!("failed to read commit {commit}: {error}"),
+            }
+        }
+
+        let send: HashSet<ObjectId> = selection.send_commits.iter().copied().collect();
+        assert_eq!(
+            send.len(),
+            selection.send_commits.len(),
+            "duplicate commit for {context}"
+        );
+        assert_eq!(send, selection.send_commit_set, "{context}");
+        assert!(
+            expected_send.is_subset(&send),
+            "a commit the client lacks was left out for {context}"
+        );
+        assert!(
+            send.is_subset(&wanted),
+            "an unwanted commit was sent for {context}"
+        );
+        assert!(
+            send.difference(&expected_send)
+                .all(|commit| had.contains(commit)),
+            "an extra commit the client lacks for {context}"
+        );
+        assert!(
+            selection
+                .boundary_commits
+                .iter()
+                .all(|commit| had.contains(commit)),
+            "a boundary commit the client lacks for {context}"
+        );
+        assert!(
+            expected_boundary
+                .iter()
+                .all(|commit| selection.boundary_commits.contains(commit) || send.contains(commit)),
+            "a boundary commit was neither had nor sent for {context}"
+        );
+        if expect_exact {
+            assert_eq!(send, expected_send, "send set for {context}");
+            assert_eq!(
+                selection.boundary_commits, expected_boundary,
+                "boundary for {context}"
+            );
+        }
+        (selection, commits_read)
+    }
+
+    /// A linear history of `length` commits, one second apart.
+    fn linear_dag(length: usize) -> Vec<DagCommit> {
+        (0..length)
+            .map(|index| match index.checked_sub(1) {
+                Some(parent) => dag_commit(1_000 + index as i64, &[parent]),
+                None => dag_commit(1_000, &[]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn incremental_walk_reads_only_commits_near_the_boundary() {
+        let repo = TestRepo::new();
+        let ids = import_dag(&repo, &linear_dag(400));
+        let (selection, commits_read) = check_commit_walk(&repo, &ids, &[399], &[394], &[], true);
+        assert_eq!(
+            selection.send_commits,
+            ids[395..].iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(selection.boundary_commits, BTreeSet::from([ids[394]]));
+        // The five new commits, the have, and at most the slop below it.
+        assert!(
+            commits_read <= 5 + 1 + COMMIT_WALK_SLOP + 1,
+            "read {commits_read} of 400 commits"
+        );
+
+        // Nothing new: only the want itself is read.
+        let (selection, commits_read) = check_commit_walk(&repo, &ids, &[399], &[399], &[], true);
+        assert!(selection.send_commits.is_empty() && selection.boundary_commits.is_empty());
+        assert_eq!(commits_read, 1);
+
+        // A have far behind still costs only the commits in between.
+        let (selection, commits_read) = check_commit_walk(&repo, &ids, &[399], &[200], &[], true);
+        assert_eq!(selection.send_commits.len(), 199);
+        assert!(commits_read <= 199 + 1 + COMMIT_WALK_SLOP + 1);
+
+        // A have newer than the want sends nothing.
+        let (selection, _) = check_commit_walk(&repo, &ids, &[300], &[399], &[], true);
+        assert!(selection.send_commits.is_empty());
+        assert_eq!(selection.boundary_commits, BTreeSet::new());
+
+        // No haves: an initial clone sends the whole history.
+        let (selection, commits_read) = check_commit_walk(&repo, &ids, &[399], &[], &[], true);
+        assert_eq!(selection.send_commits.len(), 400);
+        assert_eq!(commits_read, 400);
+    }
+
+    #[test]
+    fn commit_walk_handles_merges_and_disjoint_histories() {
+        let repo = TestRepo::new();
+        // 0 - 1 - 3 (diamond merge of 1 and 2) - 5 (octopus of 3, 2, 4)
+        //  \- 2 ----/-----------------------/      4 is a separate root
+        // 6 - 7 is a disjoint history.
+        let ids = import_dag(
+            &repo,
+            &[
+                dag_commit(100, &[]),
+                dag_commit(110, &[0]),
+                dag_commit(120, &[0]),
+                dag_commit(130, &[1, 2]),
+                dag_commit(140, &[]),
+                dag_commit(150, &[3, 2, 4]),
+                dag_commit(160, &[]),
+                dag_commit(170, &[6]),
+            ],
+        );
+        let cases: [(&[usize], &[usize], &[usize]); 12] = [
+            (&[3], &[1], &[]),
+            (&[3], &[2], &[]),
+            (&[3], &[1, 2], &[]),
+            (&[5], &[1], &[]),
+            (&[5], &[3], &[]),
+            (&[5], &[4, 1], &[]),
+            (&[5, 7], &[6, 3], &[]),
+            (&[7], &[5], &[]),
+            (&[5], &[7], &[]),
+            (&[3, 3], &[3, 0, 0], &[]),
+            (&[5], &[], &[3]),
+            (&[5], &[0], &[3]),
+        ];
+        for (wants, haves, shallow) in cases {
+            check_commit_walk(&repo, &ids, wants, haves, shallow, true);
+        }
+        let (selection, _) = check_commit_walk(&repo, &ids, &[3], &[1], &[], true);
+        assert_eq!(selection.send_commit_set, HashSet::from([ids[3], ids[2]]));
+        assert_eq!(selection.boundary_commits, BTreeSet::from([ids[0], ids[1]]));
+        let (selection, _) = check_commit_walk(&repo, &ids, &[7], &[5], &[], true);
+        assert_eq!(selection.send_commit_set, HashSet::from([ids[6], ids[7]]));
+        assert!(selection.boundary_commits.is_empty());
+    }
+
+    #[test]
+    fn commit_walk_survives_clock_skew() {
+        let repo = TestRepo::new();
+        let ids = import_dag(
+            &repo,
+            &[
+                // 0: shared base.
+                dag_commit(1_000, &[]),
+                // 1: have, older than its parent.
+                dag_commit(10, &[0]),
+                // 2: want, older than its parent and than the have.
+                dag_commit(5, &[0]),
+                // 3: a new commit far newer than its child 4 (the want).
+                dag_commit(9_000, &[0]),
+                dag_commit(20, &[3]),
+                // 5: a have whose parent 3 is newer than everything else.
+                dag_commit(30, &[3]),
+                // 6: merges the have 1 and the new 3 with an old time.
+                dag_commit(1, &[1, 3]),
+            ],
+        );
+        for (wants, haves) in [
+            (&[2][..], &[1][..]),
+            (&[4], &[1]),
+            (&[4], &[5]),
+            (&[6], &[1]),
+            (&[6], &[5]),
+            (&[2, 4], &[1, 5]),
+            (&[6], &[2]),
+        ] {
+            check_commit_walk(&repo, &ids, wants, haves, &[], true);
+        }
+        let (selection, _) = check_commit_walk(&repo, &ids, &[4], &[5], &[], true);
+        assert_eq!(selection.send_commits, vec![ids[4]]);
+        assert_eq!(selection.boundary_commits, BTreeSet::from([ids[3]]));
+    }
+
+    #[test]
+    fn severe_clock_skew_only_ever_sends_more() {
+        let repo = TestRepo::new();
+        // 0..=99: an old history with new times; 100..=199: the have's
+        // branch off 99 with times far older than all of it; 200: the want,
+        // also off 99. The have is popped last, after the slop ran out.
+        let mut commits = linear_dag(100);
+        for commit in &mut commits {
+            commit.time += 1_000_000;
+        }
+        for index in 100..200 {
+            commits.push(dag_commit(index as i64, &[index - 1]));
+        }
+        commits.push(dag_commit(2_000_000, &[99]));
+        let ids = import_dag(&repo, &commits);
+        let (selection, _) = check_commit_walk(&repo, &ids, &[200], &[199], &[], false);
+        assert!(selection.send_commit_set.contains(&ids[200]));
+        // The skew did cost something: the shared history went out again.
+        assert!(selection.send_commit_set.contains(&ids[99]));
+    }
+
+    #[test]
+    fn commit_walk_matches_the_full_walk_on_generated_histories() {
+        // A small deterministic generator (an LCG) keeps the test reproducible.
+        let mut seed: u64 = 0x5c41_d00d;
+        let mut next = move |bound: u64| -> u64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let mut shape = Vec::new();
+        for index in 0..150_usize {
+            let mut parents = Vec::new();
+            if index > 0 && next(12) != 0 {
+                let extra = match next(20) {
+                    0 => 2,
+                    1..=3 => 1,
+                    _ => 0,
+                };
+                let window = index.min(12) as u64;
+                for _ in 0..=extra {
+                    let parent = index - 1 - next(window) as usize;
+                    if !parents.contains(&parent) {
+                        parents.push(parent);
+                    }
+                }
+            }
+            shape.push(parents);
+        }
+        let mut cases = Vec::new();
+        for _ in 0..150 {
+            let pick = |count: u64, next: &mut dyn FnMut(u64) -> u64| -> Vec<usize> {
+                (0..count).map(|_| next(150) as usize).collect()
+            };
+            let want_count = 1 + next(3);
+            let have_count = next(4);
+            let shallow_count = if next(4) == 0 { 1 + next(2) } else { 0 };
+            cases.push((
+                pick(want_count, &mut next),
+                pick(have_count, &mut next),
+                pick(shallow_count, &mut next),
+            ));
+        }
+        for is_skewed in [false, true] {
+            let repo = TestRepo::new();
+            let commits: Vec<DagCommit> = shape
+                .iter()
+                .enumerate()
+                .map(|(index, parents)| {
+                    // Monotone times make the walk exact; random ones skew
+                    // most parent-child pairs.
+                    let time = if is_skewed {
+                        next(5_000) as i64
+                    } else {
+                        1_000 + 10 * index as i64
+                    };
+                    dag_commit(time, parents)
+                })
+                .collect();
+            let ids = import_dag(&repo, &commits);
+            for (wants, haves, shallow) in &cases {
+                check_commit_walk(&repo, &ids, wants, haves, shallow, !is_skewed);
+            }
+        }
+    }
+
+    /// `(path, contents)` to write in a [`DagCommit`].
+    fn file(path: &str, contents: &str) -> (String, Option<String>) {
+        (path.to_owned(), Some(contents.to_owned()))
+    }
+
+    #[test]
+    fn deep_incremental_fetch_sends_a_blob_moved_out_of_a_withheld_path() {
+        let repo = TestRepo::new();
+        let mut commits = linear_dag(300);
+        commits[0].files = vec![
+            file("config/billing/key.txt", "billing key\n"),
+            file("config/billing/other.txt", "other secret\n"),
+            file("public/a.txt", "a\n"),
+        ];
+        commits[150].files = vec![file("public/b.txt", "b\n")];
+        // The move, committed with a clock far behind its parent.
+        let mut moved = dag_commit(5, &[299]);
+        moved.files = vec![
+            ("config/billing/key.txt".to_owned(), None),
+            file("public/key.txt", "billing key\n"),
+            file("config/billing/new.txt", "new secret\n"),
+        ];
+        commits.push(moved);
+        let ids = import_dag(&repo, &commits);
+        let head = ids[300].to_string();
+        let have = ids[299].to_string();
+        let key = repo.rev_parse(&format!("{head}:public/key.txt"));
+        let new_secret = repo.rev_parse(&format!("{head}:config/billing/new.txt"));
+        let a = repo.rev_parse(&format!("{head}:public/a.txt"));
+        let b = repo.rev_parse(&format!("{head}:public/b.txt"));
+        let public_tree = repo.rev_parse(&format!("{head}:public"));
+
+        let selection = select_ok(
+            &repo,
+            &PACK_ARGS,
+            &format!("{head}\n--not\n{have}\n"),
+            &[],
+            &[],
+        );
+        let ids_sent = selected_ids(&selection);
+        assert!(ids_sent.contains(&head));
+        assert!(ids_sent.contains(&public_tree));
+        assert!(
+            ids_sent.contains(&key),
+            "the newly visible blob was not sent"
+        );
+        assert!(!ids_sent.contains(&new_secret), "a withheld blob was sent");
+        assert!(selection.withheld_any_blob);
+        for had in [&have, &a, &b] {
+            assert!(!ids_sent.contains(had), "{had} was sent again");
+        }
+        // The commit, the root, `public`, `config` and `config/billing`
+        // trees, and the moved blob.
+        assert_eq!(ids_sent.len(), 6, "{ids_sent:?}");
+
+        // A member of `billing` gets the new secret too, and still nothing had.
+        let allowed = select_ok(
+            &repo,
+            &PACK_ARGS,
+            &format!("{head}\n--not\n{have}\n"),
+            &["billing"],
+            &[],
+        );
+        let allowed_ids = selected_ids(&allowed);
+        assert!(allowed_ids.contains(&new_secret));
+        assert!(
+            !allowed_ids.contains(&key),
+            "a blob the member had was sent"
+        );
+    }
+
+    #[test]
+    fn non_utf8_paths_are_withheld_and_judged_per_path() {
+        let repo = TestRepo::new();
+        let mut root = dag_commit(1_000, &[]);
+        root.files = vec![
+            file("\"public/caf\\351/a.txt\"", "under a non-UTF-8 directory\n"),
+            file("\"public/b\\377.txt\"", "non-UTF-8 name\n"),
+            file("public/visible.txt", "visible\n"),
+            file("public/copy/same.txt", "same\n"),
+            file("config/billing/same.txt", "same\n"),
+        ];
+        let ids = import_dag(&repo, &[root]);
+        let commit = ids[0].to_string();
+        let blob = |data: &str| repo.git_with_stdin(&["hash-object", "--stdin"], data);
+        let selection = select_ok(&repo, &PACK_ARGS, &format!("{commit}\n"), &[], &[]);
+        let sent = selected_ids(&selection);
+        assert!(selection.withheld_any_blob);
+        assert!(!sent.contains(&blob("under a non-UTF-8 directory\n")));
+        assert!(!sent.contains(&blob("non-UTF-8 name\n")));
+        assert!(sent.contains(&blob("visible\n")));
+        assert!(sent.contains(&blob("same\n")));
+        assert_eq!(
+            selection.objects.len(),
+            sent.len(),
+            "an object was listed twice"
+        );
+        assert!(
+            selection
+                .objects
+                .iter()
+                .all(|(_, hint)| hint.as_deref().is_none_or(|hint| hint.is_ascii()))
+        );
+
+        // A path that cannot be judged stays withheld even from a member
+        // every rule allows (such a member never runs the hook anyway).
+        let allowed = select_ok(&repo, &PACK_ARGS, &format!("{commit}\n"), &["billing"], &[]);
+        assert!(allowed.withheld_any_blob);
+        let allowed_ids = selected_ids(&allowed);
+        assert!(!allowed_ids.contains(&blob("non-UTF-8 name\n")));
+        assert!(allowed_ids.contains(&blob("visible\n")));
+    }
+
+    #[test]
+    fn delta_base_cache_keeps_the_most_recently_used_objects() {
+        use gix::{objs::Kind, odb::pack::cache::DecodeEntry};
+
+        let mut cache = DeltaBaseCache::default();
+        let mut out = b"stale".to_vec();
+        assert_eq!(cache.get(0, 10, &mut out), None);
+        cache.put(0, 10, b"tree data", Kind::Tree, 7);
+        assert_eq!(cache.get(0, 10, &mut out), Some((Kind::Tree, 7)));
+        assert_eq!(out, b"tree data");
+        // Keyed by pack and offset.
+        assert_eq!(cache.get(1, 10, &mut out), None);
+
+        // Filling it evicts the least recently used: offset 10 was just read,
+        // so offset 11 goes first.
+        cache.put(0, 11, b"x", Kind::Blob, 1);
+        assert!(cache.get(0, 10, &mut out).is_some());
+        for offset in 0..(DELTA_BASE_CACHE_ENTRIES as u64 - 2) {
+            cache.put(1, offset, b"y", Kind::Blob, 1);
+        }
+        assert_eq!(cache.entries.len(), DELTA_BASE_CACHE_ENTRIES);
+        cache.put(2, 0, b"z", Kind::Commit, 1);
+        assert_eq!(cache.entries.len(), DELTA_BASE_CACHE_ENTRIES);
+        assert_eq!(cache.get(0, 11, &mut out), None);
+        assert!(cache.get(0, 10, &mut out).is_some());
+
+        // Replacing an entry keeps the byte count right; huge objects are skipped.
+        cache.put(2, 0, b"zz", Kind::Commit, 2);
+        let bytes: usize = cache.entries.iter().map(|entry| entry.data.len()).sum();
+        assert_eq!(cache.total_bytes, bytes);
+        cache.put(
+            3,
+            0,
+            &vec![0; DELTA_BASE_CACHE_BYTES / 4 + 1],
+            Kind::Blob,
+            1,
+        );
+        assert_eq!(cache.get(3, 0, &mut out), None);
     }
 }
