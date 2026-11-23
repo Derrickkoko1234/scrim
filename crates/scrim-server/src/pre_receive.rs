@@ -259,9 +259,11 @@ const INVALID_HOOK_REQUEST_MESSAGE: &str = "scrim: push rejected: invalid pre-re
 const WITHHELD_CONTENT_MESSAGE: &str =
     "scrim: push rejected: references the content of a path withheld from you";
 
-/// The empty blob: its content is known to everyone, so it is never treated
-/// as withheld content.
-const EMPTY_BLOB_ID: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+/// The empty blob in SHA-1 and SHA-256 repositories: its content is known to
+/// everyone, so it is never treated as withheld content.
+const EMPTY_SHA1_BLOB_ID: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+const EMPTY_SHA256_BLOB_ID: &str =
+    "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
 
 /// What the hook sends to the callback listener.
 #[derive(Serialize, Deserialize)]
@@ -1825,7 +1827,8 @@ async fn check_withheld_paths(
         }
     }
 
-    candidate_blobs.remove(EMPTY_BLOB_ID);
+    candidate_blobs.remove(EMPTY_SHA1_BLOB_ID);
+    candidate_blobs.remove(EMPTY_SHA256_BLOB_ID);
     if candidate_blobs.is_empty() {
         return Ok(());
     }

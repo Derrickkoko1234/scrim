@@ -23,7 +23,7 @@ flate2 = "1.1.11"
 fred = { version = "10.1.0", default-features = false, features = ["i-keys", "enable-rustls-ring"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
-gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+gix = { version = "0.90.0", default-features = false, features = ["sha1", "sha256"] }
 hmac = "0.13.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 russh = { version = "0.65.4", default-features = false, features = ["ring", "flate2"] }
