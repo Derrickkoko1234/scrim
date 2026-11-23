@@ -64,8 +64,8 @@ pub use backup::{
     S3SigningRequest, run_backup, run_restore, sign_s3_request,
 };
 use git_service::{
-    GitService, GitVisibilityConfig, advertise_refs, list_repo_refs, sanitize_git_protocol,
-    serve_rpc,
+    GitService, GitVisibilityConfig, RepoRefEntry, advertise_refs, list_repo_refs,
+    sanitize_git_protocol, serve_rpc,
 };
 pub use pack_withhold::{
     PACK_OBJECTS_HOOK_MODE, PACK_OBJECTS_HOOK_MODE_ENV, run_pack_objects_hook_process,
@@ -586,30 +586,35 @@ enum Visibility {
 /// Decides what `policy`'s member may see in the repository at `repo_dir`.
 ///
 /// A member who satisfies every branch and withholding rule sees everything,
-/// at no extra cost. A member with withheld paths but no hidden refs gets
-/// `enforce_visibility` alone: git then speaks protocol v0, whose wants are
-/// limited to advertised tips, and `deepen-not` is refused. Otherwise the
-/// repository's refs are listed and `HEAD` is re-read (as close
-/// to starting git as possible), and:
+/// at no extra cost. Otherwise the repository's refs are listed and `HEAD` is
+/// re-read (as close to starting git as possible), git is made to speak
+/// protocol v0 (whose wants are limited to advertised tips, and which refuses
+/// `deepen-not`), and:
 /// - a symbolic `HEAD` whose chain reaches a hidden ref is refused outright:
 ///   `transfer.hideRefs` cannot hide it, and git would still advertise its
 ///   object ID and `symref=HEAD:<target>`;
 /// - a symbolic ref whose chain reaches a hidden ref is hidden by name, since
 ///   git would advertise it with the hidden ref's object ID;
 /// - a detached `HEAD` is hidden, as it may point at a commit only reachable
-///   from hidden refs.
+///   from hidden refs, or (for a member with withheld paths) at a non-commit.
+///
+/// For a member with withheld paths, every ref that does not peel to a commit
+/// (see [`leads_to_non_commit`]) is hidden too: the `pack-objects` hook
+/// refuses such wants, since a bare blob or tree has no path to check, so
+/// advertising one (such as a tag naming a blob) would make every clone fail.
 async fn compute_visibility(
     policy: &MemberRepoPolicy,
     repo_dir: &Path,
 ) -> std::io::Result<Visibility> {
     let plan = policy.branch_policy.hidden_ref_plan(&policy.member_groups);
-    if !plan.has_unsatisfied_rules() {
-        let has_withheld_paths = policy
-            .withhold_policy
-            .has_withheld_rules(&policy.member_groups);
+    let has_hidden_branches = plan.has_unsatisfied_rules();
+    let has_withheld_paths = policy
+        .withhold_policy
+        .has_withheld_rules(&policy.member_groups);
+    if !has_hidden_branches && !has_withheld_paths {
         return Ok(Visibility::Allowed(GitVisibilityConfig {
             hidden_refs: Vec::new(),
-            enforce_visibility: has_withheld_paths,
+            enforce_visibility: false,
         }));
     }
 
@@ -629,21 +634,56 @@ async fn compute_visibility(
                 .map(|target| (entry.name.as_str(), target))
         })
         .collect();
+    let refs_by_name: BTreeMap<&str, &RepoRefEntry> = repo_refs
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
 
-    if let RepoHead::Symbolic(head_target) = &head
-        && !policy
-            .branch_policy
-            .is_ref_chain_visible(head_target, &symrefs, &policy.member_groups)
-    {
-        return Ok(Visibility::HeadHidden);
+    if let RepoHead::Symbolic(head_target) = &head {
+        let is_branch_hidden = !policy.branch_policy.is_ref_chain_visible(
+            head_target,
+            &symrefs,
+            &policy.member_groups,
+        );
+        if is_branch_hidden
+            || (has_withheld_paths && leads_to_non_commit(head_target, &refs_by_name))
+        {
+            return Ok(Visibility::HeadHidden);
+        }
     }
 
-    let mut hidden_refs = plan.resolve_hide_refs_with_symrefs(
-        &policy.branch_policy,
-        &policy.member_groups,
-        repo_refs.iter().map(|entry| entry.name.as_str()),
-        &symrefs,
-    );
+    let mut hidden_refs = if has_hidden_branches {
+        plan.resolve_hide_refs_with_symrefs(
+            &policy.branch_policy,
+            &policy.member_groups,
+            repo_refs.iter().map(|entry| entry.name.as_str()),
+            &symrefs,
+        )
+    } else {
+        Vec::new()
+    };
+    if has_withheld_paths {
+        // Appended after the branch values, `!` negations included: git lets
+        // later values win, so no negation can re-expose these. Refs the
+        // branch rules hide are already hidden and never negated, so they are
+        // skipped. A value also hides the refs below it, but git cannot store
+        // both `refs/tags/x` and `refs/tags/x/y`, so that only matters for a
+        // ref created after this listing, which is then hidden too (fails
+        // closed).
+        hidden_refs.extend(
+            repo_refs
+                .iter()
+                .filter(|entry| {
+                    leads_to_non_commit(&entry.name, &refs_by_name)
+                        && policy.branch_policy.is_ref_chain_visible(
+                            &entry.name,
+                            &symrefs,
+                            &policy.member_groups,
+                        )
+                })
+                .map(|entry| entry.name.clone()),
+        );
+    }
     if head == RepoHead::Detached {
         hidden_refs.push("HEAD".to_owned());
     }
@@ -653,7 +693,106 @@ async fn compute_visibility(
     }))
 }
 
+/// Most symbolic-ref hops [`leads_to_non_commit`] follows before failing
+/// closed. Git itself gives up after 5.
+const MAX_SYMREF_HOPS: usize = 16;
+
+/// Whether `ref_name`, or any ref its symbolic chain in `refs_by_name` leads
+/// to, names something that does not peel to a commit (see
+/// [`RepoRefEntry::peels_to_commit`]).
+///
+/// An unlisted `ref_name` is an unborn branch (for example `HEAD` of an empty
+/// repository), which git does not advertise, so it counts as `false`. A
+/// listed symbolic ref whose target is unlisted (dangling, or deleted
+/// concurrently), a cycle, or a chain longer than [`MAX_SYMREF_HOPS`] counts
+/// as `true`, failing closed.
+fn leads_to_non_commit(ref_name: &str, refs_by_name: &BTreeMap<&str, &RepoRefEntry>) -> bool {
+    let mut current = ref_name;
+    for _ in 0..=MAX_SYMREF_HOPS {
+        let Some(entry) = refs_by_name.get(current) else {
+            return current != ref_name;
+        };
+        if !entry.peels_to_commit() {
+            return true;
+        }
+        match &entry.symref_target {
+            Some(target) => current = target,
+            None => return false,
+        }
+    }
+    true
+}
+
 fn git_response(service: GitService, kind: &str, body: Body) -> Response {
     let content_type = format!("application/x-{}-{kind}", service.service_name());
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::leads_to_non_commit;
+    use crate::git_service::{GitObjectType, RepoRefEntry};
+
+    fn entry(
+        name: &str,
+        symref_target: Option<&str>,
+        object_type: GitObjectType,
+        peeled_object_type: Option<GitObjectType>,
+    ) -> RepoRefEntry {
+        RepoRefEntry {
+            name: name.to_owned(),
+            symref_target: symref_target.map(str::to_owned),
+            object_type,
+            peeled_object_type,
+        }
+    }
+
+    #[test]
+    fn non_commit_detection_follows_symref_chains_and_fails_closed() {
+        let commit = GitObjectType::Commit;
+        let blob = GitObjectType::Blob;
+        let tag = GitObjectType::Tag;
+        let refs = [
+            entry("refs/heads/main", None, commit, None),
+            entry("refs/tags/blob", None, blob, None),
+            entry("refs/tags/ann-commit", None, tag, Some(commit)),
+            entry("refs/tags/ann-blob", None, tag, Some(blob)),
+            entry("refs/tags/one-level", None, tag, Some(tag)),
+            entry("refs/heads/alias", Some("refs/heads/main"), commit, None),
+            // Reported as a commit but pointing at a blob ref: the chain wins.
+            entry(
+                "refs/heads/stale-alias",
+                Some("refs/tags/blob"),
+                commit,
+                None,
+            ),
+            entry("refs/heads/dangling", Some("refs/heads/gone"), commit, None),
+            entry("refs/heads/loop-a", Some("refs/heads/loop-b"), commit, None),
+            entry("refs/heads/loop-b", Some("refs/heads/loop-a"), commit, None),
+        ];
+        let refs_by_name: BTreeMap<&str, &RepoRefEntry> = refs
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry))
+            .collect();
+        for (ref_name, expected) in [
+            ("refs/heads/main", false),
+            ("refs/tags/ann-commit", false),
+            ("refs/heads/alias", false),
+            ("refs/heads/unborn", false),
+            ("refs/tags/blob", true),
+            ("refs/tags/ann-blob", true),
+            ("refs/tags/one-level", true),
+            ("refs/heads/stale-alias", true),
+            ("refs/heads/dangling", true),
+            ("refs/heads/loop-a", true),
+        ] {
+            assert_eq!(
+                leads_to_non_commit(ref_name, &refs_by_name),
+                expected,
+                "{ref_name}"
+            );
+        }
+    }
 }

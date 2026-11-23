@@ -672,6 +672,55 @@ async fn withheld_blobs_stay_on_the_server_over_ssh() {
     .await;
 }
 
+/// A tag naming a blob (like git/git's `refs/tags/junio-gpg-pub`) is not
+/// advertised to a member with withheld paths, whose clone would otherwise
+/// abort on the non-commit want; an unrestricted member still sees it.
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_tags_are_hidden_from_restricted_members_over_ssh() {
+    with_fixture(|fixture| {
+        let bare = fixture.root.path().join("team.git");
+        let blob = stdout_text(
+            &fixture
+                .sandbox
+                .git(&bare, &["rev-parse", "main:public/readme.txt"]),
+        );
+        fixture
+            .sandbox
+            .git(&bare, &["update-ref", "refs/tags/junio-gpg-pub", &blob]);
+
+        for protocol in ["0", "2"] {
+            assert!(
+                !fixture
+                    .ls_remote(CAROL, protocol)
+                    .contains("refs/tags/junio-gpg-pub")
+            );
+            let name = format!("carol-v{protocol}");
+            let clone = fixture.clone_as(
+                CAROL,
+                protocol,
+                &name,
+                &[PARTIAL_CLONE_FILTER, "--no-checkout"],
+            );
+            fixture.git_as(
+                CAROL,
+                protocol,
+                &clone,
+                &["fetch", "--quiet", "origin", "+refs/tags/*:refs/tags/*"],
+            );
+            assert_eq!(
+                stdout_text(&fixture.sandbox.git(&clone, &["tag", "--list"])),
+                ""
+            );
+        }
+        assert!(
+            fixture
+                .ls_remote(ALICE, "2")
+                .contains(&format!("{blob}\trefs/tags/junio-gpg-pub"))
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn revoked_keys_and_members_are_refused_over_ssh() {
     with_fixture(|fixture| {

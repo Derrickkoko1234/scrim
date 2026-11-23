@@ -74,6 +74,53 @@ pub struct RepoRefEntry {
     /// The ref a symbolic ref points at, as git's `%(symref)` reports it;
     /// `None` for a regular ref.
     pub symref_target: Option<String>,
+    /// Type of the object the ref names (for a symbolic ref, the object its
+    /// target names), as git's `%(objecttype)` reports it.
+    pub object_type: GitObjectType,
+    /// For an annotated tag, the type of the object git's `%(*objecttype)`
+    /// peels it to; `None` for any other object type.
+    pub peeled_object_type: Option<GitObjectType>,
+}
+
+impl RepoRefEntry {
+    /// Whether the ref names a commit, directly or through annotated tags.
+    ///
+    /// Git 2.40+ peels nested tags fully for `%(*objecttype)`; an older git
+    /// that peels one level reports `tag` for a nested tag, which counts as
+    /// not a commit, so the answer fails closed.
+    pub fn peels_to_commit(&self) -> bool {
+        match self.object_type {
+            GitObjectType::Commit => true,
+            GitObjectType::Tag => self.peeled_object_type == Some(GitObjectType::Commit),
+            GitObjectType::Tree | GitObjectType::Blob => false,
+        }
+    }
+}
+
+/// The four Git object types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitObjectType {
+    /// A commit.
+    Commit,
+    /// A tree.
+    Tree,
+    /// A blob.
+    Blob,
+    /// An annotated tag.
+    Tag,
+}
+
+impl GitObjectType {
+    /// Parses a type name as git prints it, e.g. `commit`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "commit" => Some(Self::Commit),
+            "tree" => Some(Self::Tree),
+            "blob" => Some(Self::Blob),
+            "tag" => Some(Self::Tag),
+            _ => None,
+        }
+    }
 }
 
 /// The two Git services a client may request over smart HTTP.
@@ -698,19 +745,23 @@ fn spawn_git(
 
 /// Lists every ref in the bare repository at `repo_dir`, e.g.
 /// `refs/heads/main` and `refs/tags/v1`, with the target of each symbolic
-/// ref, in git's sort order.
+/// ref and the type of object each names, in git's sort order.
+///
+/// Git omits (with a warning) symbolic refs whose target does not exist, as
+/// `upload-pack` does when advertising, and reports a symbolic ref's object
+/// type and final target after following its whole chain.
 ///
 /// Runs git with the same isolated environment as the protocol services.
 /// Fails if git exits unsuccessfully or prints anything that is not UTF-8 or
-/// not one `<refname>NUL<symref>` line per ref: a silently skipped ref could
-/// never be matched by a hide rule.
+/// not one `<refname>NUL<symref>NUL<objecttype>NUL<*objecttype>` line per
+/// ref: a silently skipped ref could never be matched by a hide rule.
 pub async fn list_repo_refs(repo_dir: &Path) -> io::Result<Vec<RepoRefEntry>> {
     let mut command = Command::new("git");
     command
         .arg("--git-dir")
         .arg(repo_dir)
         .arg("for-each-ref")
-        .arg("--format=%(refname)%00%(symref)");
+        .arg("--format=%(refname)%00%(symref)%00%(objecttype)%00%(*objecttype)");
     command.env_clear();
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
@@ -743,19 +794,37 @@ pub async fn list_repo_refs(repo_dir: &Path) -> io::Result<Vec<RepoRefEntry>> {
     parse_ref_listing(&stdout)
 }
 
-/// Parses `git for-each-ref --format=%(refname)%00%(symref)` output.
+/// Parses `git for-each-ref` output in the format [`list_repo_refs`] asks
+/// for.
+///
+/// Rejects any line without exactly four fields, an empty ref name, an unknown
+/// object type, a peeled type on a non-tag, or a tag without a peeled type.
 fn parse_ref_listing(listing: &str) -> io::Result<Vec<RepoRefEntry>> {
     let mut entries = Vec::new();
     for line in listing.split_terminator('\n') {
-        let Some((name, symref_target)) = line.split_once('\0') else {
+        let fields: Vec<&str> = line.split('\0').collect();
+        let [name, symref_target, object_type, peeled_object_type] = fields[..] else {
             return Err(invalid_ref_line(line));
         };
-        if name.is_empty() || symref_target.contains('\0') {
+        if name.is_empty() {
             return Err(invalid_ref_line(line));
         }
+        let Some(object_type) = GitObjectType::from_name(object_type) else {
+            return Err(invalid_ref_line(line));
+        };
+        let peeled_object_type = match (object_type, peeled_object_type) {
+            (GitObjectType::Tag, peeled) => match GitObjectType::from_name(peeled) {
+                Some(peeled) => Some(peeled),
+                None => return Err(invalid_ref_line(line)),
+            },
+            (_, "") => None,
+            (_, _) => return Err(invalid_ref_line(line)),
+        };
         entries.push(RepoRefEntry {
             name: name.to_owned(),
             symref_target: (!symref_target.is_empty()).then(|| symref_target.to_owned()),
+            object_type,
+            peeled_object_type,
         });
     }
     Ok(entries)
@@ -1063,9 +1132,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        GitInvocation, GitService, GitVisibilityConfig, RepoRefEntry, UploadPackRequestFilter,
-        advertise_refs, list_repo_refs, parse_ref_listing, sanitize_git_protocol, serve_rpc,
-        spawn_git,
+        GitInvocation, GitObjectType, GitService, GitVisibilityConfig, RepoRefEntry,
+        UploadPackRequestFilter, advertise_refs, list_repo_refs, parse_ref_listing,
+        sanitize_git_protocol, serve_rpc, spawn_git,
     };
 
     /// A bare repository with `refs/heads/main` (commit `main_commit`, also
@@ -1218,10 +1287,17 @@ mod tests {
         }
     }
 
-    fn ref_entry(name: &str, symref_target: Option<&str>) -> RepoRefEntry {
+    fn ref_entry(
+        name: &str,
+        symref_target: Option<&str>,
+        object_type: GitObjectType,
+        peeled_object_type: Option<GitObjectType>,
+    ) -> RepoRefEntry {
         RepoRefEntry {
             name: name.to_owned(),
             symref_target: symref_target.map(str::to_owned),
+            object_type,
+            peeled_object_type,
         }
     }
 
@@ -1242,13 +1318,117 @@ mod tests {
             Ok(refs) => refs,
             Err(error) => panic!("list_repo_refs failed: {error}"),
         };
+        let commit = GitObjectType::Commit;
         assert_eq!(
             refs,
             [
-                ref_entry("refs/heads/alias", Some("refs/heads/private/secret")),
-                ref_entry("refs/heads/main", None),
-                ref_entry("refs/heads/private/secret", None),
-                ref_entry("refs/tags/v1", None),
+                ref_entry(
+                    "refs/heads/alias",
+                    Some("refs/heads/private/secret"),
+                    commit,
+                    None
+                ),
+                ref_entry("refs/heads/main", None, commit, None),
+                ref_entry("refs/heads/private/secret", None, commit, None),
+                ref_entry("refs/tags/v1", None, commit, None),
+            ]
+        );
+    }
+
+    /// Pins down what git reports for every way a ref can name a non-commit:
+    /// direct refs to blobs and trees, annotated and nested annotated tags,
+    /// symbolic refs (including chains) and a dangling symbolic ref.
+    #[tokio::test]
+    async fn lists_object_types_of_tags_nested_tags_and_symrefs() {
+        let repo = create_test_repo();
+        let Some(git_dir) = repo.dir.to_str() else {
+            panic!("repo path is not UTF-8");
+        };
+        let git = |args: &[&str]| {
+            let mut full_args = vec!["--git-dir", git_dir];
+            full_args.extend_from_slice(args);
+            run_git(&full_args)
+        };
+        // stdin is null, so this writes the empty blob.
+        let blob = git(&["hash-object", "-w", "--stdin"]);
+        let tree = git(&["mktree"]);
+        git(&["update-ref", "refs/tags/blob", &blob]);
+        git(&["update-ref", "refs/tags/tree", &tree]);
+        let tag_args = ["-c", "advice.nestedTag=false", "tag", "-a", "-m", "tag"];
+        for (name, target) in [
+            ("ann-commit", repo.main_commit.as_str()),
+            ("ann-blob", blob.as_str()),
+            ("ann-tree", tree.as_str()),
+            ("nested-commit", "refs/tags/ann-commit"),
+            ("nested-blob", "refs/tags/ann-blob"),
+            ("nested-twice-commit", "refs/tags/nested-commit"),
+        ] {
+            let mut args = tag_args.to_vec();
+            args.extend_from_slice(&[name, target]);
+            git(&args);
+        }
+        git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
+        git(&[
+            "symbolic-ref",
+            "refs/heads/alias-of-alias",
+            "refs/heads/alias",
+        ]);
+        git(&["symbolic-ref", "refs/tags/blob-alias", "refs/tags/blob"]);
+        git(&["symbolic-ref", "refs/heads/dangling", "refs/heads/missing"]);
+
+        let refs = match list_repo_refs(&repo.dir).await {
+            Ok(refs) => refs,
+            Err(error) => panic!("list_repo_refs failed: {error}"),
+        };
+        let (commit, tree, blob, tag) = (
+            GitObjectType::Commit,
+            GitObjectType::Tree,
+            GitObjectType::Blob,
+            GitObjectType::Tag,
+        );
+        assert_eq!(
+            refs,
+            [
+                // A chain is reported with its final target; the dangling
+                // symbolic ref is left out.
+                ref_entry("refs/heads/alias", Some("refs/heads/main"), commit, None),
+                ref_entry(
+                    "refs/heads/alias-of-alias",
+                    Some("refs/heads/main"),
+                    commit,
+                    None
+                ),
+                ref_entry("refs/heads/main", None, commit, None),
+                ref_entry("refs/heads/private/secret", None, commit, None),
+                ref_entry("refs/tags/ann-blob", None, tag, Some(blob)),
+                ref_entry("refs/tags/ann-commit", None, tag, Some(commit)),
+                ref_entry("refs/tags/ann-tree", None, tag, Some(tree)),
+                ref_entry("refs/tags/blob", None, blob, None),
+                ref_entry("refs/tags/blob-alias", Some("refs/tags/blob"), blob, None),
+                // `%(*objecttype)` peels through every tag layer.
+                ref_entry("refs/tags/nested-blob", None, tag, Some(blob)),
+                ref_entry("refs/tags/nested-commit", None, tag, Some(commit)),
+                ref_entry("refs/tags/nested-twice-commit", None, tag, Some(commit)),
+                ref_entry("refs/tags/tree", None, tree, None),
+                ref_entry("refs/tags/v1", None, commit, None),
+            ]
+        );
+        let commit_refs: Vec<&str> = refs
+            .iter()
+            .filter(|entry| entry.peels_to_commit())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            commit_refs,
+            [
+                "refs/heads/alias",
+                "refs/heads/alias-of-alias",
+                "refs/heads/main",
+                "refs/heads/private/secret",
+                "refs/tags/ann-commit",
+                "refs/tags/nested-commit",
+                "refs/tags/nested-twice-commit",
+                "refs/tags/v1",
             ]
         );
     }
@@ -1259,11 +1439,40 @@ mod tests {
             Ok(entries) => assert!(entries.is_empty()),
             Err(error) => panic!("empty listing should parse: {error}"),
         }
+        match parse_ref_listing("refs/tags/t\0\0tag\0tag\nrefs/heads/a\0refs/heads/b\0commit\0\n") {
+            Ok(entries) => assert_eq!(
+                entries,
+                [
+                    // A tag peeled only one level (older git) is kept and
+                    // does not count as a commit.
+                    ref_entry(
+                        "refs/tags/t",
+                        None,
+                        GitObjectType::Tag,
+                        Some(GitObjectType::Tag)
+                    ),
+                    ref_entry(
+                        "refs/heads/a",
+                        Some("refs/heads/b"),
+                        GitObjectType::Commit,
+                        None
+                    ),
+                ]
+            ),
+            Err(error) => panic!("valid listing should parse: {error}"),
+        }
         for invalid in [
             "refs/heads/main\n",
-            "\0\n",
-            "refs/heads/a\0refs/heads/b\0x\n",
-            "refs/heads/main\0\n\n",
+            "refs/heads/main\0\n",
+            "refs/heads/main\0\0commit\n",
+            "\0\0commit\0\n",
+            "refs/heads/a\0refs/heads/b\0commit\0\0x\n",
+            "refs/heads/main\0\0commit\0\n\n",
+            "refs/heads/main\0\0Commit\0\n",
+            "refs/heads/main\0\0\0\n",
+            "refs/heads/main\0\0commit\0commit\n",
+            "refs/tags/t\0\0tag\0\n",
+            "refs/tags/t\0\0tag\0bogus\n",
         ] {
             assert!(
                 parse_ref_listing(invalid).is_err(),

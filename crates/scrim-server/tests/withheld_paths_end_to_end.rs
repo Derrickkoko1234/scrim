@@ -535,6 +535,190 @@ async fn merges_may_only_take_withheld_paths_cleanly() {
     .await;
 }
 
+/// Refs on the server's `team.git` that do not peel to a commit (the kind
+/// `git/git` has in `refs/tags/junio-gpg-pub`), which a restricted member
+/// must never be advertised, since the `pack-objects` hook refuses non-commit
+/// wants and would abort the whole clone.
+const NON_COMMIT_REFS: [&str; 6] = [
+    "refs/tags/junio-gpg-pub",
+    "refs/tags/tree-tag",
+    "refs/tags/annotated-blob",
+    "refs/tags/nested-blob",
+    "refs/tags/gpg-alias",
+    "refs/heads/gpg-branch",
+];
+
+/// Annotated tags on the server's `team.git` that peel to `main`'s commit,
+/// one directly and one through another tag.
+const COMMIT_TAGS: [&str; 2] = ["refs/tags/annotated-commit", "refs/tags/nested-commit"];
+
+/// Adds [`NON_COMMIT_REFS`] and [`COMMIT_TAGS`] to the server's `team.git`
+/// (bypassing the server) and returns the blob `junio-gpg-pub` names.
+fn add_non_commit_refs(fixture: &Fixture) -> String {
+    let bare = fixture.root.path().join("team.git");
+    let key_file = fixture.scratch.path().join("gpg-pub.asc");
+    if let Err(error) = std::fs::write(&key_file, "-----BEGIN PGP PUBLIC KEY BLOCK-----\n") {
+        panic!("failed to write the key file: {error}");
+    }
+    let git = |args: &[&str]| stdout_text(&fixture.sandbox.git(&bare, args));
+    let blob = git(&["hash-object", "-w", utf8_path(&key_file)]);
+    let tree = git(&["rev-parse", "main^{tree}"]);
+    git(&["update-ref", "refs/tags/junio-gpg-pub", &blob]);
+    git(&["update-ref", "refs/tags/tree-tag", &tree]);
+    for (name, target) in [
+        ("annotated-blob", blob.as_str()),
+        ("nested-blob", "refs/tags/annotated-blob"),
+        ("annotated-commit", "main"),
+        ("nested-commit", "refs/tags/annotated-commit"),
+    ] {
+        git(&[
+            "-c",
+            "advice.nestedTag=false",
+            "tag",
+            "-a",
+            "-m",
+            name,
+            name,
+            target,
+        ]);
+    }
+    git(&[
+        "symbolic-ref",
+        "refs/tags/gpg-alias",
+        "refs/tags/junio-gpg-pub",
+    ]);
+    // A branch-named symbolic ref, so it is visible to every branch rule.
+    git(&[
+        "symbolic-ref",
+        "refs/heads/gpg-branch",
+        "refs/tags/junio-gpg-pub",
+    ]);
+    blob
+}
+
+/// The ref names `git ls-remote` shows `member` for `team.git`.
+fn advertised_refs(fixture: &Fixture, member: Member) -> Vec<String> {
+    let output = fixture.git_as(
+        member,
+        fixture.scratch.path(),
+        &["ls-remote", &fixture.url()],
+    );
+    stdout_text(&output)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(_, name)| name.to_owned())
+        .collect()
+}
+
+/// A restricted member clones and fetches cleanly from a repository with
+/// refs naming blobs and trees: those refs are never advertised (so never
+/// wanted), tags peeling to commits still are, and the blob stays out of
+/// reach even when asked for by ID. With `with_hidden_branch`, the member
+/// also fails a branch rule, so the non-commit refs are hidden alongside the
+/// branch rule's values.
+fn restricted_member_skips_non_commit_refs(fixture: &Fixture, with_hidden_branch: bool) {
+    let blob = add_non_commit_refs(fixture);
+    let bare = fixture.root.path().join("team.git");
+    fixture.sandbox.git(
+        &bare,
+        &["update-ref", "refs/heads/vault", &fixture.base_commit],
+    );
+    if with_hidden_branch {
+        let mut store = fixture.store.clone();
+        for pattern in ["refs/heads/vault", "refs/heads/private/*"] {
+            match scrim_policy::BranchRule::new(pattern, ["billing".to_owned()]) {
+                Ok(rule) => store.insert_branch_rule("team.git", rule),
+                Err(error) => panic!("branch rule should be valid: {error}"),
+            }
+        }
+    }
+
+    let carol_refs = advertised_refs(fixture, CAROL);
+    for hidden in NON_COMMIT_REFS {
+        assert!(
+            !carol_refs.iter().any(|name| name == hidden),
+            "{hidden} advertised to carol: {carol_refs:?}"
+        );
+    }
+    for visible in COMMIT_TAGS.iter().chain(&["refs/heads/main", "HEAD"]) {
+        assert!(
+            carol_refs.iter().any(|name| name == visible),
+            "{visible} not advertised to carol: {carol_refs:?}"
+        );
+    }
+    assert_eq!(
+        carol_refs.iter().any(|name| name == "refs/heads/vault"),
+        !with_hidden_branch,
+        "{carol_refs:?}"
+    );
+
+    let clone = fixture.clone_as(CAROL, "carol", &[PARTIAL_CLONE_FILTER, "--no-checkout"]);
+    fixture.git_as(
+        CAROL,
+        &clone,
+        &["fetch", "--quiet", "origin", "+refs/tags/*:refs/tags/*"],
+    );
+    let tags = stdout_text(&fixture.sandbox.git(&clone, &["tag", "--list"]));
+    assert_eq!(
+        tags.lines().collect::<Vec<_>>(),
+        ["annotated-commit", "nested-commit"]
+    );
+    let main = fixture.server_main();
+    let peeled = fixture
+        .sandbox
+        .git(&clone, &["rev-parse", "nested-commit^{commit}"]);
+    assert_eq!(stdout_text(&peeled), main);
+
+    // Neither the ref nor the blob's ID can be fetched.
+    for target in ["refs/tags/junio-gpg-pub", blob.as_str()] {
+        let fetch = fixture.try_git_as(CAROL, &clone, &["fetch", "--quiet", "origin", target]);
+        assert!(!fetch.status.success(), "fetching {target} succeeded");
+    }
+    let has_blob = fixture.sandbox.try_git_with_env(
+        &clone,
+        &["cat-file", "-e", &blob],
+        &[("GIT_NO_LAZY_FETCH", "1")],
+    );
+    assert!(!has_blob.status.success(), "carol received the tagged blob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_member_skips_refs_naming_non_commits() {
+    with_fixture(|fixture| restricted_member_skips_non_commit_refs(fixture, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_member_with_hidden_branches_skips_refs_naming_non_commits() {
+    with_fixture(|fixture| restricted_member_skips_non_commit_refs(fixture, true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrestricted_member_still_fetches_refs_naming_non_commits() {
+    with_fixture(|fixture| {
+        let blob = add_non_commit_refs(fixture);
+        let alice_refs = advertised_refs(fixture, ALICE);
+        for expected in NON_COMMIT_REFS.iter().chain(&COMMIT_TAGS) {
+            assert!(
+                alice_refs.iter().any(|name| name == expected),
+                "{expected} not advertised to alice: {alice_refs:?}"
+            );
+        }
+        let clone = fixture.clone_as(ALICE, "alice", &[]);
+        fixture.git_as(
+            ALICE,
+            &clone,
+            &["fetch", "--quiet", "origin", "+refs/tags/*:refs/tags/*"],
+        );
+        let tagged = fixture.sandbox.git(&clone, &["rev-parse", "junio-gpg-pub"]);
+        assert_eq!(stdout_text(&tagged), blob);
+        let kind = fixture
+            .sandbox
+            .git(&clone, &["cat-file", "-t", "nested-blob^{}"]);
+        assert_eq!(stdout_text(&kind), "blob");
+    })
+    .await;
+}
+
 /// A thin pack whose `REF_DELTA` names the withheld blob as its base makes
 /// `index-pack --fix-thin` copy that blob into the quarantine; a new blob
 /// built from it at a visible path must not be published.
