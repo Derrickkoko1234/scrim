@@ -16,6 +16,7 @@ mod clone_cmd;
 pub mod config;
 mod filter;
 mod git;
+mod keychain;
 mod mirror_cmd;
 mod private_cmd;
 pub mod private_store;
@@ -41,7 +42,7 @@ use scrim_crypto::{
     EncryptedSecretsFile, MemberIdentity, MemberPublicKey, ScopeDataKey, ScopeKeysFile,
     SecretBundle, format_dotenv, rotate_scope, validate_scope_name, validate_secret_key,
 };
-use scrim_policy::{BranchPolicy, BranchRule, validate_ref_glob};
+use scrim_policy::{BranchPolicy, BranchRule, GitVersion, MIN_GIT_VERSION, validate_ref_glob};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -52,11 +53,12 @@ use crate::cli::{
 use crate::client::{ScopeRecipientInfo, ScrimClient};
 use crate::config::{
     ScrimConfig, load_config, load_member_identity, normalize_server_url, resolve_config_path,
-    resolve_identity_path, save_config, save_member_identity,
+    resolve_identity_path, save_config, save_keychain_account, save_member_identity,
 };
 use crate::git::{
-    git_configure_scrim_filter, git_local_config_get, git_local_config_set, git_remote_add,
-    git_remote_get_url, git_remote_set_url, git_toplevel, validate_remote_name,
+    MIRROR_MIN_GIT_VERSION, ensure_git_version, git_configure_scrim_filter, git_local_config_get,
+    git_local_config_set, git_remote_add, git_remote_get_url, git_remote_set_url, git_toplevel,
+    validate_remote_name,
 };
 use crate::private_store::paths_file_path;
 use crate::secrets_store::{
@@ -240,6 +242,12 @@ where
     let key_file = cli.key_file.take();
     let server_flag = cli.server.take();
 
+    if let Some((minimum, required_by)) = required_git_version(&cli.command)
+        && let Err(err) = ensure_git_version(minimum, required_by)
+    {
+        return Err(err);
+    }
+
     match cli.command {
         Command::Login(login_args) => {
             let config_path = match config_path_result {
@@ -375,11 +383,50 @@ where
             config_path_result.as_deref().ok(),
             env,
         ),
+        Command::Keychain(keychain_args) => keychain::handle_keychain(
+            keychain_args.command,
+            key_file.as_deref(),
+            server_flag,
+            token_override,
+            config_path_result,
+            env,
+            &keychain::OsKeychain,
+        ),
         Command::FilterProcess => private_cmd::handle_filter_process(
             key_file.as_deref(),
             config_path_result.as_deref().ok(),
             env,
         ),
+    }
+}
+
+/// The Git version `command` needs, or `None` when it does not drive Git.
+///
+/// Commands that work on a repository (init, clone, secrets, run, private)
+/// need Scrim's floor; `mirror` needs a release that honours
+/// `GIT_NO_LAZY_FETCH`. Admin-API commands are exempt even when they read a
+/// default from `git config` (which works on any Git), and so is `access
+/// revoke`, whose local key rotation is best-effort and must never block a
+/// revocation. `filter-process` is exempt because Git itself launched it, once
+/// per Git command, and the check would only add a process spawn to each.
+fn required_git_version(command: &Command) -> Option<(GitVersion, &'static str)> {
+    match command {
+        Command::Mirror(_) => Some((MIRROR_MIN_GIT_VERSION, "scrim mirror")),
+        Command::Init(_)
+        | Command::Clone(_)
+        | Command::Secrets(_)
+        | Command::Run(_)
+        | Command::Private(_) => Some((MIN_GIT_VERSION, "Scrim")),
+        Command::Login(_)
+        | Command::Whoami
+        | Command::Keygen(_)
+        | Command::Group(_)
+        | Command::Access(_)
+        | Command::Branch(_)
+        | Command::Audit(_)
+        | Command::SshKey(_)
+        | Command::Keychain(_)
+        | Command::FilterProcess => None,
     }
 }
 
@@ -564,6 +611,18 @@ fn handle_keygen(
     config_path_result: anyhow::Result<PathBuf>,
     env: &mut CliEnv<'_>,
 ) -> anyhow::Result<()> {
+    if args.keychain {
+        return handle_keygen_keychain(
+            args.force,
+            cli_key_file,
+            server_flag,
+            token_override,
+            config_path_result,
+            env,
+            &keychain::OsKeychain,
+        );
+    }
+
     let identity_path = if let Some(path) = cli_key_file
         && !path.as_os_str().is_empty()
     {
@@ -575,6 +634,18 @@ fn handle_keygen(
             Ok(path) => path.as_path(),
             Err(err) => return Err(anyhow!("{err}")),
         };
+        // A new identity.age would be ignored while config.toml points at
+        // the keychain, so refuse rather than write a key nobody uses.
+        match load_config(cfg_path) {
+            Ok(Some(ScrimConfig {
+                keychain_account: Some(account),
+                ..
+            })) => bail!(
+                "the identity is stored in the OS keychain (account \"{account}\"); pass --keychain to replace it there, or run 'scrim keychain disable' first"
+            ),
+            Ok(_) => {}
+            Err(err) => return Err(err),
+        }
         resolve_identity_path(None, &|key| env.env_var(key), cfg_path)
     };
 
@@ -640,6 +711,109 @@ fn handle_keygen(
     write_line(
         env.stdout,
         &format!("Identity saved to {}", identity_path.display()),
+    )
+}
+
+/// Handles `scrim keygen --keychain`: generates an identity, registers its
+/// public key and stores the private key in the OS keychain under
+/// `<member>@<server>`, recording that account in `config.toml`.
+fn handle_keygen_keychain(
+    force: bool,
+    cli_key_file: Option<&Path>,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path_result: anyhow::Result<PathBuf>,
+    env: &mut CliEnv<'_>,
+    store: &dyn keychain::SecretStore,
+) -> anyhow::Result<()> {
+    if let Err(err) = keychain::reject_explicit_key_file(cli_key_file, env) {
+        return Err(err);
+    }
+    let config_path = match config_path_result {
+        Ok(path) => path,
+        Err(err) => return Err(err),
+    };
+    let identity_path = resolve_identity_path(None, &|key| env.env_var(key), &config_path);
+    match fs::symlink_metadata(&identity_path) {
+        Ok(_) => bail!(
+            "identity file {} already exists; move it into the keychain with 'scrim keychain enable' or remove it first",
+            identity_path.display()
+        ),
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow!(err)).with_context(|| {
+                format!(
+                    "failed to inspect identity file {}",
+                    identity_path.display()
+                )
+            });
+        }
+    }
+    let recorded_account = match load_config(&config_path) {
+        Ok(Some(cfg)) => cfg.keychain_account,
+        Ok(None) => None,
+        Err(err) => return Err(err),
+    };
+    if let Some(account) = &recorded_account
+        && !force
+    {
+        bail!(
+            "the identity is already stored in the OS keychain (account \"{account}\"); pass --force to replace it"
+        );
+    }
+
+    let client =
+        match build_authenticated_client(server_flag, token_override, Some(&config_path), &env.cwd)
+        {
+            Ok(client) => client,
+            Err(err) => return Err(err),
+        };
+    let member = match client.whoami() {
+        Ok(info) => info.name,
+        Err(err) => return Err(err),
+    };
+    let account = keychain::keychain_account(&member, client.base_url());
+    // Reading first also surfaces an unsupported platform or locked keychain
+    // before anything is registered on the server.
+    match store.read(&account) {
+        Ok(Some(_)) if !force => bail!(
+            "the OS keychain already holds a Scrim identity for account \"{account}\"; pass --force to replace it"
+        ),
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
+
+    let identity = MemberIdentity::generate();
+    let public_key = identity.public_key();
+    // Same order as the file flow: register first so an auth or network
+    // failure never replaces a stored identity.
+    if let Err(err) = client.set_own_public_key(public_key.as_str()) {
+        return Err(err);
+    }
+    if let Err(err) = keychain::store_new_identity(store, &account, &identity) {
+        return Err(err).context(
+            "public key was registered on the server, but storing the identity in the OS keychain failed",
+        );
+    }
+    if let Err(err) = save_keychain_account(&config_path, Some(&account)) {
+        return Err(err).with_context(|| {
+            format!(
+                "the identity was stored in the OS keychain (service \"{}\", account \"{account}\"), but recording that in {} failed; add keychain_account = \"{account}\" to it",
+                keychain::KEYCHAIN_SERVICE,
+                config_path.display()
+            )
+        });
+    }
+
+    if let Err(err) = write_line(env.stdout, &format!("Public key: {public_key}")) {
+        return Err(err);
+    }
+    write_line(
+        env.stdout,
+        &format!(
+            "Identity saved to the OS keychain (service \"{}\", account \"{account}\")",
+            keychain::KEYCHAIN_SERVICE
+        ),
     )
 }
 

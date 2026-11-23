@@ -6,7 +6,65 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
+use scrim_policy::{GitVersion, parse_git_version};
 use zeroize::Zeroizing;
+
+/// Oldest Git release `scrim mirror` accepts. Mirror's fail-closed history
+/// check relies on `GIT_NO_LAZY_FETCH=1` to stop a partial clone from
+/// fetching missing objects. Mainline Git first honours it in 2.45.0; the
+/// May 2024 security releases backported it to 2.40.2, 2.41.1, 2.42.2,
+/// 2.43.4 and 2.44.1, but 2.40.0–2.44.0 otherwise ignore it. 2.44.1 is the
+/// oldest release from which every later one honours it.
+pub const MIRROR_MIN_GIT_VERSION: GitVersion = GitVersion::new(2, 44, 1);
+
+/// Runs `git --version` and fails unless the local Git is at least `minimum`.
+/// `required_by` names who needs that version (for example `Scrim` or
+/// `scrim mirror`) in the error message.
+///
+/// # Errors
+///
+/// Fails when `git` cannot be executed, exits unsuccessfully, prints output
+/// that is not a recognisable version, or reports a version older than
+/// `minimum`.
+pub fn ensure_git_version(minimum: GitVersion, required_by: &str) -> anyhow::Result<()> {
+    let output = match Command::new("git").arg("--version").output() {
+        Ok(out) => out,
+        Err(err) => {
+            return Err(anyhow!(err)).with_context(|| {
+                format!("failed to execute git --version; {required_by} requires Git {minimum} or newer on PATH")
+            });
+        }
+    };
+    if !output.status.success() {
+        bail!(
+            "git --version exited with status {}; {required_by} requires Git {minimum} or newer",
+            output.status
+        );
+    }
+    check_git_version_output(
+        &String::from_utf8_lossy(&output.stdout),
+        minimum,
+        required_by,
+    )
+}
+
+/// Checks `git --version` output against `minimum`; see [`ensure_git_version`].
+fn check_git_version_output(
+    version_output: &str,
+    minimum: GitVersion,
+    required_by: &str,
+) -> anyhow::Result<()> {
+    let Some(found) = parse_git_version(version_output) else {
+        let first_line = version_output.lines().next().map_or("", str::trim);
+        bail!(
+            "could not determine the Git version from 'git --version' output {first_line:?}; {required_by} requires Git {minimum} or newer, so upgrade Git"
+        );
+    };
+    if found < minimum {
+        bail!("found Git {found}, but {required_by} requires Git {minimum} or newer; upgrade Git");
+    }
+    Ok(())
+}
 
 /// Returns the repository top-level directory when `cwd` is inside a Git
 /// working tree, or `Ok(None)` when outside one.
@@ -583,4 +641,82 @@ fn run_git_on_path_chunks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use scrim_policy::MIN_GIT_VERSION;
+
+    use super::*;
+
+    fn error_text(result: anyhow::Result<()>) -> String {
+        match result {
+            Ok(()) => panic!("expected the version check to fail"),
+            Err(err) => format!("{err:#}"),
+        }
+    }
+
+    #[test]
+    fn accepts_versions_at_or_above_the_minimum() {
+        for output in [
+            "git version 2.40.0\n",
+            "git version 2.54.0 (Apple Git-157)\n",
+            "git version 2.47.1.windows.1\n",
+            "git version 3.0.0\n",
+        ] {
+            if let Err(err) = check_git_version_output(output, MIN_GIT_VERSION, "Scrim") {
+                panic!("{output:?} should pass: {err:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_old_versions_naming_found_and_required() {
+        let message = error_text(check_git_version_output(
+            "git version 2.39.5 (Apple Git-154)\n",
+            MIN_GIT_VERSION,
+            "Scrim",
+        ));
+        assert!(message.contains("found Git 2.39.5"), "{message}");
+        assert!(message.contains("Scrim requires Git 2.40.0"), "{message}");
+        assert!(message.contains("upgrade Git"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unparseable_output() {
+        let message = error_text(check_git_version_output(
+            "hub version 2.14.2\n",
+            MIN_GIT_VERSION,
+            "Scrim",
+        ));
+        assert!(message.contains("could not determine"), "{message}");
+        assert!(message.contains("hub version 2.14.2"), "{message}");
+        assert!(message.contains("upgrade Git"), "{message}");
+        assert!(
+            check_git_version_output("", MIN_GIT_VERSION, "Scrim").is_err(),
+            "empty output must fail"
+        );
+    }
+
+    #[test]
+    fn mirror_requires_a_release_that_honours_no_lazy_fetch() {
+        for output in ["git version 2.44.0\n", "git version 2.43.0\n"] {
+            let message = error_text(check_git_version_output(
+                output,
+                MIRROR_MIN_GIT_VERSION,
+                "scrim mirror",
+            ));
+            assert!(
+                message.contains("scrim mirror requires Git 2.44.1"),
+                "{message}"
+            );
+        }
+        for output in ["git version 2.44.1\n", "git version 2.45.2\n"] {
+            if let Err(err) =
+                check_git_version_output(output, MIRROR_MIN_GIT_VERSION, "scrim mirror")
+            {
+                panic!("{output:?} should pass: {err:#}");
+            }
+        }
+    }
 }

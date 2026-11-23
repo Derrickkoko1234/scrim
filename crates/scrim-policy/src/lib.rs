@@ -17,18 +17,23 @@
 //! Rules are compiled into a [`WithholdPolicy`], which evaluates per-member
 //! withholding by intersection across overlapping rules and generates Git
 //! non-cone sparse-checkout exclusions for partial clones.
+//!
+//! [`parse_git_version`] and [`MIN_GIT_VERSION`] give the server and the CLI
+//! one definition of the oldest Git release Scrim supports.
 
 // The `?` operator and the unwrap/expect family are deliberately forbidden in
 // this codebase; clippy's suggestion to use `?` is allowed away accordingly.
 #![allow(clippy::question_mark)]
 
 mod branch_policy;
+mod git_version;
 mod path_glob;
 mod path_policy;
 mod ref_glob;
 mod withhold_policy;
 
 pub use branch_policy::{BranchPolicy, BranchRule, HiddenRefPlan};
+pub use git_version::{GitVersion, MIN_GIT_VERSION, parse_git_version};
 pub use path_glob::{
     MAX_GROUP_NAME_BYTES, MAX_PATH_GLOB_BYTES, MAX_PATH_RULES, is_protected_metadata_path,
     normalize_repo_path, validate_group_name, validate_path_glob,

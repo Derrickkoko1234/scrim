@@ -891,6 +891,63 @@ fn branch_commands_validate_glob_locally_and_autodetect_repo_and_server() {
     assert_eq!(reqs.len(), 3);
 }
 
+/// Puts a fake `git` that reports `version` first on `PATH` and runs `args`.
+#[cfg(unix)]
+fn run_with_fake_git_version(version: &str, args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let bin_dir = tmp.path().join("bin");
+    must(fs::create_dir_all(&bin_dir), "create fake bin dir");
+    let fake_git = bin_dir.join("git");
+    must(
+        fs::write(
+            &fake_git,
+            format!("#!/bin/sh\necho 'git version {version}'\n"),
+        ),
+        "write fake git",
+    );
+    must(
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)),
+        "make fake git executable",
+    );
+    let bin_path = must_some(bin_dir.to_str(), "fake bin dir as UTF-8");
+    run_bin_with_env(
+        scrim_bin(),
+        args,
+        tmp.path(),
+        &tmp.path().join("config.toml"),
+        &[("PATH", bin_path)],
+        None,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_git_older_than_the_client_minimums() {
+    let init = run_with_fake_git_version("2.39.5", &["init", "app.git"]);
+    assert!(!init.status.success(), "init must fail on old Git");
+    let init_err = stderr_str(&init);
+    assert!(init_err.contains("found Git 2.39.5"), "{init_err}");
+    assert!(init_err.contains("requires Git 2.40.0"), "{init_err}");
+
+    let mirror = run_with_fake_git_version("2.44.0", &["mirror", "github"]);
+    assert!(
+        !mirror.status.success(),
+        "mirror must fail without GIT_NO_LAZY_FETCH"
+    );
+    let mirror_err = stderr_str(&mirror);
+    assert!(
+        mirror_err.contains("scrim mirror requires Git 2.44.1"),
+        "{mirror_err}"
+    );
+
+    // Admin-API commands never consult the Git version.
+    let whoami = run_with_fake_git_version("2.39.5", &["whoami"]);
+    let whoami_err = stderr_str(&whoami);
+    assert!(!whoami_err.contains("requires Git"), "{whoami_err}");
+}
+
 #[test]
 fn surfaces_server_error_statuses_with_nonzero_exit() {
     for (status, json_body, expected_msg) in [

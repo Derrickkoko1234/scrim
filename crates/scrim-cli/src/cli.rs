@@ -64,6 +64,8 @@ pub enum Command {
     /// Push branches and tags visible to everyone to an external mirror,
     /// refusing if any private file in their history is not encrypted.
     Mirror(MirrorArgs),
+    /// Move your private key between identity.age and the OS keychain.
+    Keychain(KeychainArgs),
     /// Serve Git's long-running clean/smudge filter protocol (invoked by Git).
     #[command(name = "filter-process", hide = true)]
     FilterProcess,
@@ -83,8 +85,27 @@ pub struct KeygenArgs {
     pub force: bool,
 
     /// Save the identity locally without uploading the public key to the server.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "keychain")]
     pub local_only: bool,
+
+    /// Store the private key in the OS keychain (macOS and Windows) instead of
+    /// identity.age.
+    #[arg(long)]
+    pub keychain: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct KeychainArgs {
+    #[command(subcommand)]
+    pub command: KeychainCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeychainCommand {
+    /// Move the private key from identity.age into the OS keychain.
+    Enable,
+    /// Move the private key from the OS keychain back into identity.age.
+    Disable,
 }
 
 #[derive(Debug, Args)]

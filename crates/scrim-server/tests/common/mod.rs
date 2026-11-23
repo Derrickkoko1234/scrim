@@ -173,6 +173,22 @@ pub async fn spawn_server_with_store(
     .await
 }
 
+/// Like [`spawn_server_with_store`], with git's server-owned hooks set up in
+/// `hook_dir`, as the `scrim-server` binary shares one directory between its
+/// HTTP and SSH transports.
+pub async fn spawn_server_with_hook_dir(
+    repo_root: PathBuf,
+    policy_store: Arc<dyn PolicyStore>,
+    hook_dir: scrim_server::SharedHookDir,
+) -> String {
+    serve_router(scrim_server::router_with_hook_dir(
+        repo_root,
+        policy_store,
+        hook_dir,
+    ))
+    .await
+}
+
 /// Serves `router` on an ephemeral loopback port and returns its base URL.
 async fn serve_router(router: Router) -> String {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {

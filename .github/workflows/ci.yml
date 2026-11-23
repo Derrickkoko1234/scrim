@@ -71,8 +71,11 @@ jobs:
           cargo test --workspace
 
   postgres:
-    name: PostgreSQL Store
+    name: PostgreSQL + Redis
     runs-on: ubuntu-latest
+    # The full-stack tests drive real git and ssh clients; a hang must not
+    # hold the runner for the default six hours.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -87,9 +90,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
-      # Throwaway credentials for the CI-only service container.
+      # Throwaway credentials for the CI-only service containers.
       DATABASE_URL: postgres://scrim:scrim@localhost:5432/scrim
+      REDIS_URL: redis://localhost:6379
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,8 +115,17 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
+      - name: Show Git version
+        run: git --version
+
       - name: Run PostgreSQL store tests
         run: cargo test -p scrim-server --test postgres_store -- --ignored
+
+      - name: Run Redis policy cache test
+        run: cargo test -p scrim-server --lib -- --ignored --exact policy_cache::tests::live_redis_round_trip
+
+      - name: Run full-stack tests
+        run: cargo test -p scrim-server --test full_stack -- --ignored
 
   deny:
     name: Cargo Deny

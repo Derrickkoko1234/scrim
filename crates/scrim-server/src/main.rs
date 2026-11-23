@@ -25,6 +25,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use scrim_policy::{GitVersion, MIN_GIT_VERSION, parse_git_version};
 use scrim_server::{
     BackupConfig, CachedPolicyStore, DEFAULT_R2_PREFIX, MAX_TOKEN_BYTES, PACK_OBJECTS_HOOK_MODE,
     PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore, R2Config,
@@ -315,6 +316,9 @@ fn secret_database_url(database_url: Option<String>) -> Option<SecretString> {
 /// Uploads a backup and prints its ID to stdout.
 async fn run_backup_command(args: BackupArgs) -> anyhow::Result<()> {
     init_tracing_to_stderr();
+    if let Err(error) = ensure_supported_git().await {
+        return Err(error);
+    }
     let manifest = match run_backup(BackupConfig {
         repo_root: args.repo_root,
         database_url: secret_database_url(args.database_url),
@@ -343,6 +347,9 @@ async fn run_backup_command(args: BackupArgs) -> anyhow::Result<()> {
 /// Restores a backup and reports what was restored.
 async fn run_restore_command(args: RestoreArgs) -> anyhow::Result<()> {
     init_tracing_to_stderr();
+    if let Err(error) = ensure_supported_git().await {
+        return Err(error);
+    }
     let manifest = match run_restore(RestoreConfig {
         repo_root: args.repo_root,
         database_url: secret_database_url(args.database_url),
@@ -377,6 +384,71 @@ fn init_tracing_to_stderr() {
         .init();
 }
 
+/// Decides whether `git --version` output names a Git release the server
+/// supports, returning the release found.
+///
+/// Kept apart from the process spawn so the decision can be tested without
+/// Git. Fails when the output cannot be parsed (refusing to guess) or names a
+/// release older than [`MIN_GIT_VERSION`]; the message names both versions.
+fn check_git_version_output(output: &str) -> Result<GitVersion, String> {
+    let first_line = output.lines().next().map_or("", str::trim);
+    let Some(found) = parse_git_version(output) else {
+        return Err(format!(
+            "cannot read the Git version from {first_line:?}; scrim-server requires Git \
+             {MIN_GIT_VERSION} or newer"
+        ));
+    };
+    if found < MIN_GIT_VERSION {
+        return Err(format!(
+            "Git {found} is too old: scrim-server requires Git {MIN_GIT_VERSION} or newer"
+        ));
+    }
+    Ok(found)
+}
+
+/// Refuses to continue unless the `git` this process spawns for repositories
+/// (the one found on `PATH`) is at least [`MIN_GIT_VERSION`], and logs the
+/// version found at `info`.
+///
+/// Runs `git --version` with the environment the server's library gives every
+/// git it spawns (empty but for `PATH`, no system or user configuration), so
+/// the binary checked is the binary served with.
+async fn ensure_supported_git() -> anyhow::Result<()> {
+    let mut command = tokio::process::Command::new("git");
+    command.arg("--version").env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let output = match command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(anyhow::Error::new(error)).context(format!(
+                "cannot run `git --version`: scrim-server requires Git {MIN_GIT_VERSION} or newer on PATH"
+            ));
+        }
+    };
+    if !output.status.success() {
+        bail!(
+            "`git --version` exited with {}; scrim-server requires Git {MIN_GIT_VERSION} or newer",
+            output.status
+        );
+    }
+    match check_git_version_output(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(found) => {
+            tracing::info!(git_version = %found, required = %MIN_GIT_VERSION, "using git");
+            Ok(())
+        }
+        Err(message) => bail!("{message}"),
+    }
+}
+
 /// Serves until Ctrl-C with the parsed server configuration.
 async fn run_server(config: Config) -> anyhow::Result<()> {
     let mut env_filter = EnvFilter::new("info");
@@ -408,6 +480,12 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     }
     if config.redis_url.is_some() && config.database_url.is_none() {
         bail!("--redis-url requires --database-url: Redis only caches the database's policy");
+    }
+
+    // After the argument checks, so a misconfigured start fails on those first;
+    // before anything is opened or served.
+    if let Err(error) = ensure_supported_git().await {
+        return Err(error);
     }
 
     // One hook directory for both transports.
@@ -644,4 +722,57 @@ async fn read_token_file(path: &Path) -> anyhow::Result<SecretString> {
     // Build an exact-sized Box<str> directly from the slice so String -> Box<str>
     // cannot shrink/reallocate and leave an unzeroized copy in freed heap memory.
     Ok(SecretString::from(Box::<str>::from(text.as_str())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_minimum_and_newer_releases() {
+        for (output, expected) in [
+            ("git version 2.40.0\n", GitVersion::new(2, 40, 0)),
+            (
+                "git version 2.54.0 (Apple Git-157)\n",
+                GitVersion::new(2, 54, 0),
+            ),
+            ("git version 2.45.0.rc1\n", GitVersion::new(2, 45, 0)),
+            ("git version 3.0.1\n", GitVersion::new(3, 0, 1)),
+        ] {
+            match check_git_version_output(output) {
+                Ok(found) => assert_eq!(found, expected, "{output:?}"),
+                Err(message) => panic!("{output:?} should be accepted: {message}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_older_releases_naming_both_versions() {
+        for output in ["git version 2.39.5\n", "git version 1.9.0\n"] {
+            match check_git_version_output(output) {
+                Ok(found) => panic!("{output:?} should be rejected, got {found}"),
+                Err(message) => {
+                    assert!(message.contains("too old"), "{message}");
+                    assert!(message.contains(&MIN_GIT_VERSION.to_string()), "{message}");
+                }
+            }
+        }
+        match check_git_version_output("git version 2.39.5\n") {
+            Err(message) => assert!(message.contains("Git 2.39.5"), "{message}"),
+            Ok(found) => panic!("2.39.5 should be rejected, got {found}"),
+        }
+    }
+
+    #[test]
+    fn rejects_output_it_cannot_parse() {
+        for output in ["", "\n", "not git\n", "git version\n", "git version dev\n"] {
+            match check_git_version_output(output) {
+                Ok(found) => panic!("{output:?} should be rejected, got {found}"),
+                Err(message) => {
+                    assert!(message.contains("cannot read the Git version"), "{message}");
+                    assert!(message.contains(&MIN_GIT_VERSION.to_string()), "{message}");
+                }
+            }
+        }
+    }
 }

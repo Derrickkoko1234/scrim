@@ -10,7 +10,7 @@ unit tests in `scrim-cli` and `scrim-server`.
 
 ```sh
 rustup toolchain install nightly
-cargo install cargo-fuzz
+cargo install cargo-fuzz --locked
 ```
 
 ## Targets
@@ -34,3 +34,14 @@ cargo +nightly fuzz run server_parsers -- -max_total_time=300
 
 Crashes are written to `fuzz/artifacts/<target>/`; reproduce one with
 `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
+
+## Nightly CI run
+
+[`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) runs every target
+daily (03:17 UTC) and on demand (`workflow_dispatch`). Each target gets its own
+matrix job with `-max_total_time=600`, the nightly toolchain forced through
+`RUSTUP_TOOLCHAIN` (the repository's `rust-toolchain.toml` pins stable), and its
+corpus (`fuzz/corpus/<target>`) carried between runs through `actions/cache`.
+A crash fails the job and uploads `fuzz/artifacts/<target>` as the
+`fuzz-artifacts-<target>` artifact; download it and reproduce locally with the
+command above.

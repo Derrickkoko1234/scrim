@@ -11,6 +11,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::keychain::{OsKeychain, SecretStore, load_identity_from_keychain};
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Loaded Scrim CLI configuration.
@@ -19,6 +21,10 @@ pub struct ScrimConfig {
     pub server: Option<String>,
     /// Bearer token for authenticating to the Scrim server.
     pub token: Option<SecretString>,
+    /// OS keychain account holding the member's private key. `None` (the
+    /// field is absent from `config.toml`) means the key lives in
+    /// `identity.age`.
+    pub keychain_account: Option<String>,
 }
 
 impl std::fmt::Debug for ScrimConfig {
@@ -31,6 +37,7 @@ impl std::fmt::Debug for ScrimConfig {
         f.debug_struct("ScrimConfig")
             .field("server", &self.server)
             .field("token", &token_state)
+            .field("keychain_account", &self.keychain_account)
             .finish()
     }
 }
@@ -39,6 +46,7 @@ impl std::fmt::Debug for ScrimConfig {
 struct RawConfig {
     server: Option<String>,
     token: Option<String>,
+    keychain_account: Option<String>,
 }
 
 impl Drop for RawConfig {
@@ -51,8 +59,12 @@ impl Drop for RawConfig {
 
 #[derive(Serialize)]
 struct SerializableConfig<'a> {
-    server: &'a str,
-    token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_account: Option<&'a str>,
 }
 
 /// Validates and normalizes a Scrim server URL by trimming whitespace and
@@ -195,17 +207,73 @@ pub fn load_config(path: &Path) -> anyhow::Result<Option<ScrimConfig>> {
         None => None,
     };
 
-    Ok(Some(ScrimConfig { server, token }))
+    let keychain_account = match raw.keychain_account.take() {
+        Some(account) if !account.trim().is_empty() => Some(account.trim().to_owned()),
+        _ => None,
+    };
+
+    Ok(Some(ScrimConfig {
+        server,
+        token,
+        keychain_account,
+    }))
 }
 
 /// Saves `server` and `token` to `path` with restricted permissions (`0o700`
-/// for newly created directories, `0o600` for the file on Unix).
+/// for newly created directories, `0o600` for the file on Unix), keeping the
+/// `keychain_account` already recorded there.
 pub fn save_config(path: &Path, server: &str, token: &SecretString) -> anyhow::Result<()> {
     let normalized_server = match normalize_server_url(server) {
         Ok(url) => url,
         Err(err) => return Err(err),
     };
 
+    // An unreadable existing config is replaced rather than reported, because
+    // `scrim login` is how users repair a broken config.
+    let keychain_account = match load_config(path) {
+        Ok(Some(existing)) => existing.keychain_account,
+        Ok(None) | Err(_) => None,
+    };
+
+    write_config(
+        path,
+        &SerializableConfig {
+            server: Some(&normalized_server),
+            token: Some(token.expose_secret()),
+            keychain_account: keychain_account.as_deref(),
+        },
+    )
+}
+
+/// Records in `config.toml` at `path` that the member's private key lives in
+/// the OS keychain under `account`, or with `None` that it lives in
+/// `identity.age`. The server and token already saved are kept; a missing
+/// config file is created.
+///
+/// # Errors
+///
+/// Fails when the existing config cannot be read or parsed, or the new one
+/// cannot be written.
+pub fn save_keychain_account(path: &Path, account: Option<&str>) -> anyhow::Result<()> {
+    let existing = match load_config(path) {
+        Ok(existing) => existing,
+        Err(err) => return Err(err),
+    };
+    let (server, token) = match &existing {
+        Some(cfg) => (cfg.server.as_deref(), cfg.token.as_ref()),
+        None => (None, None),
+    };
+    write_config(
+        path,
+        &SerializableConfig {
+            server,
+            token: token.map(|tok| tok.expose_secret()),
+            keychain_account: account,
+        },
+    )
+}
+
+fn write_config(path: &Path, payload: &SerializableConfig<'_>) -> anyhow::Result<()> {
     let parent = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -215,11 +283,7 @@ pub fn save_config(path: &Path, server: &str, token: &SecretString) -> anyhow::R
         return Err(err);
     }
 
-    let payload = SerializableConfig {
-        server: &normalized_server,
-        token: token.expose_secret(),
-    };
-    let toml_text = match toml::to_string_pretty(&payload) {
+    let toml_text = match toml::to_string_pretty(payload) {
         Ok(text) => Zeroizing::new(text),
         Err(err) => return Err(anyhow!("failed to serialize config: {err}")),
     };
@@ -261,11 +325,27 @@ pub fn resolve_identity_path(
 /// 1. Explicit `--key-file <PATH>` on the command line
 /// 2. `SCRIM_KEY` environment variable (zero disk access)
 /// 3. `SCRIM_KEY_FILE` environment variable
-/// 4. `<config_path.parent()>/identity.age` when `config_path` is available
+/// 4. The OS keychain, when `config.toml` records a `keychain_account`
+/// 5. `<config_path.parent()>/identity.age` when `config_path` is available
+///
+/// # Errors
+///
+/// In keychain mode a failed or empty keychain read is an error: the CLI never
+/// falls back to a plaintext `identity.age` that may be stale or planted.
 pub fn load_member_identity(
     cli_key_file: Option<&Path>,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     config_path: Option<&Path>,
+) -> anyhow::Result<MemberIdentity> {
+    load_member_identity_with_store(cli_key_file, env_lookup, config_path, &OsKeychain)
+}
+
+/// [`load_member_identity`] reading keychain-mode identities from `store`.
+pub(crate) fn load_member_identity_with_store(
+    cli_key_file: Option<&Path>,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    config_path: Option<&Path>,
+    store: &dyn SecretStore,
 ) -> anyhow::Result<MemberIdentity> {
     if let Some(path) = cli_key_file
         && !path.as_os_str().is_empty()
@@ -292,11 +372,20 @@ pub fn load_member_identity(
             "cannot determine identity file path: set --key-file, SCRIM_KEY, SCRIM_KEY_FILE, or HOME/SCRIM_CONFIG"
         );
     };
+    let keychain_account = match load_config(cfg_path) {
+        Ok(Some(cfg)) => cfg.keychain_account,
+        Ok(None) => None,
+        Err(err) => return Err(err),
+    };
+    if let Some(account) = keychain_account {
+        return load_identity_from_keychain(store, &account);
+    }
     let identity_path = resolve_identity_path(None, env_lookup, cfg_path);
     read_member_identity_file(&identity_path)
 }
 
-fn read_member_identity_file(identity_path: &Path) -> anyhow::Result<MemberIdentity> {
+/// Reads and parses an age identity file.
+pub(crate) fn read_member_identity_file(identity_path: &Path) -> anyhow::Result<MemberIdentity> {
     let contents = match fs::read_to_string(identity_path) {
         Ok(text) => Zeroizing::new(text),
         Err(err) if err.kind() == ErrorKind::NotFound => {
