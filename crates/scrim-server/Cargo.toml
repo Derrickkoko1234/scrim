@@ -57,3 +57,7 @@ tower = { version = "0.5.3", features = ["util"] }
 [[bench]]
 name = "pack_withhold"
 harness = false
+
+[[bench]]
+name = "policy_cache"
+harness = false
