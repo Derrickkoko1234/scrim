@@ -153,6 +153,11 @@ pub struct CloneArgs {
     /// Configure the clone without checking out files.
     #[arg(long)]
     pub no_checkout: bool,
+
+    /// SSH base URL (for example ssh://git@git.example.com:2222) to clone
+    /// over SSH when SOURCE is a repository key.
+    #[arg(long, value_name = "SSH_BASE_URL")]
+    pub ssh: Option<String>,
 }
 
 #[derive(Debug, Args)]

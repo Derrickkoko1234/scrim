@@ -6,10 +6,12 @@
 //! variables scoped to the Scrim server URL, never through argv, the remote
 //! URL or `.git/config`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use secrecy::SecretString;
+use zeroize::Zeroizing;
 
 use crate::cli::CloneArgs;
 use crate::client::{MyWithheldPathsResponse, ScrimClient};
@@ -33,16 +35,27 @@ pub(crate) const WITHHOLD_PARTIAL_CLONE_FILTER: &str = "blob:limit=2147483647";
 /// A clone source split into the Scrim server and the repository on it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CloneSource {
-    /// Normalized server base URL without a trailing slash.
+    /// Normalized HTTP(S) Scrim API server base URL without a trailing slash.
     pub(crate) server_base_url: String,
     /// Repository key on the server (for example `team/app.git`).
     pub(crate) repo_key: String,
+    /// Normalized SSH base URL (for example `ssh://git@git.example.com:2222`)
+    /// when cloning over SSH, or `None` for HTTP(S) clones.
+    pub(crate) ssh_base_url: Option<String>,
 }
 
 impl CloneSource {
+    /// Returns whether Git transport uses SSH instead of HTTP(S).
+    pub(crate) fn is_ssh(&self) -> bool {
+        self.ssh_base_url.is_some()
+    }
+
     /// Returns the Git remote URL for the repository.
     pub(crate) fn remote_url(&self) -> String {
-        format!("{}/{}", self.server_base_url, self.repo_key)
+        match &self.ssh_base_url {
+            Some(ssh_base) => format!("{ssh_base}/{}", self.repo_key),
+            None => format!("{}/{}", self.server_base_url, self.repo_key),
+        }
     }
 }
 
@@ -68,22 +81,135 @@ pub(crate) fn validate_repo_key(repo_key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Splits `source` into a server base URL and repository key.
+/// Rejects whitespace, control characters, backslashes, percent-encoding, and
+/// `.` or `..` path segments in raw URL text before `reqwest::Url::parse`
+/// normalizes them away.
+fn validate_raw_url_chars(raw: &str, scheme_end: usize, label: &str) -> anyhow::Result<()> {
+    if raw
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        bail!("{label} must not contain whitespace or control characters");
+    }
+    if raw.contains(['\\', '%']) {
+        bail!("{label} must not contain backslashes or percent-encoding");
+    }
+    if raw[scheme_end..]
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        bail!("{label} must not contain '.' or '..' path segments");
+    }
+    Ok(())
+}
+
+/// Parses and validates an `ssh://[user@]host[:port][/path]` URL, returning
+/// `(normalized_ssh_base_url, path_without_leading_slash)`.
+fn parse_ssh_url(
+    raw: &str,
+    require_empty_path: bool,
+    label: &str,
+) -> anyhow::Result<(String, String)> {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix("ssh://") else {
+        bail!("{label} must start with 'ssh://'");
+    };
+    if let Err(err) = validate_raw_url_chars(raw, "ssh://".len(), label) {
+        return Err(err);
+    }
+
+    let authority = match rest.split('/').next() {
+        Some(authority) => authority,
+        None => rest,
+    };
+    if let Some((userinfo, _host)) = authority.split_once('@')
+        && (userinfo.is_empty() || userinfo.contains(':'))
+    {
+        bail!("{label} must not contain an empty username or embedded password");
+    }
+
+    let parsed = match reqwest::Url::parse(raw) {
+        Ok(url) => url,
+        Err(err) => return Err(anyhow!("invalid {label}: {err}")),
+    };
+    let host = match parsed.host_str() {
+        Some(host) if !host.is_empty() => host,
+        _ => bail!("{label} must include a host"),
+    };
+    if parsed.password().is_some() {
+        bail!("{label} must not contain embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("{label} must not contain a query string or fragment");
+    }
+
+    let user_prefix = if parsed.username().is_empty() {
+        String::new()
+    } else {
+        format!("{}@", parsed.username())
+    };
+    let port_suffix = match parsed.port() {
+        Some(port) => format!(":{port}"),
+        None => String::new(),
+    };
+    let host_lower = host.to_ascii_lowercase();
+    let ssh_base_url = format!("ssh://{user_prefix}{host_lower}{port_suffix}");
+
+    let path = match parsed.path().strip_prefix('/') {
+        Some(stripped) => stripped,
+        None => parsed.path(),
+    };
+    if require_empty_path && !path.is_empty() {
+        bail!("{label} must not include a repository path");
+    }
+    Ok((ssh_base_url, path.to_owned()))
+}
+
+/// Splits `source` into an HTTP(S) Scrim server base URL, repository key, and
+/// optional SSH base URL.
 ///
 /// A full `http(s)://` URL is split at `configured_server` when the URL lies
-/// under it (keeping any base-path prefix), and otherwise at its origin. Any
-/// other `source` is a repository key on `configured_server`.
+/// under it (keeping any base-path prefix), and otherwise at its origin. A full
+/// `ssh://` URL uses `configured_server` for the HTTP admin API and keeps the
+/// SSH base URL for Git transport. Any other `source` is a repository key on
+/// `configured_server` (using `ssh_base` for Git transport when `--ssh` is
+/// given).
 ///
 /// # Errors
 ///
-/// Fails for URLs with credentials, a query, a fragment, percent-encoding,
-/// backslashes or dot segments, for unsafe repository keys, and for a bare
-/// repository key when no server is configured.
+/// Fails for URLs with embedded passwords, a query, a fragment,
+/// percent-encoding, backslashes or dot segments, for unsafe repository keys,
+/// when `--ssh` is combined with a full URL, and when no HTTP server URL is
+/// configured for a bare repository key or `ssh://` URL.
 pub(crate) fn parse_clone_source(
     source: &str,
     configured_server: Option<&str>,
+    ssh_base: Option<&str>,
 ) -> anyhow::Result<CloneSource> {
     let source = source.trim();
+    if source.starts_with("ssh://") {
+        if ssh_base.is_some() {
+            bail!("--ssh cannot be used when SOURCE is already a full URL");
+        }
+        let (ssh_base_url, repo_key) = match parse_ssh_url(source, false, "repository URL") {
+            Ok(parts) => parts,
+            Err(err) => return Err(err),
+        };
+        if let Err(err) = validate_repo_key(&repo_key) {
+            return Err(err);
+        }
+        let Some(server) = configured_server else {
+            bail!(
+                "no HTTP server URL configured for SSH clone '{source}'; pass --server <URL> or run 'scrim login --server <URL>' to query withholding rules"
+            );
+        };
+        return Ok(CloneSource {
+            server_base_url: server.to_owned(),
+            repo_key,
+            ssh_base_url: Some(ssh_base_url),
+        });
+    }
+
     let Some(scheme_end) = source
         .strip_prefix("https://")
         .or_else(|| source.strip_prefix("http://"))
@@ -97,28 +223,28 @@ pub(crate) fn parse_clone_source(
                 "no server URL configured for repository key '{source}'; pass a full repository URL, --server, or run 'scrim login --server <URL>'"
             );
         };
+        let ssh_base_url = match ssh_base {
+            Some(raw_ssh) => match parse_ssh_url(raw_ssh, true, "SSH URL") {
+                Ok((base, _)) => Some(base),
+                Err(err) => return Err(err),
+            },
+            None => None,
+        };
         return Ok(CloneSource {
             server_base_url: server.to_owned(),
             repo_key: source.to_owned(),
+            ssh_base_url,
         });
     };
 
+    if ssh_base.is_some() {
+        bail!("--ssh cannot be used when SOURCE is already a full URL");
+    }
+
     // The URL parser silently resolves dot segments, percent-encoded dots and
     // backslashes, so reject them in the raw text before parsing.
-    if source
-        .bytes()
-        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        bail!("repository URL must not contain whitespace or control characters");
-    }
-    if source.contains(['\\', '%']) {
-        bail!("repository URL must not contain backslashes or percent-encoding");
-    }
-    if source[scheme_end..]
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        bail!("repository URL must not contain '.' or '..' path segments");
+    if let Err(err) = validate_raw_url_chars(source, scheme_end, "repository URL") {
+        return Err(err);
     }
 
     let parsed = match reqwest::Url::parse(source) {
@@ -164,7 +290,25 @@ pub(crate) fn parse_clone_source(
     Ok(CloneSource {
         server_base_url,
         repo_key,
+        ssh_base_url: None,
     })
+}
+
+/// Returns the Git HTTP auth environment variables for `source`, or an empty
+/// list when `source` clones over SSH (never leak HTTP bearer tokens to SSH).
+fn auth_env_for_source(
+    source: &CloneSource,
+    parent_env: &BTreeMap<String, String>,
+    client: &ScrimClient,
+) -> anyhow::Result<Vec<(String, Zeroizing<String>)>> {
+    if source.is_ssh() {
+        return Ok(Vec::new());
+    }
+    git_extra_header_env(
+        parent_env,
+        client.base_url(),
+        &client.authorization_header(),
+    )
 }
 
 /// Derives the default clone directory like `git clone`: the repository key's
@@ -252,6 +396,7 @@ pub(crate) fn handle_clone(
     let source = match parse_clone_source(
         &args.source,
         explicit_server.as_deref().or(config_server.as_deref()),
+        args.ssh.as_deref(),
     ) {
         Ok(source) => source,
         Err(err) => return Err(err),
@@ -315,11 +460,7 @@ pub(crate) fn handle_clone(
         return Err(err);
     }
 
-    let auth_env = match git_extra_header_env(
-        &env.env_vars,
-        client.base_url(),
-        &client.authorization_header(),
-    ) {
+    let auth_env = match auth_env_for_source(&source, &env.env_vars, &client) {
         Ok(vars) => vars,
         Err(err) => return Err(err),
     };
@@ -427,15 +568,25 @@ mod tests {
     use super::*;
 
     fn parse_ok(source: &str, configured: Option<&str>) -> CloneSource {
-        match parse_clone_source(source, configured) {
+        parse_ssh_ok(source, configured, None)
+    }
+
+    fn parse_ssh_ok(source: &str, configured: Option<&str>, ssh_base: Option<&str>) -> CloneSource {
+        match parse_clone_source(source, configured, ssh_base) {
             Ok(parsed) => parsed,
-            Err(err) => panic!("expected {source:?} to parse: {err:#}"),
+            Err(err) => panic!("expected {source:?} (ssh={ssh_base:?}) to parse: {err:#}"),
         }
     }
 
     fn parse_err(source: &str, configured: Option<&str>) -> String {
-        match parse_clone_source(source, configured) {
-            Ok(parsed) => panic!("expected {source:?} to be rejected, got {parsed:?}"),
+        parse_ssh_err(source, configured, None)
+    }
+
+    fn parse_ssh_err(source: &str, configured: Option<&str>, ssh_base: Option<&str>) -> String {
+        match parse_clone_source(source, configured, ssh_base) {
+            Ok(parsed) => {
+                panic!("expected {source:?} (ssh={ssh_base:?}) to be rejected, got {parsed:?}")
+            }
             Err(err) => format!("{err:#}"),
         }
     }
@@ -579,5 +730,160 @@ mod tests {
         for branch in ["", "-b", "a b", "a\nb"] {
             assert!(validate_branch_arg(branch).is_err(), "{branch:?}");
         }
+    }
+
+    #[test]
+    fn parses_ssh_urls_and_ssh_flag() {
+        let with_user_port = parse_ok(
+            "ssh://git@Git.Example.com:2222/team/app.git",
+            Some("https://api.example.com"),
+        );
+        assert!(with_user_port.is_ssh());
+        assert_eq!(with_user_port.server_base_url, "https://api.example.com");
+        assert_eq!(with_user_port.repo_key, "team/app.git");
+        assert_eq!(
+            with_user_port.ssh_base_url.as_deref(),
+            Some("ssh://git@git.example.com:2222")
+        );
+        assert_eq!(
+            with_user_port.remote_url(),
+            "ssh://git@git.example.com:2222/team/app.git"
+        );
+
+        let without_user_port = parse_ok(
+            "ssh://git.example.com/team/app.git",
+            Some("http://127.0.0.1:8080"),
+        );
+        assert!(without_user_port.is_ssh());
+        assert_eq!(without_user_port.server_base_url, "http://127.0.0.1:8080");
+        assert_eq!(without_user_port.repo_key, "team/app.git");
+        assert_eq!(
+            without_user_port.remote_url(),
+            "ssh://git.example.com/team/app.git"
+        );
+
+        let via_flag = parse_ssh_ok(
+            "team/app.git",
+            Some("http://127.0.0.1:8080"),
+            Some("ssh://git@git.example.com:2222/"),
+        );
+        assert!(via_flag.is_ssh());
+        assert_eq!(via_flag.server_base_url, "http://127.0.0.1:8080");
+        assert_eq!(via_flag.repo_key, "team/app.git");
+        assert_eq!(
+            via_flag.remote_url(),
+            "ssh://git@git.example.com:2222/team/app.git"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ssh_sources_and_flag_combinations() {
+        let server = Some("https://api.example.com");
+        assert!(
+            parse_err("ssh://git@git.example.com/team/app.git", None)
+                .contains("--server <URL> or run 'scrim login")
+        );
+        for (source, expected) in [
+            ("ssh://alice:pw@git.example.com/app.git", "password"),
+            ("ssh://:pw@git.example.com/app.git", "password"),
+            ("ssh://@git.example.com/app.git", "empty username"),
+            ("ssh://git@git.example.com/app.git?x=1", "query"),
+            ("ssh://git@git.example.com/app.git#frag", "query"),
+            ("ssh://git@git.example.com/team/../app.git", "'..'"),
+            ("ssh://git@git.example.com/./app.git", "'..'"),
+            ("ssh://git@git.example.com/%2e%2e/app.git", "percent"),
+            ("ssh://git@git.example.com\\team\\app.git", "backslash"),
+            ("ssh://git@git.example.com/a b.git", "whitespace"),
+            (
+                "ssh://git@git.example.com/",
+                "repository key cannot be empty",
+            ),
+        ] {
+            let message = parse_err(source, server);
+            assert!(
+                message.contains(expected),
+                "{source:?}: expected {expected:?} in {message:?}"
+            );
+        }
+
+        assert!(
+            parse_ssh_err(
+                "https://git.example.com/team/app.git",
+                server,
+                Some("ssh://git@git.example.com:2222")
+            )
+            .contains("--ssh cannot be used")
+        );
+        assert!(
+            parse_ssh_err(
+                "ssh://git@git.example.com/team/app.git",
+                server,
+                Some("ssh://git@git.example.com:2222")
+            )
+            .contains("--ssh cannot be used")
+        );
+        for bad_ssh in [
+            "https://git.example.com",
+            "ssh://git@git.example.com/team/app.git",
+            "ssh://alice:pw@git.example.com:2222",
+            "ssh://git@git.example.com:2222?x=1",
+            "ssh://git@git.example.com:2222#frag",
+            "ssh://git@git.example.com:2222/..",
+            "ssh://git@git.example.com:2222/%2e",
+            "ssh://git@git.example.com:2222\\x",
+            "ssh://git@git.example.com:22 22",
+        ] {
+            let trimmed = bad_ssh.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                parse_ssh_err("team/app.git", server, Some(bad_ssh)).contains("SSH URL"),
+                "expected SSH URL error for {bad_ssh:?}"
+            );
+        }
+        assert!(
+            parse_ssh_err(
+                "team/app.git",
+                server,
+                Some("ssh://git@git.example.com:22\n22")
+            )
+            .contains("whitespace or control")
+        );
+    }
+
+    #[test]
+    fn ssh_clone_never_attaches_http_auth_env() {
+        let client = match ScrimClient::new(
+            "https://api.example.com",
+            SecretString::from("scrim-secret-token"),
+        ) {
+            Ok(client) => client,
+            Err(err) => panic!("client should build: {err:#}"),
+        };
+        let parent_env = BTreeMap::new();
+
+        let ssh_source = parse_ok(
+            "ssh://git@git.example.com:2222/team/app.git",
+            Some("https://api.example.com"),
+        );
+        let ssh_env = match auth_env_for_source(&ssh_source, &parent_env, &client) {
+            Ok(env) => env,
+            Err(err) => panic!("ssh auth env failed: {err:#}"),
+        };
+        assert!(
+            ssh_env.is_empty(),
+            "SSH clone must not attach HTTP auth env"
+        );
+
+        let http_source = parse_ok("https://api.example.com/team/app.git", None);
+        let http_env = match auth_env_for_source(&http_source, &parent_env, &client) {
+            Ok(env) => env,
+            Err(err) => panic!("http auth env failed: {err:#}"),
+        };
+        assert!(
+            !http_env.is_empty(),
+            "HTTP clone should attach GIT_CONFIG_* auth env"
+        );
     }
 }
