@@ -40,7 +40,8 @@ use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use scrim_crypto::{
     EncryptedSecretsFile, MemberIdentity, MemberPublicKey, ScopeDataKey, ScopeKeysFile,
-    SecretBundle, format_dotenv, rotate_scope, validate_scope_name, validate_secret_key,
+    SecretBundle, format_dotenv, rotate_scope, validate_member_name, validate_scope_name,
+    validate_secret_key,
 };
 use scrim_policy::{BranchPolicy, BranchRule, GitVersion, MIN_GIT_VERSION, validate_ref_glob};
 use secrecy::{ExposeSecret, SecretString};
@@ -48,7 +49,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::{
     AccessCommand, BranchCommand, Cli, Command, ExportFormat, GrantArgs, GroupCommand, InitArgs,
-    KeygenArgs, LoginArgs, RunArgs, SecretsCommand, SecretsScopeCommand, SecretsSetArgs,
+    KeygenArgs, LoginArgs, RunArgs, SecretsCommand, SecretsRecipientsCommand, SecretsScopeCommand,
+    SecretsSetArgs,
 };
 use crate::client::{ScopeRecipientInfo, ScrimClient};
 use crate::config::{
@@ -1784,6 +1786,205 @@ fn handle_secrets(
                 Err(err) => return Err(err),
             };
             handle_secrets_scope(scope_args.command, &client, env)
+        }
+        SecretsCommand::Recipients(recipients_args) => {
+            handle_secrets_recipients(recipients_args.command, cli_key_file, config_path, env)
+        }
+    }
+}
+
+/// Handles `scrim secrets recipients` (`list`, `add`, `rm`) entirely offline.
+fn handle_secrets_recipients(
+    command: SecretsRecipientsCommand,
+    cli_key_file: Option<&Path>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    match command {
+        SecretsRecipientsCommand::List { scope } => {
+            if let Err(err) = validate_scope_name(&scope) {
+                return Err(anyhow!(err));
+            }
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_scope_keys(&repo_root, &scope) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("secret scope '{scope}' does not exist locally"),
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Scope '{scope}' (generation {}, {} recipient(s)):",
+                    keys_file.generation,
+                    keys_file.recipients.len()
+                ),
+            ) {
+                return Err(err);
+            }
+            for recipient in &keys_file.recipients {
+                let member = escape_control_chars(&recipient.member);
+                if let Err(err) =
+                    write_line(env.stdout, &format!("  {member}: {}", recipient.public_key))
+                {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+        SecretsRecipientsCommand::Add {
+            member,
+            public_key,
+            scope,
+        } => {
+            if let Err(err) = validate_scope_name(&scope) {
+                return Err(anyhow!(err));
+            }
+            if let Err(err) = validate_member_name(&member) {
+                return Err(anyhow!(err));
+            }
+            let parsed_key = match MemberPublicKey::parse(&public_key) {
+                Ok(pk) => pk,
+                Err(err) => return Err(anyhow!(err)),
+            };
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_scope_keys(&repo_root, &scope) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("secret scope '{scope}' does not exist locally"),
+                Err(err) => return Err(err),
+            };
+            let identity =
+                match load_member_identity(cli_key_file, &|k| env.env_var(k), config_path) {
+                    Ok(id) => id,
+                    Err(err) => return Err(err),
+                };
+            // Unwrapping proves the caller is currently authorized to share this scope.
+            let data_key = match keys_file.unwrap_key(&scope, &identity) {
+                Ok(key) => key,
+                Err(err) => {
+                    return Err(anyhow!(err))
+                        .with_context(|| format!("failed to unwrap key for scope '{scope}'"));
+                }
+            };
+            let mut recipients = match keys_file.recipient_public_keys() {
+                Ok(map) => map,
+                Err(err) => {
+                    return Err(anyhow!(err)).context("invalid recipient list in scope keys file");
+                }
+            };
+            if recipients.contains_key(&member) {
+                bail!(
+                    "recipient '{member}' already exists in scope '{scope}'; remove them first with 'scrim secrets recipients rm {member} --scope {scope}' before replacing their key"
+                );
+            }
+            recipients.insert(member.clone(), parsed_key);
+            let updated_keys = match ScopeKeysFile::wrap_for_recipients(
+                &scope,
+                keys_file.generation,
+                &data_key,
+                &recipients,
+            ) {
+                Ok(file) => file,
+                Err(err) => return Err(anyhow!(err)).context("failed to wrap scope data key"),
+            };
+            if let Err(err) = write_scope_keys(&repo_root, &scope, &updated_keys) {
+                return Err(err);
+            }
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Added recipient '{member}' to scope '{scope}' (generation {}, {} recipient(s))",
+                    updated_keys.generation,
+                    updated_keys.recipients.len()
+                ),
+            ) {
+                return Err(err);
+            }
+            write_line(
+                env.stdout,
+                &format!("Remember to commit and push .scrim/keys/{scope}.toml."),
+            )
+        }
+        SecretsRecipientsCommand::Rm { member, scope } => {
+            if let Err(err) = validate_scope_name(&scope) {
+                return Err(anyhow!(err));
+            }
+            if let Err(err) = validate_member_name(&member) {
+                return Err(anyhow!(err));
+            }
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_scope_keys(&repo_root, &scope) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("secret scope '{scope}' does not exist locally"),
+                Err(err) => return Err(err),
+            };
+            let mut remaining_recipients = match keys_file.recipient_public_keys() {
+                Ok(map) => map,
+                Err(err) => {
+                    return Err(anyhow!(err)).context("invalid recipient list in scope keys file");
+                }
+            };
+            if remaining_recipients.remove(&member).is_none() {
+                bail!("recipient '{member}' not found in scope '{scope}'");
+            }
+            if remaining_recipients.is_empty() {
+                bail!("cannot remove the last recipient '{member}' from scope '{scope}'");
+            }
+            let identity =
+                match load_member_identity(cli_key_file, &|k| env.env_var(k), config_path) {
+                    Ok(id) => id,
+                    Err(err) => return Err(err),
+                };
+            let secrets_file = match read_scope_secrets(&repo_root, &scope) {
+                Ok(sf) => sf,
+                Err(err) => return Err(err),
+            };
+            // Removing a recipient must rotate the data key and re-encrypt secrets.
+            let rotated = match rotate_scope(
+                &scope,
+                &keys_file,
+                secrets_file.as_ref(),
+                &identity,
+                &remaining_recipients,
+            ) {
+                Ok(r) => r,
+                Err(err) => return Err(anyhow!(err)).context("failed to rotate scope"),
+            };
+            if let Err(err) = write_scope_keys(&repo_root, &scope, &rotated.keys_file) {
+                return Err(err);
+            }
+            if let Some(new_secrets) = &rotated.secrets_file
+                && let Err(err) = write_scope_secrets(&repo_root, &scope, new_secrets)
+            {
+                return Err(err);
+            }
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Removed recipient '{member}' from scope '{scope}' and rotated to generation {} ({} recipient(s))",
+                    rotated.keys_file.generation,
+                    rotated.keys_file.recipients.len()
+                ),
+            ) {
+                return Err(err);
+            }
+            if !rotated.rotated_secret_keys.is_empty()
+                && let Err(err) = print_secrets_to_rotate(env.stdout, &rotated.rotated_secret_keys)
+            {
+                return Err(err);
+            }
+            write_line(
+                env.stdout,
+                "Remember to commit and push the updated .scrim/ files.",
+            )
         }
     }
 }

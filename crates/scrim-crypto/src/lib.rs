@@ -65,9 +65,10 @@ pub use scope_key::{ScopeDataKey, ScopeKeysFile, WrappedRecipientKey};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use secrets::{EncryptedSecretsFile, SecretBundle};
 pub use validation::{
-    MAX_FILE_PATH_BYTES, MAX_GROUP_NAME_BYTES, MAX_PRIVATE_FILE_BYTES, MAX_SCOPE_NAME_BYTES,
-    MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRETS_PER_SCOPE, validate_file_path,
-    validate_group_name, validate_scope_name, validate_secret_key,
+    MAX_FILE_PATH_BYTES, MAX_GROUP_NAME_BYTES, MAX_MEMBER_NAME_BYTES, MAX_PRIVATE_FILE_BYTES,
+    MAX_SCOPE_NAME_BYTES, MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, MAX_SECRETS_PER_SCOPE,
+    validate_file_path, validate_group_name, validate_member_name, validate_scope_name,
+    validate_secret_key,
 };
 
 /// The only on-disk format version of `.scrim/keys/<scope>.toml`,
@@ -102,6 +103,14 @@ pub enum CryptoError {
     InvalidGroupName {
         /// The rejected group name.
         group: String,
+        /// Human-readable description of the broken rule.
+        reason: &'static str,
+    },
+    /// The member name breaks a naming rule (see [`validate_member_name`]).
+    #[error("invalid member name {member:?}: {reason}")]
+    InvalidMemberName {
+        /// The rejected member name.
+        member: String,
         /// Human-readable description of the broken rule.
         reason: &'static str,
     },

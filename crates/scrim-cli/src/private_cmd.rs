@@ -9,13 +9,13 @@ use std::path::Path;
 use anyhow::{Context, anyhow, bail};
 use scrim_crypto::{
     GroupDataKey, GroupKeysFile, MemberIdentity, MemberPublicKey, extract_placeholder,
-    is_encrypted_file, is_placeholder, rotate_group_key,
+    is_encrypted_file, is_placeholder, rotate_group_key, validate_member_name,
 };
 use scrim_policy::{PathPolicy, PathRule, validate_group_name, validate_path_glob};
 use secrecy::SecretString;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::cli::PrivateCommand;
+use crate::cli::{PrivateCommand, PrivateRecipientsCommand};
 use crate::client::ScrimClient;
 use crate::clone_cmd::{WITHHOLD_PARTIAL_CLONE_FILTER, validate_withheld_response};
 use crate::config::load_member_identity;
@@ -32,8 +32,8 @@ use crate::private_store::{
 };
 use crate::secrets_store::require_repo_root;
 use crate::{
-    CliEnv, build_authenticated_client, format_list_or_none, recipients_from_server,
-    resolve_repo_arg, write_line,
+    CliEnv, build_authenticated_client, escape_control_chars, format_list_or_none,
+    recipients_from_server, resolve_repo_arg, write_line,
 };
 
 /// Environment variables forwarded to `git` processes that may start
@@ -790,6 +790,221 @@ pub(crate) fn handle_private(
                     &format!("Removed recipient(s): {}", removed.join(", ")),
                 )
             {
+                return Err(err);
+            }
+            if let Err(err) = print_paths(
+                env.stdout,
+                "Private files re-encrypted (review/rotate any embedded credentials):",
+                &rotation.reencrypted,
+            ) {
+                return Err(err);
+            }
+            warn_skipped(env.stderr, &rotation.skipped);
+            write_line(
+                env.stdout,
+                "Remember to commit and push the updated .scrim/ files.",
+            )
+        }
+        PrivateCommand::Recipients(recipients_args) => {
+            handle_private_recipients(recipients_args.command, cli_key_file, config_path, env)
+        }
+    }
+}
+
+/// Handles `scrim private recipients` (`list`, `add`, `rm`) entirely offline.
+fn handle_private_recipients(
+    command: PrivateRecipientsCommand,
+    cli_key_file: Option<&Path>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    match command {
+        PrivateRecipientsCommand::List { group } => {
+            if let Err(err) = validate_group_name(&group) {
+                return Err(anyhow!(err));
+            }
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_group_keys(&repo_root, &group) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("group key file .scrim/group-keys/{group}.toml does not exist"),
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Group '{group}' (generation {}, {} recipient(s)):",
+                    keys_file.generation,
+                    keys_file.recipients.len()
+                ),
+            ) {
+                return Err(err);
+            }
+            for recipient in &keys_file.recipients {
+                let member = escape_control_chars(&recipient.member);
+                if let Err(err) =
+                    write_line(env.stdout, &format!("  {member}: {}", recipient.public_key))
+                {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+        PrivateRecipientsCommand::Add {
+            member,
+            public_key,
+            group,
+        } => {
+            if let Err(err) = validate_group_name(&group) {
+                return Err(anyhow!(err));
+            }
+            if let Err(err) = validate_member_name(&member) {
+                return Err(anyhow!(err));
+            }
+            let parsed_key = match MemberPublicKey::parse(&public_key) {
+                Ok(pk) => pk,
+                Err(err) => return Err(anyhow!(err)),
+            };
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_group_keys(&repo_root, &group) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("group key file .scrim/group-keys/{group}.toml does not exist"),
+                Err(err) => return Err(err),
+            };
+            let identity =
+                match load_member_identity(cli_key_file, &|key| env.env_var(key), config_path) {
+                    Ok(identity) => identity,
+                    Err(err) => return Err(err),
+                };
+            // Unwrapping proves the caller is currently authorized to share this group.
+            let data_key = match keys_file.unwrap_key(&group, &identity) {
+                Ok(key) => key,
+                Err(err) => {
+                    return Err(anyhow!(err))
+                        .with_context(|| format!("failed to unwrap key for group '{group}'"));
+                }
+            };
+            let mut recipients = match keys_file.recipient_public_keys() {
+                Ok(map) => map,
+                Err(err) => {
+                    return Err(anyhow!(err)).context("invalid recipient list in group keys file");
+                }
+            };
+            if recipients.contains_key(&member) {
+                bail!(
+                    "recipient '{member}' already exists in group '{group}'; remove them first with 'scrim private recipients rm {member} --group {group}' before replacing their key"
+                );
+            }
+            recipients.insert(member.clone(), parsed_key);
+            let updated_keys = match GroupKeysFile::wrap_for_recipients(
+                &group,
+                keys_file.generation,
+                &data_key,
+                &recipients,
+            ) {
+                Ok(file) => file,
+                Err(err) => return Err(anyhow!(err)).context("failed to wrap group data key"),
+            };
+            if let Err(err) = write_group_keys(&repo_root, &group, &updated_keys) {
+                return Err(err);
+            }
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Added recipient '{member}' to group '{group}' (generation {}, {} recipient(s))",
+                    updated_keys.generation,
+                    updated_keys.recipients.len()
+                ),
+            ) {
+                return Err(err);
+            }
+            write_line(
+                env.stdout,
+                &format!("Remember to commit and push .scrim/group-keys/{group}.toml."),
+            )
+        }
+        PrivateRecipientsCommand::Rm { member, group } => {
+            if let Err(err) = validate_group_name(&group) {
+                return Err(anyhow!(err));
+            }
+            if let Err(err) = validate_member_name(&member) {
+                return Err(anyhow!(err));
+            }
+            let repo_root = match require_repo_root(&env.cwd) {
+                Ok(root) => root,
+                Err(err) => return Err(err),
+            };
+            let keys_file = match read_group_keys(&repo_root, &group) {
+                Ok(Some(file)) => file,
+                Ok(None) => bail!("group key file .scrim/group-keys/{group}.toml does not exist"),
+                Err(err) => return Err(err),
+            };
+            let mut remaining_recipients = match keys_file.recipient_public_keys() {
+                Ok(map) => map,
+                Err(err) => {
+                    return Err(anyhow!(err)).context("invalid recipient list in group keys file");
+                }
+            };
+            if remaining_recipients.remove(&member).is_none() {
+                bail!("recipient '{member}' not found in group '{group}'");
+            }
+            if remaining_recipients.is_empty() {
+                bail!("cannot remove the last recipient '{member}' from group '{group}'");
+            }
+            let identity =
+                match load_member_identity(cli_key_file, &|key| env.env_var(key), config_path) {
+                    Ok(identity) => identity,
+                    Err(err) => return Err(err),
+                };
+            // Re-normalizing tracked plaintext files runs Git's clean filter
+            // with the caller's identity against the new key file, so refuse
+            // before writing the rotated key file if the caller removed their
+            // own key while plaintext files still need re-encryption.
+            let own_key = identity.public_key();
+            if !remaining_recipients.values().any(|pk| *pk == own_key) {
+                let policy = match read_path_policy(&repo_root) {
+                    Ok(policy) => policy,
+                    Err(err) => return Err(err),
+                };
+                let files: Vec<String> = match private_files_by_group(&repo_root, &policy) {
+                    Ok(mut by_group) => by_group.remove(&group).into_iter().flatten().collect(),
+                    Err(err) => return Err(err),
+                };
+                for path in &files {
+                    match file_state(&repo_root, path) {
+                        Ok(FileState::Plaintext) => bail!(
+                            "cannot remove your own key from group '{group}' while tracked private files need to be re-encrypted; ask another group member to remove you instead"
+                        ),
+                        Ok(_) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            let filter_env = FilterEnv::new(env, cli_key_file, config_path);
+            let rotation = match rotate_group_files(
+                &repo_root,
+                &group,
+                &keys_file,
+                &identity,
+                &remaining_recipients,
+                &filter_env,
+            ) {
+                Ok(rotation) => rotation,
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = write_line(
+                env.stdout,
+                &format!(
+                    "Removed recipient '{member}' from group '{group}' and rotated to generation {} ({} recipient(s))",
+                    rotation.keys_file.generation,
+                    rotation.keys_file.recipients.len()
+                ),
+            ) {
                 return Err(err);
             }
             if let Err(err) = print_paths(

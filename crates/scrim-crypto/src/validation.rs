@@ -12,6 +12,8 @@ pub const MAX_SECRET_VALUE_BYTES: usize = 256 * 1024;
 pub const MAX_SECRETS_PER_SCOPE: usize = 4096;
 /// Longest accepted private-file group name, in bytes.
 pub const MAX_GROUP_NAME_BYTES: usize = 64;
+/// Longest accepted member name, in bytes.
+pub const MAX_MEMBER_NAME_BYTES: usize = 64;
 /// Largest private file plaintext accepted for encryption, in bytes (64 MiB).
 pub const MAX_PRIVATE_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest accepted repo-relative private file path, in bytes.
@@ -117,6 +119,40 @@ pub fn validate_group_name(group: &str) -> Result<(), CryptoError> {
     let is_allowed = |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
     if !bytes.iter().all(is_allowed) {
         return reject("group name may only contain ASCII letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
+/// Checks that `member` is a valid Scrim member identifier for recipient
+/// entries in `.scrim/keys/<scope>.toml` and `.scrim/group-keys/<group>.toml`.
+///
+/// The rules match [`validate_scope_name`] and [`validate_group_name`]: 1 to
+/// [`MAX_MEMBER_NAME_BYTES`] ASCII bytes, starting with `[A-Za-z0-9]` and
+/// otherwise only `[A-Za-z0-9._-]`.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidMemberName`] naming the broken rule.
+pub fn validate_member_name(member: &str) -> Result<(), CryptoError> {
+    let reject = |reason| {
+        Err(CryptoError::InvalidMemberName {
+            member: member.to_owned(),
+            reason,
+        })
+    };
+    let bytes = member.as_bytes();
+    let Some(first) = bytes.first() else {
+        return reject("member name must not be empty");
+    };
+    if bytes.len() > MAX_MEMBER_NAME_BYTES {
+        return reject("member name is longer than 64 bytes");
+    }
+    if !first.is_ascii_alphanumeric() {
+        return reject("member name must start with an ASCII letter or digit");
+    }
+    let is_allowed = |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
+    if !bytes.iter().all(is_allowed) {
+        return reject("member name may only contain ASCII letters, digits, '.', '_' and '-'");
     }
     Ok(())
 }
@@ -246,6 +282,35 @@ mod tests {
             match validate_group_name(group) {
                 Err(CryptoError::InvalidGroupName { .. }) => {}
                 other => panic!("{group:?} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validates_member_names_like_group_names() {
+        let long = "m".repeat(MAX_MEMBER_NAME_BYTES);
+        for member in ["alice", "Bob-2", "ci.bot_1", "0", long.as_str()] {
+            if let Err(error) = validate_member_name(member) {
+                panic!("{member:?} should be valid: {error}");
+            }
+        }
+        let too_long = "m".repeat(MAX_MEMBER_NAME_BYTES + 1);
+        for member in [
+            "",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "-alice",
+            "_alice",
+            "alice bob",
+            "alicé",
+            "alice\n",
+            too_long.as_str(),
+        ] {
+            match validate_member_name(member) {
+                Err(CryptoError::InvalidMemberName { .. }) => {}
+                other => panic!("{member:?} should be rejected, got {other:?}"),
             }
         }
     }

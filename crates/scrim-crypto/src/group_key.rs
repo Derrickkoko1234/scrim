@@ -539,4 +539,47 @@ pub(crate) mod tests {
             other => panic!("expected GenerationOverflow, got {other:?}"),
         }
     }
+
+    #[test]
+    fn rewrapping_same_group_key_at_existing_generation_preserves_generation_and_domain() {
+        let alice = MemberIdentity::generate();
+        let bob = MemberIdentity::generate();
+        let key = group_key();
+        let original = wrap("finance", 4, &key, &[("alice", &alice)]);
+
+        let recovered = match original.unwrap_key("finance", &alice) {
+            Ok(k) => k,
+            Err(error) => panic!("alice should unwrap gen 4: {error}"),
+        };
+        let mut updated_recipients = match original.recipient_public_keys() {
+            Ok(map) => map,
+            Err(error) => panic!("recipient keys should parse: {error}"),
+        };
+        updated_recipients.insert("bob".to_owned(), bob.public_key());
+
+        let rewrapped = match GroupKeysFile::wrap_for_recipients(
+            "finance",
+            original.generation,
+            &recovered,
+            &updated_recipients,
+        ) {
+            Ok(file) => file,
+            Err(error) => panic!("rewrapping at gen 4 should succeed: {error}"),
+        };
+        assert_eq!(rewrapped.generation, 4);
+        assert_eq!(unwrap_bytes(&rewrapped, "finance", &alice), *key.as_bytes());
+        assert_eq!(unwrap_bytes(&rewrapped, "finance", &bob), *key.as_bytes());
+
+        // Domain and generation binding remain enforced on Bob's newly wrapped copy.
+        let mut wrong_gen = rewrapped.clone();
+        wrong_gen.generation = 3;
+        expect_error(wrong_gen.unwrap_key("finance", &bob), |e| {
+            matches!(e, CryptoError::WrappedKeyMismatch)
+        });
+        let mut wrong_group = rewrapped;
+        wrong_group.group = "backend".to_owned();
+        expect_error(wrong_group.unwrap_key("backend", &bob), |e| {
+            matches!(e, CryptoError::WrappedKeyMismatch)
+        });
+    }
 }

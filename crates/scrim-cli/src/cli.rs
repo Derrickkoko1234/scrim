@@ -348,6 +348,42 @@ pub enum SecretsCommand {
     },
     /// Manage server-side secret scope group permissions.
     Scope(SecretsScopeArgs),
+    /// Manage secret scope recipients offline without a Scrim server.
+    Recipients(SecretsRecipientsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsRecipientsArgs {
+    #[command(subcommand)]
+    pub command: SecretsRecipientsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsRecipientsCommand {
+    /// List authorized recipients for a local secret scope.
+    List {
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+    /// Add a recipient to a local secret scope without rotating the key.
+    Add {
+        /// Member name to record for this recipient.
+        member: String,
+        /// Canonical age1... X25519 public key.
+        public_key: String,
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
+    /// Remove a recipient from a local secret scope, rotating the key and re-encrypting secrets.
+    Rm {
+        /// Member name to remove.
+        member: String,
+        /// Secret scope name.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -489,6 +525,42 @@ pub enum PrivateCommand {
     /// Rotate a group's key to match its current members on the server and re-encrypt its files.
     Sync {
         /// Group to rotate.
+        #[arg(long, value_name = "GROUP")]
+        group: String,
+    },
+    /// Manage private-file group recipients offline without a Scrim server.
+    Recipients(PrivateRecipientsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrivateRecipientsArgs {
+    #[command(subcommand)]
+    pub command: PrivateRecipientsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PrivateRecipientsCommand {
+    /// List authorized recipients for a local private-file group.
+    List {
+        /// Group name.
+        #[arg(long, value_name = "GROUP")]
+        group: String,
+    },
+    /// Add a recipient to a local private-file group without rotating the key.
+    Add {
+        /// Member name to record for this recipient.
+        member: String,
+        /// Canonical age1... X25519 public key.
+        public_key: String,
+        /// Group name.
+        #[arg(long, value_name = "GROUP")]
+        group: String,
+    },
+    /// Remove a recipient from a local private-file group, rotating the key and re-encrypting files.
+    Rm {
+        /// Member name to remove.
+        member: String,
+        /// Group name.
         #[arg(long, value_name = "GROUP")]
         group: String,
     },

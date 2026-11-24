@@ -680,4 +680,49 @@ pub(crate) mod tests {
             other => panic!("expected InvalidToml, got {other:?}"),
         }
     }
+
+    #[test]
+    fn rewrapping_same_key_at_existing_generation_adds_recipient_with_domain_binding() {
+        let alice = MemberIdentity::generate();
+        let bob = MemberIdentity::generate();
+        let key = data_key();
+        let original = wrap("prod", 3, &key, &[("alice", &alice)]);
+
+        let recovered = match original.unwrap_key("prod", &alice) {
+            Ok(k) => k,
+            Err(error) => panic!("alice should unwrap gen 3: {error}"),
+        };
+        let mut updated_recipients = match original.recipient_public_keys() {
+            Ok(map) => map,
+            Err(error) => panic!("recipient keys should parse: {error}"),
+        };
+        updated_recipients.insert("bob".to_owned(), bob.public_key());
+
+        let rewrapped = match ScopeKeysFile::wrap_for_recipients(
+            "prod",
+            original.generation,
+            &recovered,
+            &updated_recipients,
+        ) {
+            Ok(file) => file,
+            Err(error) => panic!("rewrapping at gen 3 should succeed: {error}"),
+        };
+        assert_eq!(rewrapped.generation, 3);
+        assert_eq!(unwrap_bytes(&rewrapped, "prod", &alice), *key.as_bytes());
+        assert_eq!(unwrap_bytes(&rewrapped, "prod", &bob), *key.as_bytes());
+
+        // Domain and generation binding remain enforced on Bob's newly wrapped copy.
+        let mut wrong_gen = rewrapped.clone();
+        wrong_gen.generation = 2;
+        match wrong_gen.unwrap_key("prod", &bob) {
+            Err(CryptoError::WrappedKeyMismatch) => {}
+            other => panic!("expected WrappedKeyMismatch for wrong gen, got {other:?}"),
+        }
+        let mut wrong_scope = rewrapped;
+        wrong_scope.scope = "dev".to_owned();
+        match wrong_scope.unwrap_key("dev", &bob) {
+            Err(CryptoError::WrappedKeyMismatch) => {}
+            other => panic!("expected WrappedKeyMismatch for wrong scope, got {other:?}"),
+        }
+    }
 }
