@@ -28,10 +28,10 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use scrim_policy::{GitVersion, MIN_GIT_VERSION, parse_git_version};
 use scrim_server::{
     BackupConfig, CachedPolicyStore, DEFAULT_R2_PREFIX, MAX_TOKEN_BYTES, PACK_OBJECTS_HOOK_MODE,
-    PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore, R2Config,
-    RedisPolicyCache, RestoreConfig, SecretString, SharedHookDir, SshServerConfig, TokenAuth,
-    load_or_create_ssh_host_key, run_backup, run_pack_objects_hook_process,
-    run_pre_receive_hook_process, run_restore, serve_ssh,
+    PRE_RECEIVE_HOOK_MODE, PRE_RECEIVE_HOOK_MODE_ENV, PgPolicyStore, PolicyStore, PruneConfig,
+    R2Config, RedisPolicyCache, RestoreConfig, SecretString, SharedHookDir, SshServerConfig,
+    TokenAuth, list_backups, load_or_create_ssh_host_key, prune_backups, run_backup,
+    run_pack_objects_hook_process, run_pre_receive_hook_process, run_restore, serve_ssh,
 };
 use secrecy::ExposeSecret;
 use tokio::io::AsyncReadExt;
@@ -125,9 +125,21 @@ enum Command {
     /// a `pg_dump` of the database) to Cloudflare R2, then points
     /// `<prefix>/latest.json` at it.
     Backup(BackupArgs),
+    /// Lists or prunes backups stored in Cloudflare R2.
+    #[command(subcommand)]
+    Backups(BackupsCommand),
     /// Restores a backup from Cloudflare R2 into an empty repo root (and,
     /// with `DATABASE_URL`, the database through `pg_restore --clean`).
     Restore(RestoreArgs),
+}
+
+/// Subcommands of `scrim-server backups`.
+#[derive(Subcommand)]
+enum BackupsCommand {
+    /// Lists backups stored in Cloudflare R2, newest first.
+    List(BackupsListArgs),
+    /// Deletes older backups from Cloudflare R2 while retaining the newest N.
+    Prune(BackupsPruneArgs),
 }
 
 /// Where backups live: an S3-compatible Cloudflare R2 bucket.
@@ -187,6 +199,33 @@ struct BackupArgs {
     /// `pg_dump` executable.
     #[arg(long, default_value = "pg_dump")]
     pg_dump_bin: PathBuf,
+
+    /// Retain at most this many newest backups (plus `latest.json`), pruning
+    /// older ones after the backup succeeds.
+    #[arg(long)]
+    keep: Option<usize>,
+}
+
+/// Arguments of `scrim-server backups list`.
+#[derive(Args)]
+struct BackupsListArgs {
+    #[command(flatten)]
+    r2: R2Args,
+}
+
+/// Arguments of `scrim-server backups prune`.
+#[derive(Args)]
+struct BackupsPruneArgs {
+    #[command(flatten)]
+    r2: R2Args,
+
+    /// Number of newest valid backups to retain (must be at least 1).
+    #[arg(long)]
+    keep: usize,
+
+    /// Show which backups would be pruned without deleting any objects.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Arguments of `scrim-server restore`.
@@ -262,6 +301,12 @@ fn main() -> anyhow::Result<()> {
     match config.command {
         Some(Command::BootstrapAdmin(args)) => runtime.block_on(run_bootstrap_admin(args)),
         Some(Command::Backup(args)) => runtime.block_on(run_backup_command(args)),
+        Some(Command::Backups(BackupsCommand::List(args))) => {
+            runtime.block_on(run_backups_list_command(args))
+        }
+        Some(Command::Backups(BackupsCommand::Prune(args))) => {
+            runtime.block_on(run_backups_prune_command(args))
+        }
         Some(Command::Restore(args)) => runtime.block_on(run_restore_command(args)),
         None => runtime.block_on(run_server(config)),
     }
@@ -324,6 +369,7 @@ async fn run_backup_command(args: BackupArgs) -> anyhow::Result<()> {
         database_url: secret_database_url(args.database_url),
         r2: args.r2.into_config(),
         pg_dump_bin: args.pg_dump_bin,
+        keep: args.keep,
     })
     .await
     {
@@ -340,6 +386,67 @@ async fn run_backup_command(args: BackupArgs) -> anyhow::Result<()> {
             ""
         },
         manifest.backup_id
+    );
+    Ok(())
+}
+
+/// Lists backups stored in R2, newest first.
+async fn run_backups_list_command(args: BackupsListArgs) -> anyhow::Result<()> {
+    init_tracing_to_stderr();
+    let r2 = args.r2.into_config();
+    let backups = match list_backups(&r2).await {
+        Ok(backups) => backups,
+        Err(error) => return Err(error.context("listing backups failed")),
+    };
+    if backups.is_empty() {
+        println!("No backups found.");
+        return Ok(());
+    }
+    for backup in backups {
+        let db_flag = if backup.has_database { "db" } else { "no-db" };
+        let latest_marker = if backup.is_latest { " [latest]" } else { "" };
+        println!(
+            "{}\t{}\t{} repos\t{}\t{} bytes{}",
+            backup.backup_id,
+            backup.created_at_utc,
+            backup.repo_count,
+            db_flag,
+            backup.total_size_bytes,
+            latest_marker
+        );
+    }
+    Ok(())
+}
+
+/// Prunes older backups stored in R2 according to `--keep`.
+async fn run_backups_prune_command(args: BackupsPruneArgs) -> anyhow::Result<()> {
+    init_tracing_to_stderr();
+    let report = match prune_backups(PruneConfig {
+        r2: args.r2.into_config(),
+        keep: args.keep,
+        dry_run: args.dry_run,
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => return Err(error.context("pruning backups failed")),
+    };
+    for id in &report.kept {
+        println!("keep\t{id}");
+    }
+    for id in &report.pruned {
+        println!("prune\t{id}");
+    }
+    let verb = if report.dry_run {
+        "Would prune"
+    } else {
+        "Pruned"
+    };
+    eprintln!(
+        "{verb} {} backup(s) ({} object(s) deleted); kept {} backup(s).",
+        report.pruned.len(),
+        report.deleted_objects,
+        report.kept.len()
     );
     Ok(())
 }

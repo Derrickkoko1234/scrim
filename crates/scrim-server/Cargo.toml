@@ -25,7 +25,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 getrandom = "0.4.3"
 gix = { version = "0.90.0", default-features = false, features = ["sha1", "sha256"] }
 hmac = "0.13.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 russh = { version = "0.65.4", default-features = false, features = ["ring", "flate2"] }
 scrim-policy = { version = "0.0.0", path = "../scrim-policy" }
 secrecy = "0.10.3"

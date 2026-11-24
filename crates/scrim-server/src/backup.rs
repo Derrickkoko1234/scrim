@@ -2,12 +2,20 @@
 //!
 //! [`run_backup`] snapshots every bare repository under the repository root
 //! (an isolated `git clone --mirror`, so concurrent pushes cannot tear the
-//! copy), uploads each as a `.tar.gz`, optionally uploads a `pg_dump` of the
-//! database, and finally writes a [`BackupManifest`] plus a
-//! [`LatestBackupPointer`]. [`run_restore`] reverses that, verifying every
-//! object's exact SHA-256 digest before it is decompressed or handed to
-//! `pg_restore`, and refusing any archive entry other than plain files and
-//! directories at safe relative paths.
+//! copy), archives each as a `.tar.gz` into a staging file on disk while
+//! computing its SHA-256 and byte length in a single pass, streams each
+//! archive from disk with O(1) memory, optionally runs `pg_dump` to a staging
+//! file and streams it from disk, and finally writes a [`BackupManifest`] plus
+//! a [`LatestBackupPointer`]. Each per-repo staging archive is deleted right
+//! after its upload so staging disk usage stays bounded to one repository at
+//! a time. [`run_restore`] reverses that, verifying every object's exact
+//! SHA-256 digest before it is decompressed or handed to `pg_restore`, and
+//! refusing any archive entry other than plain files and directories at safe
+//! relative paths.
+//!
+//! [`list_backups`] enumerates and validates backups stored under the
+//! configured prefix, and [`prune_backups`] enforces a retention count while
+//! keeping `latest.json` protected.
 //!
 //! R2 is spoken to through its S3-compatible API with path-style URLs and
 //! AWS Signature Version 4 (see [`sign_s3_request`]). Database credentials only
@@ -15,11 +23,13 @@
 //! their arguments, and child processes start from a cleared environment so
 //! no other secret is inherited.
 //!
-//! Each object is held in memory while it is uploaded (R2 accepts at most
-//! [`MAX_BACKUP_OBJECT_BYTES`] per single PUT); downloads stream to disk.
+//! Large objects (repository archives and database dumps) stream both to and
+//! from disk (R2 accepts at most [`MAX_BACKUP_OBJECT_BYTES`] per single PUT);
+//! only small JSON payloads (`manifest.json` and `latest.json`) and XML
+//! `ListObjectsV2` responses are held in memory.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -53,6 +63,15 @@ pub const MAX_BACKUP_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Largest manifest or `latest.json` pointer accepted.
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest `ListObjectsV2` XML response page accepted.
+const MAX_LIST_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Most `ListObjectsV2` pages followed per listing request.
+const MAX_LIST_PAGES: usize = 10_000;
+
+/// Most object keys accumulated across `ListObjectsV2` pages.
+const MAX_LIST_OBJECTS: usize = 1_000_000;
 
 /// Most bytes one repository archive may expand to, against gzip bombs.
 const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -109,6 +128,52 @@ pub struct BackupConfig {
     pub r2: R2Config,
     /// `pg_dump` executable (looked up on `PATH` if not a path).
     pub pg_dump_bin: PathBuf,
+    /// Optional retention count: when `Some(n)`, prunes older backups after
+    /// `latest.json` is published, keeping at least `n` newest valid backups
+    /// plus the `latest.json` target.
+    pub keep: Option<usize>,
+}
+
+/// Summary of one backup stored in R2, returned by [`list_backups`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSummary {
+    /// Unique backup ID.
+    pub backup_id: String,
+    /// RFC 3339 UTC timestamp recorded in the backup manifest.
+    pub created_at_utc: String,
+    /// Number of repository archives in the backup.
+    pub repo_count: usize,
+    /// Whether a PostgreSQL database dump is included.
+    pub has_database: bool,
+    /// Total byte size of all artifacts recorded in the manifest.
+    pub total_size_bytes: u64,
+    /// Whether `<prefix>/latest.json` currently points at this backup.
+    pub is_latest: bool,
+}
+
+/// Input of [`prune_backups`].
+#[derive(Clone, Debug)]
+pub struct PruneConfig {
+    /// Bucket containing the backups.
+    pub r2: R2Config,
+    /// Number of newest valid backups to retain (must be at least 1).
+    pub keep: usize,
+    /// When `true`, compute which backups would be pruned without deleting any
+    /// objects from R2.
+    pub dry_run: bool,
+}
+
+/// Outcome of [`prune_backups`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    /// Backup IDs retained (the `keep` newest plus the `latest.json` target, if any).
+    pub kept: Vec<String>,
+    /// Backup IDs deleted (or selected for deletion when `dry_run` is `true`).
+    pub pruned: Vec<String>,
+    /// Number of R2 objects deleted (always `0` when `dry_run` is `true`).
+    pub deleted_objects: usize,
+    /// Whether this run was a dry run.
+    pub dry_run: bool,
 }
 
 /// Input of [`run_restore`].
@@ -235,17 +300,7 @@ pub fn sign_s3_request(request: &S3SigningRequest<'_>) -> Result<String, String>
         .collect::<Vec<_>>()
         .join(";");
 
-    let mut query: Vec<(String, String)> = request
-        .query
-        .iter()
-        .map(|(name, value)| (uri_encode(name, true), uri_encode(value, true)))
-        .collect();
-    query.sort();
-    let canonical_query = query
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
+    let canonical_query = canonical_query_string(request.query);
 
     let canonical_request = format!(
         "{}\n{}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{}",
@@ -305,6 +360,21 @@ fn collapse_header_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Builds a SigV4 canonical query string: RFC 3986 URI-encodes each name and
+/// value, then sorts by encoded name and then encoded value.
+fn canonical_query_string(params: &[(&str, &str)]) -> String {
+    let mut query: Vec<(String, String)> = params
+        .iter()
+        .map(|(name, value)| (uri_encode(name, true), uri_encode(value, true)))
+        .collect();
+    query.sort();
+    query
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// Percent-encodes every byte of `value` except RFC 3986 unreserved
 /// characters (and `/` unless `encode_slash`), with uppercase hex.
 fn uri_encode(value: &str, encode_slash: bool) -> String {
@@ -344,7 +414,7 @@ fn current_timestamps() -> (String, String) {
     (rfc3339, amz_date)
 }
 
-/// A minimal S3 client for path-style object PUT and GET.
+/// A minimal S3 client for path-style object PUT, GET, DELETE and ListObjectsV2.
 struct S3Client {
     http: reqwest::Client,
     /// `scheme://host[:port]`.
@@ -419,30 +489,29 @@ impl S3Client {
         })
     }
 
-    /// Sends a signed request for `key` with `body` (PUT) or none (GET).
-    async fn send(
+    /// Sends a signed S3 request and returns the raw HTTP response.
+    async fn send_signed_raw(
         &self,
-        method: reqwest::Method,
-        key: &str,
-        body: Option<Vec<u8>>,
+        method: &reqwest::Method,
+        raw_path: &str,
+        query: &[(&str, &str)],
+        display_target: &str,
+        payload_sha256: &str,
+        body: Option<(reqwest::Body, u64)>,
     ) -> anyhow::Result<reqwest::Response> {
-        let canonical_uri = uri_encode(&format!("/{}/{key}", self.bucket), false);
-        let payload_sha256 = match &body {
-            Some(body) => sha256_hex(body),
-            None => EMPTY_PAYLOAD_SHA256.to_owned(),
-        };
+        let canonical_uri = uri_encode(raw_path, false);
         let (_, amz_date) = current_timestamps();
         let headers = [
             ("host", self.host.as_str()),
-            ("x-amz-content-sha256", payload_sha256.as_str()),
+            ("x-amz-content-sha256", payload_sha256),
             ("x-amz-date", amz_date.as_str()),
         ];
         let authorization = match sign_s3_request(&S3SigningRequest {
             method: method.as_str(),
             canonical_uri: &canonical_uri,
-            query: &[],
+            query,
             headers: &headers,
-            payload_sha256: &payload_sha256,
+            payload_sha256,
             amz_date: &amz_date,
             region: R2_REGION,
             service: S3_SERVICE,
@@ -450,32 +519,132 @@ impl S3Client {
             secret_access_key: self.secret_access_key.expose_secret(),
         }) {
             Ok(authorization) => authorization,
-            Err(error) => bail!("cannot sign the request for {key}: {error}"),
+            Err(error) => bail!("cannot sign the request for {display_target}: {error}"),
+        };
+        let url = if query.is_empty() {
+            format!("{}{canonical_uri}", self.origin)
+        } else {
+            let encoded_query = canonical_query_string(query);
+            format!("{}{canonical_uri}?{encoded_query}", self.origin)
         };
         let mut request = self
             .http
-            .request(method.clone(), format!("{}{canonical_uri}", self.origin))
+            .request(method.clone(), url)
             .header("x-amz-date", amz_date)
             .header("x-amz-content-sha256", payload_sha256)
             .header(reqwest::header::AUTHORIZATION, authorization);
-        if let Some(body) = body {
-            request = request.body(body);
+        if let Some((body, content_length)) = body {
+            request = request
+                .header(reqwest::header::CONTENT_LENGTH, content_length)
+                .body(body);
         }
-        let response = match request.send().await {
+        match request.send().await {
+            Ok(response) => Ok(response),
+            Err(error) => bail!("{method} {display_target} failed: {error}"),
+        }
+    }
+
+    /// Sends a signed S3 request, failing with a quoted error body on non-2xx.
+    async fn send_signed(
+        &self,
+        method: reqwest::Method,
+        raw_path: &str,
+        query: &[(&str, &str)],
+        display_target: &str,
+        payload_sha256: &str,
+        body: Option<(reqwest::Body, u64)>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let response = match self
+            .send_signed_raw(
+                &method,
+                raw_path,
+                query,
+                display_target,
+                payload_sha256,
+                body,
+            )
+            .await
+        {
             Ok(response) => response,
-            Err(error) => bail!("{method} {key} failed: {error}"),
+            Err(error) => return Err(error),
         };
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
         let quoted_body = read_error_body(response).await;
-        bail!("{method} {key} failed with HTTP {status}: {quoted_body}")
+        bail!("{method} {display_target} failed with HTTP {status}: {quoted_body}")
     }
 
-    /// Uploads `body` to `key`.
+    /// Uploads a small in-memory `body` (such as JSON metadata) to `key`.
     async fn put_object(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
-        match self.send(reqwest::Method::PUT, key, Some(body)).await {
+        let payload_sha256 = sha256_hex(&body);
+        let size_bytes = body.len() as u64;
+        match self
+            .send_signed(
+                reqwest::Method::PUT,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                &payload_sha256,
+                Some((reqwest::Body::from(body), size_bytes)),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Streams a staged file at `path` to `key` with precomputed
+    /// `payload_sha256` and exact `size_bytes` (`Content-Length`).
+    async fn put_file_object(
+        &self,
+        key: &str,
+        path: &Path,
+        payload_sha256: &str,
+        size_bytes: u64,
+    ) -> anyhow::Result<()> {
+        if size_bytes > MAX_BACKUP_OBJECT_BYTES {
+            bail!("{key} exceeds maximum object size of {MAX_BACKUP_OBJECT_BYTES} bytes");
+        }
+        if !is_sha256_hex(payload_sha256) {
+            bail!("invalid SHA-256 digest for {key}");
+        }
+        let file = match tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("cannot open staged object {}", path.display()))
+        {
+            Ok(file) => file,
+            Err(error) => return Err(error),
+        };
+        let metadata = match file
+            .metadata()
+            .await
+            .with_context(|| format!("cannot inspect staged object {}", path.display()))
+        {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(error),
+        };
+        if metadata.len() != size_bytes {
+            bail!(
+                "staged object {} changed size on disk (expected {size_bytes} bytes, found {})",
+                path.display(),
+                metadata.len()
+            );
+        }
+        let body = reqwest::Body::from(file);
+        match self
+            .send_signed(
+                reqwest::Method::PUT,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                payload_sha256,
+                Some((body, size_bytes)),
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         }
@@ -483,22 +652,55 @@ impl S3Client {
 
     /// Downloads `key` into memory, failing beyond `max_bytes`.
     async fn get_object_bytes(&self, key: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
-        let mut response = match self.send(reqwest::Method::GET, key, None).await {
+        let mut response = match self
+            .send_signed(
+                reqwest::Method::GET,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                EMPTY_PAYLOAD_SHA256,
+                None,
+            )
+            .await
+        {
             Ok(response) => response,
             Err(error) => return Err(error),
         };
-        let mut bytes = Vec::new();
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
-                        bail!("{key} is larger than {max_bytes} bytes");
-                    }
-                    bytes.extend_from_slice(&chunk);
-                }
-                Ok(None) => return Ok(bytes),
-                Err(error) => bail!("cannot read {key}: {error}"),
-            }
+        read_bounded_bytes(&mut response, max_bytes, key).await
+    }
+
+    /// Downloads `key` into memory if it exists, returning `Ok(None)` on 404.
+    async fn get_optional_object_bytes(
+        &self,
+        key: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let method = reqwest::Method::GET;
+        let mut response = match self
+            .send_signed_raw(
+                &method,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                EMPTY_PAYLOAD_SHA256,
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let quoted_body = read_error_body(response).await;
+            bail!("{method} {key} failed with HTTP {status}: {quoted_body}");
+        }
+        match read_bounded_bytes(&mut response, max_bytes, key).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => Err(error),
         }
     }
 
@@ -510,7 +712,17 @@ impl S3Client {
         expected_size_bytes: u64,
         path: &Path,
     ) -> anyhow::Result<String> {
-        let mut response = match self.send(reqwest::Method::GET, key, None).await {
+        let mut response = match self
+            .send_signed(
+                reqwest::Method::GET,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                EMPTY_PAYLOAD_SHA256,
+                None,
+            )
+            .await
+        {
             Ok(response) => response,
             Err(error) => return Err(error),
         };
@@ -553,6 +765,324 @@ impl S3Client {
         }
         Ok(encode_hex(hasher.finalize().as_slice()).as_str().to_owned())
     }
+
+    /// Lists all object keys starting with `key_prefix` via S3
+    /// `ListObjectsV2`, following `NextContinuationToken` within bounded page
+    /// and object limits.
+    async fn list_objects(&self, key_prefix: &str) -> anyhow::Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let raw_bucket_path = format!("/{}", self.bucket);
+        for _page in 0..MAX_LIST_PAGES {
+            let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", key_prefix)];
+            if let Some(token) = continuation_token.as_deref() {
+                query.push(("continuation-token", token));
+            }
+            let mut response = match self
+                .send_signed(
+                    reqwest::Method::GET,
+                    &raw_bucket_path,
+                    &query,
+                    &format!("list {key_prefix}"),
+                    EMPTY_PAYLOAD_SHA256,
+                    None,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return Err(error),
+            };
+            let body = match read_bounded_bytes(&mut response, MAX_LIST_RESPONSE_BYTES, key_prefix)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return Err(error),
+            };
+            let page = match parse_list_objects_v2_xml(&body) {
+                Ok(page) => page,
+                Err(error) => return Err(error),
+            };
+            if keys.len().saturating_add(page.keys.len()) > MAX_LIST_OBJECTS {
+                bail!("listing {key_prefix} exceeded the maximum of {MAX_LIST_OBJECTS} objects");
+            }
+            keys.extend(page.keys);
+            if !page.is_truncated {
+                return Ok(keys);
+            }
+            let Some(next_token) = page.next_continuation_token else {
+                bail!("truncated ListObjectsV2 response did not include NextContinuationToken");
+            };
+            if next_token.is_empty() || continuation_token.as_deref() == Some(next_token.as_str()) {
+                bail!("truncated ListObjectsV2 response returned an invalid continuation token");
+            }
+            continuation_token = Some(next_token);
+        }
+        bail!("listing {key_prefix} exceeded the maximum of {MAX_LIST_PAGES} pages")
+    }
+
+    /// Deletes `key` from the bucket.
+    async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        match self
+            .send_signed(
+                reqwest::Method::DELETE,
+                &format!("/{}/{key}", self.bucket),
+                &[],
+                key,
+                EMPTY_PAYLOAD_SHA256,
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Reads an HTTP response body into memory, failing if it exceeds `max_bytes`.
+async fn read_bounded_bytes(
+    response: &mut reqwest::Response,
+    max_bytes: u64,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+                    bail!("{label} is larger than {max_bytes} bytes");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(bytes),
+            Err(error) => bail!("cannot read {label}: {error}"),
+        }
+    }
+}
+
+/// Parsed page from an S3 `ListObjectsV2` XML response.
+struct ListObjectsPage {
+    keys: Vec<String>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+/// Parses an S3 `ListObjectsV2` `<ListBucketResult>` XML response without a
+/// general-purpose XML dependency.
+fn parse_list_objects_v2_xml(bytes: &[u8]) -> anyhow::Result<ListObjectsPage> {
+    let xml = match std::str::from_utf8(bytes) {
+        Ok(xml) => xml,
+        Err(_) => bail!("ListObjectsV2 response is not valid UTF-8"),
+    };
+    let mut keys = Vec::new();
+    let mut is_truncated = false;
+    let mut next_continuation_token: Option<String> = None;
+    let mut stack: Vec<&str> = Vec::new();
+    let mut saw_root = false;
+    let mut current_key: Option<String> = None;
+    let mut text_buf = String::new();
+    let mut pos = 0;
+
+    while pos < xml.len() {
+        let rest = &xml[pos..];
+        let Some(lt_offset) = rest.find('<') else {
+            let trailing = rest.trim();
+            if !trailing.is_empty() && stack.is_empty() {
+                bail!("unexpected trailing text in ListObjectsV2 XML");
+            }
+            text_buf.push_str(rest);
+            break;
+        };
+        if lt_offset > 0 {
+            let segment = &rest[..lt_offset];
+            if !stack.is_empty() {
+                text_buf.push_str(segment);
+            } else if !segment.trim().is_empty() {
+                bail!("unexpected text outside XML root element");
+            }
+            pos += lt_offset;
+        }
+
+        let tag_rest = &xml[pos..];
+        if let Some(comment_rest) = tag_rest.strip_prefix("<!--") {
+            let Some(end_offset) = comment_rest.find("-->") else {
+                bail!("unclosed XML comment in ListObjectsV2 response");
+            };
+            pos += 4 + end_offset + 3;
+            continue;
+        }
+        if let Some(pi_rest) = tag_rest.strip_prefix("<?") {
+            let Some(end_offset) = pi_rest.find("?>") else {
+                bail!("unclosed XML processing instruction in ListObjectsV2 response");
+            };
+            pos += 2 + end_offset + 2;
+            continue;
+        }
+        if let Some(cdata_rest) = tag_rest.strip_prefix("<![CDATA[") {
+            let Some(end_offset) = cdata_rest.find("]]>") else {
+                bail!("unclosed XML CDATA section in ListObjectsV2 response");
+            };
+            if !stack.is_empty() {
+                text_buf.push_str(&cdata_rest[..end_offset]);
+            }
+            pos += 9 + end_offset + 3;
+            continue;
+        }
+
+        let Some(gt_offset) = tag_rest.find('>') else {
+            bail!("unclosed XML tag in ListObjectsV2 response");
+        };
+        let inside = tag_rest[1..gt_offset].trim();
+        pos += gt_offset + 1;
+
+        if inside.is_empty() {
+            bail!("empty XML tag in ListObjectsV2 response");
+        }
+        if let Some(closing) = inside.strip_prefix('/') {
+            let tag_name = xml_local_name(closing.trim());
+            if tag_name.is_empty() {
+                bail!("empty closing XML tag in ListObjectsV2 response");
+            }
+            let Some(expected) = stack.pop() else {
+                bail!("unexpected closing XML tag </{tag_name}>");
+            };
+            if expected != tag_name {
+                bail!("mismatched closing XML tag </{tag_name}> (expected </{expected}>)");
+            }
+            if stack.as_slice() == ["ListBucketResult", "Contents"] && tag_name == "Key" {
+                let decoded = match decode_xml_entities(&text_buf) {
+                    Ok(decoded) => decoded,
+                    Err(error) => return Err(error),
+                };
+                if decoded.is_empty() {
+                    bail!("ListObjectsV2 XML contains an empty <Key>");
+                }
+                current_key = Some(decoded);
+            } else if stack.as_slice() == ["ListBucketResult"] {
+                match tag_name {
+                    "Contents" => {
+                        let Some(key) = current_key.take() else {
+                            bail!("ListObjectsV2 <Contents> entry is missing <Key>");
+                        };
+                        keys.push(key);
+                    }
+                    "IsTruncated" => {
+                        let flag = match decode_xml_entities(&text_buf) {
+                            Ok(flag) => flag,
+                            Err(error) => return Err(error),
+                        };
+                        match flag.trim() {
+                            "true" => is_truncated = true,
+                            "false" => is_truncated = false,
+                            other => {
+                                bail!("invalid <IsTruncated> value {other:?} in ListObjectsV2 XML");
+                            }
+                        }
+                    }
+                    "NextContinuationToken" => {
+                        let token = match decode_xml_entities(&text_buf) {
+                            Ok(token) => token,
+                            Err(error) => return Err(error),
+                        };
+                        next_continuation_token = Some(token);
+                    }
+                    _ => {}
+                }
+            }
+            text_buf.clear();
+        } else {
+            let (body, self_closing) = match inside.strip_suffix('/') {
+                Some(stripped) => (stripped.trim_end(), true),
+                None => (inside, false),
+            };
+            let raw_name = match body.split(|ch: char| ch.is_ascii_whitespace()).next() {
+                Some(name) if !name.is_empty() => name,
+                _ => bail!("malformed opening XML tag in ListObjectsV2 response"),
+            };
+            let tag_name = xml_local_name(raw_name);
+            if stack.is_empty() {
+                if tag_name != "ListBucketResult" {
+                    bail!("unexpected ListObjectsV2 root element <{tag_name}>");
+                }
+                saw_root = true;
+            }
+            text_buf.clear();
+            if !self_closing {
+                if stack.as_slice() == ["ListBucketResult"] && tag_name == "Contents" {
+                    current_key = None;
+                }
+                stack.push(tag_name);
+            } else if stack.as_slice() == ["ListBucketResult"] && tag_name == "Contents" {
+                bail!("ListObjectsV2 <Contents/> entry is missing <Key>");
+            }
+        }
+    }
+
+    if !saw_root || !stack.is_empty() {
+        bail!("incomplete ListObjectsV2 XML response");
+    }
+    Ok(ListObjectsPage {
+        keys,
+        is_truncated,
+        next_continuation_token,
+    })
+}
+
+/// Strips any XML namespace prefix (`ns:Tag` -> `Tag`).
+fn xml_local_name(name: &str) -> &str {
+    match name.rsplit_once(':') {
+        Some((_, local)) => local,
+        None => name,
+    }
+}
+
+/// Decodes standard XML entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`,
+/// and numeric character references) in `raw`.
+fn decode_xml_entities(raw: &str) -> anyhow::Result<String> {
+    if !raw.contains('&') {
+        return Ok(raw.to_owned());
+    }
+    let mut decoded = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp_idx) = rest.find('&') {
+        decoded.push_str(&rest[..amp_idx]);
+        let after_amp = &rest[amp_idx + 1..];
+        let Some(semi_idx) = after_amp.find(';') else {
+            bail!("unterminated XML entity in ListObjectsV2 response");
+        };
+        let entity = &after_amp[..semi_idx];
+        match entity {
+            "amp" => decoded.push('&'),
+            "lt" => decoded.push('<'),
+            "gt" => decoded.push('>'),
+            "quot" => decoded.push('"'),
+            "apos" => decoded.push('\''),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                let hex = &entity[2..];
+                let Ok(code) = u32::from_str_radix(hex, 16) else {
+                    bail!("invalid hexadecimal XML entity &#x{hex};");
+                };
+                let Some(ch) = char::from_u32(code).filter(|ch| *ch != '\0') else {
+                    bail!("invalid XML character reference &#x{hex};");
+                };
+                decoded.push(ch);
+            }
+            _ if entity.starts_with('#') => {
+                let dec = &entity[1..];
+                let Ok(code) = dec.parse::<u32>() else {
+                    bail!("invalid decimal XML entity &#{dec};");
+                };
+                let Some(ch) = char::from_u32(code).filter(|ch| *ch != '\0') else {
+                    bail!("invalid XML character reference &#{dec};");
+                };
+                decoded.push(ch);
+            }
+            other => bail!("unsupported XML entity &{other}; in ListObjectsV2 response"),
+        }
+        rest = &after_amp[semi_idx + 1..];
+    }
+    decoded.push_str(rest);
+    Ok(decoded)
 }
 
 /// Reads at most [`MAX_ERROR_BODY_BYTES`] of an error response for quoting.
@@ -704,14 +1234,22 @@ fn validate_manifest(manifest: &BackupManifest, prefix: &str) -> anyhow::Result<
 /// Uploads a backup of `config.repo_root` (and the database, if configured)
 /// and returns its manifest.
 ///
-/// `latest.json` is only updated after every object and the manifest are
-/// uploaded, so it always points at a complete backup.
+/// Repository archives and `pg_dump` outputs are staged to temporary files on
+/// disk and streamed to R2 with O(1) memory; each per-repository staging file
+/// is deleted immediately after its upload. `latest.json` is only updated after
+/// every object and the manifest are uploaded, so it always points at a
+/// complete backup. When `config.keep` is `Some(n)`, older backups are pruned
+/// after `latest.json` is published.
 ///
 /// # Errors
 ///
-/// Fails on invalid configuration, any snapshot, `pg_dump` or upload failure.
-/// No error message contains the database password or R2 secret.
+/// Fails on invalid configuration, any snapshot, `pg_dump` or upload failure,
+/// or retention pruning failure. No error message contains the database password
+/// or R2 secret.
 pub async fn run_backup(config: BackupConfig) -> anyhow::Result<BackupManifest> {
+    if config.keep == Some(0) {
+        bail!("keep must be at least 1");
+    }
     let prefix = match normalize_prefix(&config.r2.prefix) {
         Ok(prefix) => prefix,
         Err(error) => return Err(error),
@@ -736,6 +1274,14 @@ pub async fn run_backup(config: BackupConfig) -> anyhow::Result<BackupManifest> 
         Ok(repo_root) => repo_root,
         Err(error) => return Err(error),
     };
+    let staging_dir = match tempfile::Builder::new()
+        .prefix(".scrim-backup-")
+        .tempdir()
+        .context("cannot create the backup staging directory")
+    {
+        Ok(dir) => dir,
+        Err(error) => return Err(error),
+    };
 
     let (created_at_utc, amz_date) = current_timestamps();
     let random_suffix = match generate_random_hex(4) {
@@ -752,19 +1298,25 @@ pub async fn run_backup(config: BackupConfig) -> anyhow::Result<BackupManifest> 
     };
     let mut repos = Vec::with_capacity(repositories.len());
     for (repo_key, repo_dir) in repositories {
-        let archive = match snapshot_and_archive(&repo_dir).await {
-            Ok(archive) => archive,
+        let staged = match snapshot_and_archive(&repo_dir, staging_dir.path()).await {
+            Ok(staged) => staged,
             Err(error) => return Err(error.context(format!("cannot back up {repo_key}"))),
         };
         let object_key = format!("{backup_prefix}/repos/{repo_key}.tar.gz");
         if let Err(error) = validate_object_key(&prefix, &object_key) {
             return Err(error);
         }
-        let sha256 = sha256_hex(&archive);
-        let size_bytes = archive.len() as u64;
-        if let Err(error) = client.put_object(&object_key, archive).await {
+        let sha256 = staged.sha256.clone();
+        let size_bytes = staged.size_bytes;
+        if let Err(error) = client
+            .put_file_object(&object_key, &staged.path, &sha256, size_bytes)
+            .await
+        {
             return Err(error);
         }
+        // Delete each per-repo staging archive immediately after uploading so
+        // local staging disk usage remains bounded to one repository at a time.
+        staged.cleanup().await;
         tracing::info!(%repo_key, size_bytes, "uploaded repository");
         repos.push(BackupRepoEntry {
             repo_key,
@@ -776,19 +1328,28 @@ pub async fn run_backup(config: BackupConfig) -> anyhow::Result<BackupManifest> 
 
     let database = match pg_env {
         Some(pg_env) => {
-            let dump = match run_pg_dump(&config.pg_dump_bin, &pg_env).await {
-                Ok(dump) => dump,
+            let staged = match run_pg_dump(&config.pg_dump_bin, &pg_env, staging_dir.path()).await {
+                Ok(staged) => staged,
                 Err(error) => return Err(error),
             };
             let object_key = format!("{backup_prefix}/database.dump");
             let artifact = BackupArtifact {
                 object_key: object_key.clone(),
-                sha256: sha256_hex(&dump),
-                size_bytes: dump.len() as u64,
+                sha256: staged.sha256.clone(),
+                size_bytes: staged.size_bytes,
             };
-            if let Err(error) = client.put_object(&object_key, dump).await {
+            if let Err(error) = client
+                .put_file_object(
+                    &object_key,
+                    &staged.path,
+                    &artifact.sha256,
+                    artifact.size_bytes,
+                )
+                .await
+            {
                 return Err(error);
             }
+            staged.cleanup().await;
             tracing::info!(size_bytes = artifact.size_bytes, "uploaded database dump");
             Some(artifact)
         }
@@ -823,8 +1384,275 @@ pub async fn run_backup(config: BackupConfig) -> anyhow::Result<BackupManifest> 
             return Err(error);
         }
     }
+    if let Some(keep) = config.keep {
+        let report = match prune_backups_with_client(&client, &prefix, keep, false).await {
+            Ok(report) => report,
+            Err(error) => return Err(error),
+        };
+        tracing::info!(
+            kept = report.kept.len(),
+            pruned = report.pruned.len(),
+            deleted_objects = report.deleted_objects,
+            "pruned older backups"
+        );
+    }
     tracing::info!(backup_id = %manifest.backup_id, "backup complete");
     Ok(manifest)
+}
+
+/// One discovered backup and all object keys under its `<prefix>/<backup_id>/`.
+struct DiscoveredBackup {
+    manifest: BackupManifest,
+    manifest_key: String,
+    object_keys: Vec<String>,
+    is_latest: bool,
+}
+
+/// Result of scanning `<prefix>/` for valid backups and `latest.json`.
+struct DiscoveredBackups {
+    /// Sorted newest-first (`created_at_utc` desc, then `backup_id` desc).
+    backups: Vec<DiscoveredBackup>,
+    latest_backup_id: Option<String>,
+}
+
+/// Discovers and validates every backup under `prefix/`, reading `latest.json`
+/// if present, and returns them sorted newest-first.
+async fn discover_backups(client: &S3Client, prefix: &str) -> anyhow::Result<DiscoveredBackups> {
+    let list_prefix = format!("{prefix}/");
+    let all_keys = match client.list_objects(&list_prefix).await {
+        Ok(keys) => keys,
+        Err(error) => return Err(error),
+    };
+
+    let latest_key = format!("{prefix}/latest.json");
+    let latest_backup_id = match client
+        .get_optional_object_bytes(&latest_key, MAX_MANIFEST_BYTES)
+        .await
+    {
+        Ok(Some(bytes)) => {
+            let latest: LatestBackupPointer = match serde_json::from_slice(&bytes) {
+                Ok(latest) => latest,
+                Err(error) => bail!("cannot parse {latest_key}: {error}"),
+            };
+            if !is_valid_backup_id(&latest.backup_id)
+                || latest.manifest_key != format!("{prefix}/{}/manifest.json", latest.backup_id)
+            {
+                bail!("{latest_key} points at an invalid backup");
+            }
+            Some(latest.backup_id)
+        }
+        Ok(None) => None,
+        Err(error) => return Err(error),
+    };
+
+    let mut manifest_ids: Vec<(String, String)> = Vec::new();
+    let mut objects_by_backup: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in all_keys {
+        let Some(rest) = key.strip_prefix(&list_prefix) else {
+            continue;
+        };
+        let Some((backup_id, inner)) = rest.split_once('/') else {
+            continue;
+        };
+        if !is_valid_backup_id(backup_id) || inner.is_empty() {
+            continue;
+        }
+        if validate_object_key(prefix, &key).is_err() {
+            continue;
+        }
+        objects_by_backup
+            .entry(backup_id.to_owned())
+            .or_default()
+            .push(key.clone());
+        if inner == "manifest.json" {
+            manifest_ids.push((backup_id.to_owned(), key));
+        }
+    }
+
+    let mut backups = Vec::with_capacity(manifest_ids.len());
+    for (backup_id, manifest_key) in manifest_ids {
+        let bytes = match client
+            .get_object_bytes(&manifest_key, MAX_MANIFEST_BYTES)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(error),
+        };
+        let manifest: BackupManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(error) => bail!("cannot parse {manifest_key}: {error}"),
+        };
+        if manifest.backup_id != backup_id {
+            bail!("{manifest_key} describes a different backup");
+        }
+        if let Err(error) = validate_manifest(&manifest, prefix) {
+            return Err(error);
+        }
+        let is_latest = latest_backup_id.as_deref() == Some(backup_id.as_str());
+        let object_keys = match objects_by_backup.remove(&backup_id) {
+            Some(keys) => keys,
+            None => vec![manifest_key.clone()],
+        };
+        backups.push(DiscoveredBackup {
+            manifest,
+            manifest_key,
+            object_keys,
+            is_latest,
+        });
+    }
+
+    backups.sort_by(|a, b| {
+        (
+            b.manifest.created_at_utc.as_str(),
+            b.manifest.backup_id.as_str(),
+        )
+            .cmp(&(
+                a.manifest.created_at_utc.as_str(),
+                a.manifest.backup_id.as_str(),
+            ))
+    });
+
+    Ok(DiscoveredBackups {
+        backups,
+        latest_backup_id,
+    })
+}
+
+/// Lists and validates every backup stored under `r2.prefix`, sorted newest
+/// first (`created_at_utc` descending, then `backup_id` descending).
+///
+/// # Errors
+///
+/// Fails on invalid R2 configuration, S3 listing/fetch failures, or an invalid
+/// manifest or `latest.json` pointer.
+pub async fn list_backups(r2: &R2Config) -> anyhow::Result<Vec<BackupSummary>> {
+    let prefix = match normalize_prefix(&r2.prefix) {
+        Ok(prefix) => prefix,
+        Err(error) => return Err(error),
+    };
+    let client = match S3Client::new(r2) {
+        Ok(client) => client,
+        Err(error) => return Err(error),
+    };
+    let discovered = match discover_backups(&client, &prefix).await {
+        Ok(discovered) => discovered,
+        Err(error) => return Err(error),
+    };
+    let summaries = discovered
+        .backups
+        .into_iter()
+        .map(|entry| {
+            let repo_bytes: u64 = entry
+                .manifest
+                .repos
+                .iter()
+                .map(|repo| repo.size_bytes)
+                .sum();
+            let db_bytes = entry
+                .manifest
+                .database
+                .as_ref()
+                .map_or(0, |db| db.size_bytes);
+            BackupSummary {
+                backup_id: entry.manifest.backup_id,
+                created_at_utc: entry.manifest.created_at_utc,
+                repo_count: entry.manifest.repos.len(),
+                has_database: entry.manifest.database.is_some(),
+                total_size_bytes: repo_bytes.saturating_add(db_bytes),
+                is_latest: entry.is_latest,
+            }
+        })
+        .collect();
+    Ok(summaries)
+}
+
+/// Prunes older backups stored under `config.r2.prefix`, retaining the
+/// `config.keep` newest valid backups and unconditionally protecting whichever
+/// backup `latest.json` points at.
+///
+/// # Errors
+///
+/// Rejects `config.keep == 0` so all backups cannot be wiped accidentally, and
+/// fails on invalid R2 configuration, listing/manifest errors, or S3 deletion
+/// errors.
+pub async fn prune_backups(config: PruneConfig) -> anyhow::Result<PruneReport> {
+    if config.keep == 0 {
+        bail!("keep must be at least 1");
+    }
+    let prefix = match normalize_prefix(&config.r2.prefix) {
+        Ok(prefix) => prefix,
+        Err(error) => return Err(error),
+    };
+    let client = match S3Client::new(&config.r2) {
+        Ok(client) => client,
+        Err(error) => return Err(error),
+    };
+    prune_backups_with_client(&client, &prefix, config.keep, config.dry_run).await
+}
+
+async fn prune_backups_with_client(
+    client: &S3Client,
+    prefix: &str,
+    keep: usize,
+    dry_run: bool,
+) -> anyhow::Result<PruneReport> {
+    if keep == 0 {
+        bail!("keep must be at least 1");
+    }
+    let discovered = match discover_backups(client, prefix).await {
+        Ok(discovered) => discovered,
+        Err(error) => return Err(error),
+    };
+
+    let mut kept = Vec::new();
+    let mut to_prune = Vec::new();
+    for (index, entry) in discovered.backups.into_iter().enumerate() {
+        let is_protected_latest =
+            discovered.latest_backup_id.as_deref() == Some(entry.manifest.backup_id.as_str());
+        if index < keep || is_protected_latest {
+            kept.push(entry.manifest.backup_id);
+        } else {
+            to_prune.push(entry);
+        }
+    }
+
+    let mut pruned = Vec::with_capacity(to_prune.len());
+    let mut deleted_objects = 0usize;
+    for entry in to_prune {
+        let backup_id = entry.manifest.backup_id;
+        if !dry_run {
+            // Delete every data/archive object under `<prefix>/<backup_id>/`
+            // BEFORE deleting `manifest.json`. That way, if pruning fails or
+            // is interrupted halfway through a backup, `manifest.json` remains
+            // present so a subsequent `prune_backups` run still discovers that
+            // backup and cleans up any remaining objects.
+            let mut data_keys: Vec<&str> = entry
+                .object_keys
+                .iter()
+                .map(String::as_str)
+                .filter(|key| *key != entry.manifest_key)
+                .collect();
+            data_keys.sort_unstable();
+            for key in data_keys {
+                if let Err(error) = client.delete_object(key).await {
+                    return Err(error);
+                }
+                deleted_objects += 1;
+            }
+            if let Err(error) = client.delete_object(&entry.manifest_key).await {
+                return Err(error);
+            }
+            deleted_objects += 1;
+        }
+        pruned.push(backup_id);
+    }
+
+    Ok(PruneReport {
+        kept,
+        pruned,
+        deleted_objects,
+        dry_run,
+    })
 }
 
 /// Downloads the backup selected by `config.backup_id` and restores its
@@ -1102,14 +1930,105 @@ async fn run_checked(mut command: tokio::process::Command, what: &str) -> anyhow
     bail!("{what} exited with {}: {stderr}", output.status)
 }
 
-/// Mirrors the bare repository at `repo_dir` into a temporary directory and
-/// returns it as a gzip-compressed tar archive of the repository's files.
-async fn snapshot_and_archive(repo_dir: &Path) -> anyhow::Result<Vec<u8>> {
-    let temp_dir = match tempfile::TempDir::new().context("cannot create a temporary directory") {
-        Ok(temp_dir) => temp_dir,
+/// An [`io::Write`] adapter that hashes every written byte with SHA-256 and
+/// enforces an upper bound of `max_bytes`.
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    bytes_written: u64,
+    max_bytes: u64,
+}
+
+impl<W> HashingWriter<W> {
+    fn new(inner: W, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            max_bytes,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<(W, String, u64)>
+    where
+        W: Write,
+    {
+        if let Err(error) = self.inner.flush() {
+            return Err(error);
+        }
+        let sha256 = encode_hex(self.hasher.finalize().as_slice())
+            .as_str()
+            .to_owned();
+        Ok((self.inner, sha256, self.bytes_written))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.max_bytes.saturating_sub(self.bytes_written);
+        if remaining == 0 {
+            return Err(io::Error::other(format!(
+                "backup object exceeds maximum size of {} bytes",
+                self.max_bytes
+            )));
+        }
+        let limit = match usize::try_from(remaining) {
+            Ok(limit) => buf.len().min(limit),
+            Err(_) => buf.len(),
+        };
+        let written = match self.inner.write(&buf[..limit]) {
+            Ok(written) => written,
+            Err(error) => return Err(error),
+        };
+        self.hasher.update(&buf[..written]);
+        self.bytes_written = self.bytes_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A staged backup object written to disk inside its own temporary directory,
+/// together with its precomputed SHA-256 digest and exact byte length.
+struct StagedArtifact {
+    _temp_dir: tempfile::TempDir,
+    path: PathBuf,
+    sha256: String,
+    size_bytes: u64,
+}
+
+impl StagedArtifact {
+    /// Removes the staged file immediately and drops its temporary directory.
+    async fn cleanup(self) {
+        if let Err(error) = tokio::fs::remove_file(&self.path).await
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), %error, "failed to remove staged backup file");
+        }
+        drop(self._temp_dir);
+    }
+}
+
+/// Mirrors the bare repository at `repo_dir` into a temporary directory under
+/// `staging_root` and writes it as a gzip-compressed tar archive on disk.
+async fn snapshot_and_archive(
+    repo_dir: &Path,
+    staging_root: &Path,
+) -> anyhow::Result<StagedArtifact> {
+    let work_dir = match tempfile::Builder::new()
+        .prefix("repo-")
+        .tempdir_in(staging_root)
+        .context("cannot create a temporary directory")
+    {
+        Ok(work_dir) => work_dir,
         Err(error) => return Err(error),
     };
-    let mirror_dir = temp_dir.path().join("mirror.git");
+    let mirror_dir = work_dir.path().join("mirror.git");
     let mut clone = isolated_git_command();
     clone
         .args([
@@ -1136,24 +2055,45 @@ async fn snapshot_and_archive(repo_dir: &Path) -> anyhow::Result<Vec<u8>> {
         return Err(error);
     }
 
-    let archive = match tokio::task::spawn_blocking(move || archive_directory(&mirror_dir)).await {
+    let archive_path = work_dir.path().join("archive.tar.gz");
+    let archive_path_for_task = archive_path.clone();
+    let mirror_dir_for_task = mirror_dir.clone();
+    let archived = match tokio::task::spawn_blocking(move || {
+        let result = archive_directory(&mirror_dir_for_task, &archive_path_for_task);
+        let _ = fs::remove_dir_all(&mirror_dir_for_task);
+        result
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => Err(anyhow!("the archiving task failed: {error}")),
     };
-    drop(temp_dir);
-    let archive = match archive {
-        Ok(archive) => archive,
+    let (sha256, size_bytes) = match archived {
+        Ok(info) => info,
         Err(error) => return Err(error),
     };
-    if archive.len() as u64 > MAX_BACKUP_OBJECT_BYTES {
-        bail!("the repository archive exceeds {MAX_BACKUP_OBJECT_BYTES} bytes");
-    }
-    Ok(archive)
+    Ok(StagedArtifact {
+        _temp_dir: work_dir,
+        path: archive_path,
+        sha256,
+        size_bytes,
+    })
 }
 
-/// Archives the files below `source` (paths relative to it) as `.tar.gz`.
-fn archive_directory(source: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+/// Archives the files below `source` (paths relative to it) into `archive_path`
+/// as `.tar.gz`, hashing and bounding size in a single streaming pass.
+fn archive_directory(source: &Path, archive_path: &Path) -> anyhow::Result<(String, u64)> {
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(archive_path)
+        .with_context(|| format!("cannot create {}", archive_path.display()))
+    {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+    let writer = HashingWriter::new(io::BufWriter::new(file), MAX_BACKUP_OBJECT_BYTES);
+    let mut builder = tar::Builder::new(GzEncoder::new(writer, Compression::default()));
     builder.mode(tar::HeaderMode::Deterministic);
     builder.follow_symlinks(false);
     let mut pending = vec![PathBuf::new()];
@@ -1210,7 +2150,18 @@ fn archive_directory(source: &Path) -> anyhow::Result<Vec<u8>> {
         Ok(encoder) => encoder,
         Err(error) => return Err(error),
     };
-    encoder.finish().context("cannot finish the gzip stream")
+    let hashing_writer = match encoder.finish().context("cannot finish the gzip stream") {
+        Ok(writer) => writer,
+        Err(error) => return Err(error),
+    };
+    let (_buf_writer, sha256, size_bytes) = match hashing_writer
+        .finish()
+        .context("cannot flush the backup archive")
+    {
+        Ok(finished) => finished,
+        Err(error) => return Err(error),
+    };
+    Ok((sha256, size_bytes))
 }
 
 /// Downloads, verifies, extracts and installs one repository.
@@ -1578,13 +2529,21 @@ fn pg_command(program: &Path, pg_env: &PgConnectionEnv) -> tokio::process::Comma
     command
 }
 
-/// Runs `pg_dump --format=custom` and returns the dump.
-async fn run_pg_dump(pg_dump_bin: &Path, pg_env: &PgConnectionEnv) -> anyhow::Result<Vec<u8>> {
-    let temp_dir = match tempfile::TempDir::new().context("cannot create a temporary directory") {
-        Ok(temp_dir) => temp_dir,
+/// Runs `pg_dump --format=custom` into a staged file and hashes it with O(1) memory.
+async fn run_pg_dump(
+    pg_dump_bin: &Path,
+    pg_env: &PgConnectionEnv,
+    staging_root: &Path,
+) -> anyhow::Result<StagedArtifact> {
+    let work_dir = match tempfile::Builder::new()
+        .prefix("pgdump-")
+        .tempdir_in(staging_root)
+        .context("cannot create a temporary directory")
+    {
+        Ok(work_dir) => work_dir,
         Err(error) => return Err(error),
     };
-    let dump_path = temp_dir.path().join("database.dump");
+    let dump_path = work_dir.path().join("database.dump");
     let mut command = pg_command(pg_dump_bin, pg_env);
     command
         .args(["--format=custom", "--no-owner", "--no-privileges", "--file"])
@@ -1592,23 +2551,47 @@ async fn run_pg_dump(pg_dump_bin: &Path, pg_env: &PgConnectionEnv) -> anyhow::Re
     if let Err(error) = run_checked(command, "pg_dump").await {
         return Err(error);
     }
-    let metadata = match tokio::fs::metadata(&dump_path)
-        .await
-        .context("pg_dump did not write a dump")
-    {
+    let dump_path_for_task = dump_path.clone();
+    let hashed =
+        match tokio::task::spawn_blocking(move || hash_file_bounded(&dump_path_for_task)).await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("the database dump hashing task failed: {error}")),
+        };
+    let (sha256, size_bytes) = match hashed {
+        Ok(info) => info,
+        Err(error) => return Err(error),
+    };
+    Ok(StagedArtifact {
+        _temp_dir: work_dir,
+        path: dump_path,
+        sha256,
+        size_bytes,
+    })
+}
+
+/// Computes `(sha256, size_bytes)` of `path` using a bounded streaming read.
+fn hash_file_bounded(path: &Path) -> anyhow::Result<(String, u64)> {
+    let file = match fs::File::open(path).context("pg_dump did not write a dump") {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+    let metadata = match file.metadata().context("cannot inspect the database dump") {
         Ok(metadata) => metadata,
         Err(error) => return Err(error),
     };
     if metadata.len() > MAX_BACKUP_OBJECT_BYTES {
         bail!("the database dump exceeds {MAX_BACKUP_OBJECT_BYTES} bytes");
     }
-    match tokio::fs::read(&dump_path)
-        .await
-        .context("cannot read the database dump")
-    {
-        Ok(dump) => Ok(dump),
-        Err(error) => Err(error),
+    let mut reader = io::BufReader::new(file);
+    let mut writer = HashingWriter::new(io::sink(), MAX_BACKUP_OBJECT_BYTES);
+    if let Err(error) = io::copy(&mut reader, &mut writer) {
+        return Err(anyhow::Error::new(error)).context("cannot read the database dump");
     }
+    let (_, sha256, size_bytes) = match writer.finish().context("cannot hash the database dump") {
+        Ok(finished) => finished,
+        Err(error) => return Err(error),
+    };
+    Ok((sha256, size_bytes))
 }
 
 /// Downloads and verifies the database dump, then runs `pg_restore` on it.
@@ -1921,6 +2904,132 @@ mod tests {
             outside_prefix,
         ] {
             assert!(validate_manifest(&invalid, "p").is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_query_signing_encodes_and_sorts_parameters() {
+        assert_eq!(
+            canonical_query_string(&[
+                ("prefix", "backups/prod/"),
+                ("list-type", "2"),
+                ("continuation-token", "abc/def+ghi=1 "),
+            ]),
+            "continuation-token=abc%2Fdef%2Bghi%3D1%20&list-type=2&prefix=backups%2Fprod%2F"
+        );
+
+        let headers = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-content-sha256", EMPTY_PAYLOAD_SHA256),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        // Reordering input query pairs must produce the exact same signature.
+        let sig_a = sign(
+            "GET",
+            "/scrim-test",
+            &[
+                ("prefix", "backups/prod/"),
+                ("list-type", "2"),
+                ("continuation-token", "tok/1+2="),
+            ],
+            &headers,
+            EMPTY_PAYLOAD_SHA256,
+        );
+        let sig_b = sign(
+            "GET",
+            "/scrim-test",
+            &[
+                ("continuation-token", "tok/1+2="),
+                ("list-type", "2"),
+                ("prefix", "backups/prod/"),
+            ],
+            &headers,
+            EMPTY_PAYLOAD_SHA256,
+        );
+        assert_eq!(sig_a, sig_b);
+
+        // Duplicate parameter names sort by encoded value.
+        assert_eq!(
+            canonical_query_string(&[("k", "z"), ("k", "a"), ("k", "b/c")]),
+            "k=a&k=b%2Fc&k=z"
+        );
+    }
+
+    #[test]
+    fn hashing_writer_computes_sha256_and_enforces_limit() {
+        let mut writer = HashingWriter::new(Vec::new(), 11);
+        if let Err(error) = writer.write_all(b"hello ") {
+            panic!("first write should succeed: {error}");
+        }
+        if let Err(error) = writer.write_all(b"world") {
+            panic!("second write at exact limit should succeed: {error}");
+        }
+        let (buf, digest, len) = match writer.finish() {
+            Ok(res) => res,
+            Err(error) => panic!("finish should succeed: {error}"),
+        };
+        assert_eq!(buf, b"hello world");
+        assert_eq!(len, 11);
+        assert_eq!(digest, sha256_hex(b"hello world"));
+
+        let mut bounded = HashingWriter::new(Vec::new(), 5);
+        assert!(bounded.write_all(b"123456").is_err());
+    }
+
+    #[test]
+    fn list_objects_v2_xml_parses_entities_pagination_and_rejects_malformed() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+        <!-- R2 ListObjectsV2 -->
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+          <Name>scrim-test</Name>
+          <Prefix>backups/prod/</Prefix>
+          <IsTruncated>true</IsTruncated>
+          <NextContinuationToken>tok&amp;1+2=&lt;next&gt;</NextContinuationToken>
+          <Contents>
+            <Key>backups/prod/id1/repos/a&amp;b&apos;c&quot;d.git.tar.gz</Key>
+            <Size>123</Size>
+          </Contents>
+          <Contents>
+            <Key><![CDATA[backups/prod/id1/manifest.json]]></Key>
+          </Contents>
+        </ListBucketResult>"#;
+        let page = match parse_list_objects_v2_xml(xml) {
+            Ok(page) => page,
+            Err(error) => panic!("valid XML should parse: {error}"),
+        };
+        assert!(page.is_truncated);
+        assert_eq!(
+            page.next_continuation_token.as_deref(),
+            Some("tok&1+2=<next>")
+        );
+        assert_eq!(
+            page.keys,
+            [
+                "backups/prod/id1/repos/a&b'c\"d.git.tar.gz",
+                "backups/prod/id1/manifest.json"
+            ]
+        );
+
+        let empty_xml = br#"<ListBucketResult><IsTruncated>false</IsTruncated><NextContinuationToken/></ListBucketResult>"#;
+        let empty_page = match parse_list_objects_v2_xml(empty_xml) {
+            Ok(page) => page,
+            Err(error) => panic!("empty XML should parse: {error}"),
+        };
+        assert!(!empty_page.is_truncated);
+        assert!(empty_page.keys.is_empty());
+
+        for bad in [
+            b"<WrongRoot/>".as_slice(),
+            b"<ListBucketResult><Contents></Contents></ListBucketResult>",
+            b"<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+            b"<ListBucketResult><Contents><Key>a</Key></ListBucketResult>",
+            b"<ListBucketResult><Contents><Key>a&unknown;</Key></Contents></ListBucketResult>",
+        ] {
+            assert!(
+                parse_list_objects_v2_xml(bad).is_err(),
+                "expected error for {}",
+                String::from_utf8_lossy(bad)
+            );
         }
     }
 }

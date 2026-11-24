@@ -60,8 +60,9 @@ pub use admin_api::MAX_ADMIN_BODY_BYTES;
 pub use auth::{AuthConfigError, MAX_TOKEN_BYTES, TokenAuth};
 pub use backup::{
     BACKUP_MANIFEST_VERSION, BackupArtifact, BackupConfig, BackupManifest, BackupRepoEntry,
-    DEFAULT_R2_PREFIX, LatestBackupPointer, MAX_BACKUP_OBJECT_BYTES, R2Config, RestoreConfig,
-    S3SigningRequest, run_backup, run_restore, sign_s3_request,
+    BackupSummary, DEFAULT_R2_PREFIX, LatestBackupPointer, MAX_BACKUP_OBJECT_BYTES, PruneConfig,
+    PruneReport, R2Config, RestoreConfig, S3SigningRequest, list_backups, prune_backups,
+    run_backup, run_restore, sign_s3_request,
 };
 use git_service::{
     GitService, GitVisibilityConfig, RepoRefEntry, advertise_refs, list_repo_refs,

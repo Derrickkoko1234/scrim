@@ -3,6 +3,7 @@
 //! `pg_restore` executables recording how they were invoked.
 
 #![cfg(unix)]
+#![allow(clippy::question_mark)]
 
 mod common;
 
@@ -23,8 +24,9 @@ use axum::{
 use common::{GitSandbox, hex};
 use flate2::{Compression, write::GzEncoder};
 use scrim_server::{
-    BackupConfig, BackupManifest, BackupRepoEntry, LatestBackupPointer, R2Config, RestoreConfig,
-    S3SigningRequest, SecretString, run_backup, run_restore, sign_s3_request,
+    BackupConfig, BackupManifest, BackupRepoEntry, BackupSummary, LatestBackupPointer, PruneConfig,
+    PruneReport, R2Config, RestoreConfig, S3SigningRequest, SecretString, list_backups,
+    prune_backups, run_backup, run_restore, sign_s3_request,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -38,11 +40,27 @@ const DATABASE_URL: &str = "postgres://scrim:s3cr%40t-pw@db.internal:5433/scrim?
 const FAKE_DUMP: &str = "PGDMP fake custom-format dump\n";
 
 /// Objects stored by the mock, keyed by object key (without the bucket).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MockR2 {
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     rejected_requests: Arc<Mutex<Vec<String>>>,
     request_count: Arc<Mutex<usize>>,
+    deleted_keys: Arc<Mutex<Vec<String>>>,
+    put_content_lengths: Arc<Mutex<BTreeMap<String, u64>>>,
+    max_list_keys: Arc<Mutex<usize>>,
+}
+
+impl Default for MockR2 {
+    fn default() -> Self {
+        Self {
+            objects: Arc::default(),
+            rejected_requests: Arc::default(),
+            request_count: Arc::default(),
+            deleted_keys: Arc::default(),
+            put_content_lengths: Arc::default(),
+            max_list_keys: Arc::new(Mutex::new(1000)),
+        }
+    }
 }
 
 impl MockR2 {
@@ -53,12 +71,68 @@ impl MockR2 {
         }
     }
 
+    fn all_keys(&self) -> Vec<String> {
+        match self.objects.lock() {
+            Ok(objects) => objects.keys().cloned().collect(),
+            Err(_) => panic!("mock objects mutex is poisoned"),
+        }
+    }
+
     fn put(&self, key: &str, bytes: Vec<u8>) {
         match self.objects.lock() {
             Ok(mut objects) => {
                 objects.insert(key.to_owned(), bytes);
             }
             Err(_) => panic!("mock objects mutex is poisoned"),
+        }
+    }
+
+    fn delete(&self, key: &str) -> bool {
+        let removed = match self.objects.lock() {
+            Ok(mut objects) => objects.remove(key).is_some(),
+            Err(_) => panic!("mock objects mutex is poisoned"),
+        };
+        match self.deleted_keys.lock() {
+            Ok(mut deleted) => deleted.push(key.to_owned()),
+            Err(_) => panic!("mock deleted_keys mutex is poisoned"),
+        }
+        removed
+    }
+
+    fn deleted_keys(&self) -> Vec<String> {
+        match self.deleted_keys.lock() {
+            Ok(deleted) => deleted.clone(),
+            Err(_) => panic!("mock deleted_keys mutex is poisoned"),
+        }
+    }
+
+    fn record_put_content_length(&self, key: &str, content_length: u64) {
+        match self.put_content_lengths.lock() {
+            Ok(mut lengths) => {
+                lengths.insert(key.to_owned(), content_length);
+            }
+            Err(_) => panic!("mock put_content_lengths mutex is poisoned"),
+        }
+    }
+
+    fn put_content_length(&self, key: &str) -> Option<u64> {
+        match self.put_content_lengths.lock() {
+            Ok(lengths) => lengths.get(key).copied(),
+            Err(_) => panic!("mock put_content_lengths mutex is poisoned"),
+        }
+    }
+
+    fn set_max_list_keys(&self, max_keys: usize) {
+        match self.max_list_keys.lock() {
+            Ok(mut limit) => *limit = max_keys,
+            Err(_) => panic!("mock max_list_keys mutex is poisoned"),
+        }
+    }
+
+    fn max_list_keys(&self) -> usize {
+        match self.max_list_keys.lock() {
+            Ok(limit) => *limit,
+            Err(_) => panic!("mock max_list_keys mutex is poisoned"),
         }
     }
 
@@ -93,7 +167,77 @@ fn header_text(request: &Request, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Verifies the request's SigV4 signature and serves PUT and GET of objects.
+fn percent_decode_str(raw: &str) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(hi) = bytes.get(index + 1).and_then(|b| (*b as char).to_digit(16)) else {
+                return Err(format!("invalid percent-escape in {raw:?}"));
+            };
+            let Some(lo) = bytes.get(index + 2).and_then(|b| (*b as char).to_digit(16)) else {
+                return Err(format!("invalid percent-escape in {raw:?}"));
+            };
+            let Ok(byte) = u8::try_from(hi * 16 + lo) else {
+                return Err(format!("invalid percent-escape in {raw:?}"));
+            };
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    match String::from_utf8(out) {
+        Ok(text) => Ok(text),
+        Err(_) => Err(format!("non-UTF-8 percent-encoded query {raw:?}")),
+    }
+}
+
+fn parse_query_pairs(query: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let Some(query) = query else {
+        return Ok(Vec::new());
+    };
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pairs = Vec::new();
+    for part in query.split('&') {
+        let (name, value) = match part.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (part, ""),
+        };
+        let name = match percent_decode_str(name) {
+            Ok(name) => name,
+            Err(error) => return Err(error),
+        };
+        let value = match percent_decode_str(value) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        pairs.push((name, value));
+    }
+    Ok(pairs)
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Verifies the request's SigV4 signature and serves PUT, GET, DELETE and
+/// ListObjectsV2 requests.
 async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Response {
     match mock.request_count.lock() {
         Ok(mut count) => *count += 1,
@@ -101,9 +245,16 @@ async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Re
     }
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    if request.uri().query().is_some() {
+    let raw_query = request.uri().query().map(str::to_owned);
+    let query_pairs = match parse_query_pairs(raw_query.as_deref()) {
+        Ok(pairs) => pairs,
+        Err(error) => return mock.reject(format!("invalid query on {path}: {error}")),
+    };
+    let is_bucket_list = method == Method::GET && path == format!("/{BUCKET}");
+    if !is_bucket_list && raw_query.is_some() {
         return mock.reject(format!("unexpected query on {path}"));
     }
+
     let (Some(host), Some(amz_date), Some(content_sha256), Some(authorization)) = (
         header_text(&request, "host"),
         header_text(&request, "x-amz-date"),
@@ -112,6 +263,7 @@ async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Re
     ) else {
         return mock.reject(format!("missing SigV4 headers on {method} {path}"));
     };
+    let content_length_header = header_text(&request, "content-length");
     let body = match to_bytes(request.into_body(), usize::MAX).await {
         Ok(body) => body,
         Err(error) => return mock.reject(format!("cannot read body: {error}")),
@@ -129,10 +281,14 @@ async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Re
     )) {
         return mock.reject(format!("unexpected Authorization {authorization:?}"));
     }
+    let query_refs: Vec<(&str, &str)> = query_pairs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
     let expected = sign_s3_request(&S3SigningRequest {
         method: method.as_str(),
         canonical_uri: &path,
-        query: &[],
+        query: &query_refs,
         headers: &[
             ("host", host.as_str()),
             ("x-amz-content-sha256", content_sha256.as_str()),
@@ -148,11 +304,94 @@ async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Re
     if expected.as_deref() != Ok(authorization.as_str()) {
         return mock.reject(format!("bad signature on {method} {path}"));
     }
+
+    if is_bucket_list {
+        let list_type = query_pairs
+            .iter()
+            .find(|(name, _)| name == "list-type")
+            .map(|(_, value)| value.as_str());
+        if list_type != Some("2") {
+            return mock.reject(format!("expected list-type=2, got {list_type:?}"));
+        }
+        let mut key_prefix = "";
+        if let Some((_, value)) = query_pairs.iter().find(|(name, _)| name == "prefix") {
+            key_prefix = value.as_str();
+        }
+        let continuation_token = query_pairs
+            .iter()
+            .find(|(name, _)| name == "continuation-token")
+            .map(|(_, value)| value.as_str());
+        let mut matching: Vec<String> = mock
+            .all_keys()
+            .into_iter()
+            .filter(|key| key.starts_with(key_prefix))
+            .collect();
+        matching.sort();
+        let start_idx = match continuation_token {
+            Some(token) => match token.strip_prefix("idx:") {
+                Some(num) => match num.parse::<usize>() {
+                    Ok(idx) => idx,
+                    Err(_) => return mock.reject(format!("bad continuation-token {token:?}")),
+                },
+                None => return mock.reject(format!("bad continuation-token {token:?}")),
+            },
+            None => 0,
+        };
+        let max_keys = mock.max_list_keys().max(1);
+        let remaining = match matching.get(start_idx..) {
+            Some(slice) => slice,
+            None => &[],
+        };
+        let is_truncated = remaining.len() > max_keys;
+        let page_keys = if is_truncated {
+            &remaining[..max_keys]
+        } else {
+            remaining
+        };
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+        );
+        xml.push_str(&format!("<IsTruncated>{is_truncated}</IsTruncated>"));
+        if is_truncated {
+            let next_token = format!("idx:{}", start_idx + page_keys.len());
+            xml.push_str(&format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                xml_escape(&next_token)
+            ));
+        }
+        for key in page_keys {
+            xml.push_str(&format!(
+                "<Contents><Key>{}</Key></Contents>",
+                xml_escape(key)
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/xml")],
+            xml,
+        )
+            .into_response();
+    }
+
     let Some(key) = path.strip_prefix(&format!("/{BUCKET}/")) else {
         return mock.reject(format!("request outside the bucket: {path}"));
     };
     match method {
         Method::PUT => {
+            let Some(raw_len) = content_length_header else {
+                return mock.reject(format!("missing Content-Length on PUT {key}"));
+            };
+            let Ok(parsed_len) = raw_len.parse::<u64>() else {
+                return mock.reject(format!("invalid Content-Length {raw_len:?} on PUT {key}"));
+            };
+            if parsed_len != body.len() as u64 {
+                return mock.reject(format!(
+                    "Content-Length mismatch on PUT {key}: header {parsed_len} != body {}",
+                    body.len()
+                ));
+            }
+            mock.record_put_content_length(key, parsed_len);
             mock.put(key, body.to_vec());
             StatusCode::OK.into_response()
         }
@@ -164,6 +403,10 @@ async fn handle_mock_request(State(mock): State<MockR2>, request: Request) -> Re
             )
                 .into_response(),
         },
+        Method::DELETE => {
+            let _ = mock.delete(key);
+            StatusCode::NO_CONTENT.into_response()
+        }
         other => mock.reject(format!("unexpected method {other}")),
     }
 }
@@ -294,6 +537,15 @@ fn directory_names(path: &Path) -> Vec<String> {
 }
 
 async fn backup(endpoint: &str, repo_root: &Path, database: Option<&Path>) -> BackupManifest {
+    backup_with_keep(endpoint, repo_root, database, None).await
+}
+
+async fn backup_with_keep(
+    endpoint: &str,
+    repo_root: &Path,
+    database: Option<&Path>,
+    keep: Option<usize>,
+) -> BackupManifest {
     let result = run_backup(BackupConfig {
         repo_root: repo_root.to_path_buf(),
         database_url: database.map(|_| SecretString::from(DATABASE_URL.to_owned())),
@@ -302,6 +554,7 @@ async fn backup(endpoint: &str, repo_root: &Path, database: Option<&Path>) -> Ba
             Some(pg_dump) => pg_dump.to_path_buf(),
             None => PathBuf::from("pg_dump-must-not-run"),
         },
+        keep,
     })
     .await;
     match result {
@@ -358,6 +611,10 @@ async fn backup_and_restore_round_trip_with_database() {
         };
         assert_eq!(hex(&Sha256::digest(&stored)), repo.sha256);
         assert_eq!(stored.len() as u64, repo.size_bytes);
+        assert_eq!(
+            mock.put_content_length(&repo.object_key),
+            Some(repo.size_bytes)
+        );
     }
     let Some(database) = &manifest.database else {
         panic!("the database should be backed up");
@@ -369,6 +626,10 @@ async fn backup_and_restore_round_trip_with_database() {
     assert_eq!(
         mock.object(&database.object_key).as_deref(),
         Some(FAKE_DUMP.as_bytes())
+    );
+    assert_eq!(
+        mock.put_content_length(&database.object_key),
+        Some(database.size_bytes)
     );
     assert_eq!(database.sha256, hex(&Sha256::digest(FAKE_DUMP.as_bytes())));
     let latest: LatestBackupPointer = match mock
@@ -674,4 +935,294 @@ async fn unsafe_archive_entries_are_rejected() {
         assert!(directory_names(&target).is_empty(), "{case}");
     }
     assert!(!Path::new("/tmp/scrim-escape").exists());
+}
+
+fn seed_synthetic_backup(
+    mock: &MockR2,
+    backup_id: &str,
+    created_at_utc: &str,
+    with_database: bool,
+    set_latest: bool,
+) {
+    let repo_bytes = format!("archive-{backup_id}").into_bytes();
+    let repo_key = format!("{PREFIX}/{backup_id}/repos/team/app.git.tar.gz");
+    mock.put(&repo_key, repo_bytes.clone());
+
+    let db_artifact = if with_database {
+        let db_bytes = format!("dump-{backup_id}").into_bytes();
+        let db_key = format!("{PREFIX}/{backup_id}/database.dump");
+        mock.put(&db_key, db_bytes.clone());
+        Some(scrim_server::BackupArtifact {
+            object_key: db_key,
+            sha256: hex(&Sha256::digest(&db_bytes)),
+            size_bytes: db_bytes.len() as u64,
+        })
+    } else {
+        None
+    };
+
+    let manifest = BackupManifest {
+        version: 1,
+        backup_id: backup_id.to_owned(),
+        created_at_utc: created_at_utc.to_owned(),
+        repos: vec![BackupRepoEntry {
+            repo_key: "team/app.git".to_owned(),
+            object_key: repo_key,
+            sha256: hex(&Sha256::digest(&repo_bytes)),
+            size_bytes: repo_bytes.len() as u64,
+        }],
+        database: db_artifact,
+    };
+    let manifest_key = format!("{PREFIX}/{backup_id}/manifest.json");
+    match serde_json::to_vec(&manifest) {
+        Ok(json) => mock.put(&manifest_key, json),
+        Err(error) => panic!("manifest json: {error}"),
+    }
+    if set_latest {
+        let latest = LatestBackupPointer {
+            backup_id: backup_id.to_owned(),
+            manifest_key,
+            created_at_utc: created_at_utc.to_owned(),
+        };
+        match serde_json::to_vec(&latest) {
+            Ok(json) => mock.put(&format!("{PREFIX}/latest.json"), json),
+            Err(error) => panic!("latest json: {error}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_backups_paginates_sorts_newest_first_and_ignores_unexpected_keys() {
+    let (mock, endpoint) = spawn_mock_r2().await;
+    let r2 = r2_config(&endpoint);
+
+    // Empty bucket returns an empty list cleanly even without latest.json.
+    let empty = match list_backups(&r2).await {
+        Ok(list) => list,
+        Err(error) => panic!("listing empty bucket should succeed: {error:#}"),
+    };
+    assert!(empty.is_empty());
+
+    // Force multi-page ListObjectsV2 responses (2 keys per page).
+    mock.set_max_list_keys(2);
+
+    seed_synthetic_backup(
+        &mock,
+        "20261120T000000Z-aaaa0001",
+        "2026-11-20T00:00:00Z",
+        false,
+        false,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261121T000000Z-aaaa0002",
+        "2026-11-21T00:00:00Z",
+        true,
+        false,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261121T000000Z-bbbb0003",
+        "2026-11-21T00:00:00Z",
+        true,
+        true,
+    );
+    // Unexpected/malformed keys that must be ignored safely.
+    mock.put(
+        &format!("{PREFIX}/nested/extra/manifest.json"),
+        b"not-a-manifest".to_vec(),
+    );
+    mock.put(
+        &format!("{PREFIX}/../bad/manifest.json"),
+        b"not-a-manifest".to_vec(),
+    );
+    mock.put(&format!("{PREFIX}/stray.txt"), b"hello".to_vec());
+
+    let listed: Vec<BackupSummary> = match list_backups(&r2).await {
+        Ok(list) => list,
+        Err(error) => panic!("list_backups should succeed: {error:#}"),
+    };
+    assert!(
+        mock.rejected_requests().is_empty(),
+        "{:?}",
+        mock.rejected_requests()
+    );
+    let ids: Vec<&str> = listed.iter().map(|b| b.backup_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "20261121T000000Z-bbbb0003",
+            "20261121T000000Z-aaaa0002",
+            "20261120T000000Z-aaaa0001",
+        ]
+    );
+    assert!(listed[0].is_latest);
+    assert!(!listed[1].is_latest);
+    assert!(!listed[2].is_latest);
+    assert_eq!(listed[0].repo_count, 1);
+    assert!(listed[0].has_database);
+    assert!(!listed[2].has_database);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_backups_rejects_zero_supports_dry_run_protects_latest_and_cleans_objects() {
+    let (mock, endpoint) = spawn_mock_r2().await;
+    let r2 = r2_config(&endpoint);
+
+    // keep == 0 must be rejected.
+    match prune_backups(PruneConfig {
+        r2: r2.clone(),
+        keep: 0,
+        dry_run: false,
+    })
+    .await
+    {
+        Ok(_) => panic!("keep == 0 must be rejected"),
+        Err(error) => assert!(format!("{error:#}").contains("at least 1"), "{error:#}"),
+    }
+
+    mock.set_max_list_keys(3);
+    // Oldest backup is pointed to by latest.json to verify unconditional protection.
+    seed_synthetic_backup(
+        &mock,
+        "20261118T000000Z-00000001",
+        "2026-11-18T00:00:00Z",
+        true,
+        true,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261119T000000Z-00000002",
+        "2026-11-19T00:00:00Z",
+        true,
+        false,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261120T000000Z-00000003",
+        "2026-11-20T00:00:00Z",
+        false,
+        false,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261121T000000Z-00000004",
+        "2026-11-21T00:00:00Z",
+        true,
+        false,
+    );
+
+    let keys_before = mock.all_keys();
+
+    // Dry run with keep = 2: keeps newest 2 (#4, #3) PLUS latest (#1), would prune #2.
+    let dry: PruneReport = match prune_backups(PruneConfig {
+        r2: r2.clone(),
+        keep: 2,
+        dry_run: true,
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => panic!("dry_run prune should succeed: {error:#}"),
+    };
+    assert!(dry.dry_run);
+    assert_eq!(dry.deleted_objects, 0);
+    assert_eq!(
+        dry.kept,
+        [
+            "20261121T000000Z-00000004",
+            "20261120T000000Z-00000003",
+            "20261118T000000Z-00000001",
+        ]
+    );
+    assert_eq!(dry.pruned, ["20261119T000000Z-00000002"]);
+    assert_eq!(mock.all_keys(), keys_before);
+    assert!(mock.deleted_keys().is_empty());
+
+    // Actual prune with keep = 2.
+    let report = match prune_backups(PruneConfig {
+        r2: r2.clone(),
+        keep: 2,
+        dry_run: false,
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => panic!("prune should succeed: {error:#}"),
+    };
+    assert!(!report.dry_run);
+    assert_eq!(report.kept, dry.kept);
+    assert_eq!(report.pruned, ["20261119T000000Z-00000002"]);
+    // #2 has repo archive + database.dump + manifest.json = 3 objects.
+    assert_eq!(report.deleted_objects, 3);
+    assert!(
+        mock.rejected_requests().is_empty(),
+        "{:?}",
+        mock.rejected_requests()
+    );
+
+    // manifest.json must be deleted LAST so failed prunes remain retryable.
+    let deleted = mock.deleted_keys();
+    assert_eq!(deleted.len(), 3);
+    assert_eq!(
+        deleted[2],
+        format!("{PREFIX}/20261119T000000Z-00000002/manifest.json")
+    );
+    for remaining in mock.all_keys() {
+        assert!(
+            !remaining.starts_with(&format!("{PREFIX}/20261119T000000Z-00000002/")),
+            "leftover object {remaining}"
+        );
+    }
+
+    // Protected oldest backup (pointed to by latest.json) can still be restored.
+    let listed = match list_backups(&r2).await {
+        Ok(list) => list,
+        Err(error) => panic!("list_backups after prune: {error:#}"),
+    };
+    assert_eq!(listed.len(), 3);
+    assert!(
+        listed
+            .iter()
+            .any(|b| b.backup_id == "20261118T000000Z-00000001" && b.is_latest)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_backup_with_keep_prunes_older_backups_after_publishing_latest() {
+    let (mock, endpoint) = spawn_mock_r2().await;
+    let sandbox = GitSandbox::new();
+    let source = temp_dir();
+    sandbox.init_bare_with_commit(&source.path().join("team/app.git"));
+
+    // Seed two older backups before taking a fresh backup with keep = 2.
+    seed_synthetic_backup(
+        &mock,
+        "20261118T000000Z-old00001",
+        "2026-11-18T00:00:00Z",
+        false,
+        false,
+    );
+    seed_synthetic_backup(
+        &mock,
+        "20261119T000000Z-old00002",
+        "2026-11-19T00:00:00Z",
+        false,
+        true,
+    );
+
+    let newest = backup_with_keep(&endpoint, source.path(), None, Some(2)).await;
+    let listed = match list_backups(&r2_config(&endpoint)).await {
+        Ok(list) => list,
+        Err(error) => panic!("list_backups should succeed: {error:#}"),
+    };
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].backup_id, newest.backup_id);
+    assert!(listed[0].is_latest);
+    assert_eq!(listed[1].backup_id, "20261119T000000Z-old00002");
+    assert!(!listed[1].is_latest);
+    assert!(
+        mock.object(&format!("{PREFIX}/20261118T000000Z-old00001/manifest.json"))
+            .is_none()
+    );
 }
