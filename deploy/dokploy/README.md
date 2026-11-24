@@ -55,7 +55,7 @@ Store the printed token securely and use it with `scrim login` against `https://
 
 ## Backups and restore (Cloudflare R2)
 
-`scrim-server` ships built-in R2 backup and restore subcommands that archive bare repositories (`SCRIM_REPO_ROOT`) and PostgreSQL (`DATABASE_URL`, using `pg_dump` / `psql` bundled in the image).
+`scrim-server` ships built-in R2 backup and restore subcommands that archive bare repositories (`SCRIM_REPO_ROOT`) and PostgreSQL (`DATABASE_URL`, using `pg_dump` / `pg_restore` bundled in the image).
 
 ### Scheduled backup
 

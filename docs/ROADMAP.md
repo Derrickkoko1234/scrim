@@ -170,12 +170,12 @@ Learn Git's internals by building a server that only passes requests through.
 - Mirroring to GitHub: push visible branches only, with private paths encrypted.
 - `scrim audit` to read the audit log from the CLI.
 - Backups of bare repos and Postgres to Cloudflare R2.
-- Deployment through Dokploy, from a container image published by CI.
+- Container image published by CI with a self-hosting Docker Compose stack.
 - Performance: Redis policy cache, and clone and fetch benchmarks on a large public repo with `criterion` and end-to-end timings.
 - Fuzzing the filter protocol and policy parser with `cargo-fuzz`.
 - A full threat-model review against the Security model section.
 
-**Done when:** Scrim runs in production for your own projects, with backups, both transports and benchmark numbers recorded.
+**Done when:** the self-hosted container image, backups, both transports, and benchmark numbers are verified and recorded.
 
 **v1 = M0 through M3.** M4 and M5 follow once v1 is in daily use.
 
@@ -202,7 +202,7 @@ Learn Git's internals by building a server that only passes requests through.
 | Tests | `cargo test`, `assert_cmd`, `tempfile`, `testcontainers` (Postgres, Redis) |
 | Release | `cargo-dist`: prebuilt binaries for macOS, Linux and Windows, a Homebrew tap, a shell installer, and `cargo install scrim-cli` |
 | Backups | Cloudflare R2 |
-| Deployment | Dokploy |
+| Self-hosting | Container image (GHCR) + Docker Compose |
 
 **Crate names on crates.io:** `scrim` is taken by an unrelated project, so the crates are `scrim-cli` (installs the `scrim` and `git-scrim` binaries), `scrim-server`, `scrim-crypto` and `scrim-policy`.
 
