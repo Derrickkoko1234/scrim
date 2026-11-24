@@ -122,10 +122,16 @@ fn parse_ssh_url(
         Some(authority) => authority,
         None => rest,
     };
-    if let Some((userinfo, _host)) = authority.split_once('@')
-        && (userinfo.is_empty() || userinfo.contains(':'))
-    {
-        bail!("{label} must not contain an empty username or embedded password");
+    if let Some((userinfo, _host)) = authority.rsplit_once('@') {
+        if userinfo.is_empty() || userinfo.contains(':') {
+            bail!("{label} must not contain an empty username or embedded password");
+        }
+        if userinfo.contains('@') {
+            bail!("{label} must not contain multiple '@' characters in authority");
+        }
+        if userinfo.starts_with('-') {
+            bail!("{label} username must not start with '-'");
+        }
     }
 
     let parsed = match reqwest::Url::parse(raw) {
@@ -136,6 +142,9 @@ fn parse_ssh_url(
         Some(host) if !host.is_empty() => host,
         _ => bail!("{label} must include a host"),
     };
+    if host.starts_with('-') {
+        bail!("{label} host must not start with '-'");
+    }
     if parsed.password().is_some() {
         bail!("{label} must not contain embedded credentials");
     }
@@ -787,6 +796,18 @@ mod tests {
             ("ssh://alice:pw@git.example.com/app.git", "password"),
             ("ssh://:pw@git.example.com/app.git", "password"),
             ("ssh://@git.example.com/app.git", "empty username"),
+            (
+                "ssh://alice@evil.com@git.example.com/app.git",
+                "multiple '@'",
+            ),
+            (
+                "ssh://-oProxyCommand=id@git.example.com/app.git",
+                "username must not start with '-'",
+            ),
+            (
+                "ssh://-git.example.com/app.git",
+                "host must not start with '-'",
+            ),
             ("ssh://git@git.example.com/app.git?x=1", "query"),
             ("ssh://git@git.example.com/app.git#frag", "query"),
             ("ssh://git@git.example.com/team/../app.git", "'..'"),

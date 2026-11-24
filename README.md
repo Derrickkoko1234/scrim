@@ -33,9 +33,9 @@ Git access is all-or-nothing per repository: a person sees every branch and ever
 ## What it does
 
 - **Private branches** that only named groups can see, fetch or push over smart HTTP or SSH. Non-members never see the refs, cannot fetch their commits by hash, and cannot merge them into visible branches by accident.
-- **Private files and folders** inside a shared repository. Contents are encrypted on the client with AES-256-SIV, so they stay protected on any remote, GitHub included (`scrim mirror`). Repos hosted on `scrim-server` can also withhold protected blob bytes from non-members entirely (`scrim clone`).
-- **Secrets** stored and versioned with the code, encrypted per environment with XChaCha20-Poly1305, and injected at runtime with `scrim run`. No external secret manager and no `.env` files.
-- **Operations & auditing** built in: manage SSH keys with `scrim ssh-key`, inspect access and override events with `scrim audit`, mirror public refs safely with `scrim mirror`, and deploy with [Dokploy](deploy/dokploy/README.md) with Redis policy caching and Cloudflare R2 backups.
+- **Private files and folders** inside a shared repository. Contents are encrypted on the client with AES-256-SIV, so they stay protected on any remote, GitHub included (`scrim mirror`, or fully serverless with `scrim private recipients`). Repos hosted on `scrim-server` can also withhold protected blob bytes from non-members entirely (`scrim clone` over HTTP or SSH).
+- **Secrets** stored and versioned with the code, encrypted per environment with XChaCha20-Poly1305, and injected at runtime with `scrim run`. No external secret manager and no `.env` files (works with `scrim-server` or offline via `scrim secrets recipients`).
+- **Operations & auditing** built in: manage API tokens (`scrim token`), SSH keys (`scrim ssh-key`), repositories (`scrim repo list`), and access/override logs (`scrim audit`), mirror public refs safely (`scrim mirror`), and run streaming Cloudflare R2 backups with retention pruning (`scrim-server backup --keep`, `scrim-server backups list|prune`).
 
 ```sh
 scrim branch private 'refs/heads/private/*' --group core
