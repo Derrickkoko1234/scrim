@@ -2,7 +2,8 @@
 //!
 //! Requests arrive already authenticated by [`crate::auth::require_auth`].
 //! `GET /api/v1/whoami`, `PUT /api/v1/me/public-key`, `/api/v1/me/ssh-keys`
-//! (list, add, revoke the member's own SSH keys), and
+//! (list, add, revoke the member's own SSH keys), `/api/v1/me/tokens`
+//! (list and revoke the member's own API tokens), and
 //! `GET /api/v1/path-rules/me` are open to every active member,
 //! `GET /api/v1/groups/{group}/recipients` is open to members belonging to that
 //! group (as well as admins), and `GET /api/v1/secret-scopes/recipients` is
@@ -32,8 +33,9 @@ use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use crate::{
     policy_store::{
         AuditLogQuery, AuditLogRecord, AuthenticatedMember, BranchRuleRecord, CreateMemberRequest,
-        DEFAULT_AUDIT_LOG_LIMIT, MemberRecord, MemberSshKeyRecord, PathRuleRecord, PolicyStore,
-        PolicyStoreError, ScopeRecipient, SecretScopeRecord, validate_repository_path,
+        DEFAULT_AUDIT_LOG_LIMIT, MemberRecord, MemberSshKeyRecord, MemberTokenRecord,
+        PathRuleRecord, PolicyStore, PolicyStoreError, ScopeRecipient, SecretScopeRecord,
+        validate_repository_path,
     },
     repo_path::{
         BareRepoError, BareRepoLocation, create_bare_repo, locate_bare_repo, resolve_bare_repo,
@@ -58,11 +60,14 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
         .route("/me/public-key", put(set_own_public_key))
         .route("/me/ssh-keys", get(list_own_ssh_keys).post(add_own_ssh_key))
         .route("/me/ssh-keys/{id}", delete(revoke_own_ssh_key))
+        .route("/me/tokens", get(list_own_tokens))
+        .route("/me/tokens/{id}", delete(revoke_own_token))
         .route(
             "/repositories",
             get(list_repositories).post(register_repository),
         )
         .route("/groups", get(list_groups).post(create_group))
+        .route("/groups/{group}", delete(delete_group))
         .route("/groups/{group}/recipients", get(get_group_recipients))
         .route("/groups/{group}/members", post(add_group_member))
         .route(
@@ -71,7 +76,11 @@ pub(crate) fn router(repo_root: PathBuf, policy_store: Arc<dyn PolicyStore>) -> 
         )
         .route("/members", get(list_members).post(create_member))
         .route("/members/{name}", delete(revoke_member))
-        .route("/members/{name}/tokens", post(issue_member_token))
+        .route(
+            "/members/{name}/tokens",
+            get(list_member_tokens).post(issue_member_token),
+        )
+        .route("/members/{name}/tokens/{id}", delete(revoke_member_token))
         .route("/members/{name}/public-key", put(set_member_public_key))
         .route(
             "/members/{name}/ssh-keys",
@@ -508,6 +517,21 @@ async fn list_groups(
     }
 }
 
+async fn delete_group(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiPath(group): ApiPath<String>,
+) -> Result<StatusCode, ApiError> {
+    match state
+        .policy_store
+        .delete_group(Some(actor.id), &group)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddGroupMemberBody {
@@ -674,6 +698,107 @@ async fn issue_member_token(
         }),
         Err(error) => Err(store_error(error)),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListTokensQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Serialize)]
+struct MemberTokenResponse {
+    id: i64,
+    member_name: String,
+    label: String,
+    created_at_utc: String,
+    revoked_at_utc: Option<String>,
+}
+
+impl From<MemberTokenRecord> for MemberTokenResponse {
+    fn from(record: MemberTokenRecord) -> Self {
+        Self {
+            id: record.id,
+            member_name: record.member_name,
+            label: record.label,
+            created_at_utc: record.created_at_utc,
+            revoked_at_utc: record.revoked_at_utc,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MemberTokensResponse {
+    tokens: Vec<MemberTokenResponse>,
+}
+
+/// Lists `member_name`'s API tokens (skipping revoked ones unless `include_revoked`).
+async fn list_tokens(
+    state: &AdminState,
+    member_name: &str,
+    include_revoked: bool,
+) -> ApiResult<MemberTokensResponse> {
+    match state
+        .policy_store
+        .list_member_tokens(member_name, include_revoked)
+        .await
+    {
+        Ok(tokens) => ok(MemberTokensResponse {
+            tokens: tokens.into_iter().map(MemberTokenResponse::from).collect(),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// Revokes `member_name`'s token `token_id` on behalf of `actor`.
+async fn revoke_token(
+    state: &AdminState,
+    actor: &AuthenticatedMember,
+    member_name: &str,
+    token_id: i64,
+) -> Result<StatusCode, ApiError> {
+    match state
+        .policy_store
+        .revoke_member_token(Some(actor.id), member_name, token_id)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+async fn list_own_tokens(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiQuery(query): ApiQuery<ListTokensQuery>,
+) -> ApiResult<MemberTokensResponse> {
+    list_tokens(&state, &member.name, query.all).await
+}
+
+async fn revoke_own_token(
+    State(state): State<AdminState>,
+    CurrentMember(member): CurrentMember,
+    ApiPath(token_id): ApiPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    revoke_token(&state, &member, &member.name, token_id).await
+}
+
+async fn list_member_tokens(
+    State(state): State<AdminState>,
+    AdminMember(_actor): AdminMember,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(query): ApiQuery<ListTokensQuery>,
+) -> ApiResult<MemberTokensResponse> {
+    list_tokens(&state, &name, query.all).await
+}
+
+async fn revoke_member_token(
+    State(state): State<AdminState>,
+    AdminMember(actor): AdminMember,
+    ApiPath((name, token_id)): ApiPath<(String, i64)>,
+) -> Result<StatusCode, ApiError> {
+    revoke_token(&state, &actor, &name, token_id).await
 }
 
 #[derive(Serialize)]

@@ -82,10 +82,10 @@ pub use policy_store::{
     DEFAULT_AUDIT_LOG_LIMIT, GroupMembershipChange, GroupRecipientsRecord, GroupRecord,
     GroupWithMembers, IssuedToken, MAX_AUDIT_LOG_LIMIT, MAX_NAME_BYTES, MAX_REPOSITORY_PATH_BYTES,
     MAX_SCOPE_NAME_BYTES, MAX_SSH_PUBLIC_KEY_BYTES, MAX_TOKEN_LABEL_BYTES, MemberPublicKeyRecord,
-    MemberRecord, MemberRepoPolicy, MemberSshKeyRecord, MemoryPolicyStore, PathRuleRecord,
-    PgPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture, RegisterRepositoryResult,
-    RepositoryRecord, RevokeMemberResult, ScopeRecipient, ScopeRecipientsRecord, SecretScopeRecord,
-    StaticPolicyStore,
+    MemberRecord, MemberRepoPolicy, MemberSshKeyRecord, MemberTokenRecord, MemoryPolicyStore,
+    PathRuleRecord, PgPolicyStore, PolicyStore, PolicyStoreError, PolicyStoreFuture,
+    RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult, ScopeRecipient,
+    ScopeRecipientsRecord, SecretScopeRecord, StaticPolicyStore,
 };
 pub use pre_receive::{
     ALLOW_MERGE_LEAK_PUSH_OPTION, ALLOW_SECRET_SCAN_PUSH_OPTION, PRE_RECEIVE_HOOK_MODE,

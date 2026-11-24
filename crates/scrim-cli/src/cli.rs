@@ -46,8 +46,12 @@ pub enum Command {
     Clone(CloneArgs),
     /// Manage Scrim groups and group memberships.
     Group(GroupArgs),
+    /// List registered repositories.
+    Repo(RepoArgs),
     /// Manage member accounts and API tokens.
     Access(AccessArgs),
+    /// List and revoke API authentication tokens.
+    Token(TokenArgs),
     /// Manage private branch visibility rules.
     Branch(BranchArgs),
     /// Manage encrypted repository secrets and scope permissions.
@@ -189,6 +193,54 @@ pub enum GroupCommand {
     },
     /// List all groups and their members.
     List,
+    /// Delete an unused group.
+    #[command(visible_alias = "delete")]
+    Rm {
+        /// Group name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RepoArgs {
+    #[command(subcommand)]
+    pub command: RepoCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoCommand {
+    /// List all registered repositories.
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub command: TokenCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// List API authentication tokens.
+    List {
+        /// List tokens for another member (admin only).
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
+
+        /// Include revoked tokens.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke an API authentication token by ID.
+    Rm {
+        /// Numeric token ID shown by 'scrim token list'.
+        #[arg(value_name = "ID", allow_negative_numbers = true)]
+        id: i64,
+
+        /// Revoke a token belonging to another member (admin only).
+        #[arg(long, value_name = "MEMBER")]
+        member: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]

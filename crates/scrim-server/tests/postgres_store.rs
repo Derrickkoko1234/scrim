@@ -1848,3 +1848,273 @@ async fn administers_and_authenticates_member_ssh_keys() {
 
     isolated.drop_schema().await;
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn lists_and_revokes_member_tokens() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+
+    let root = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let root_id = Some(root.member.id);
+    let alice = create_member_ok(store, member_request("alice", false, &[])).await;
+    if let Err(error) = store.issue_member_token(root_id, "alice", "ci").await {
+        panic!("issue_member_token failed: {error}");
+    }
+    let alice_second = match store.issue_member_token(root_id, "alice", "laptop").await {
+        Ok(issued) => issued,
+        Err(error) => panic!("issue_member_token failed: {error}"),
+    };
+
+    assert!(matches!(
+        store.list_member_tokens("nobody", false).await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+
+    let alice_tokens = match store.list_member_tokens("alice", false).await {
+        Ok(tokens) => tokens,
+        Err(error) => panic!("list_member_tokens failed: {error}"),
+    };
+    assert_eq!(alice_tokens.len(), 3);
+    assert!(alice_tokens[0].id < alice_tokens[1].id && alice_tokens[1].id < alice_tokens[2].id);
+    assert_eq!(alice_tokens[0].member_name, "alice");
+    assert_eq!(alice_tokens[1].label, "ci");
+    assert_eq!(alice_tokens[2].label, "laptop");
+    assert!(alice_tokens.iter().all(|t| t.revoked_at_utc.is_none()));
+
+    // Invalid token IDs and cross-member / missing-member revocations fail cleanly.
+    assert!(matches!(
+        store.revoke_member_token(root_id, "alice", 0).await,
+        Err(PolicyStoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store.revoke_member_token(root_id, "alice", -1).await,
+        Err(PolicyStoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        store
+            .revoke_member_token(root_id, "root", alice_tokens[0].id)
+            .await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .revoke_member_token(root_id, "nobody", alice_tokens[0].id)
+            .await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+
+    // Revoking alice's `laptop` token invalidates it and excludes it unless `include_revoked`.
+    if let Err(error) = store
+        .revoke_member_token(Some(alice.member.id), "alice", alice_tokens[2].id)
+        .await
+    {
+        panic!("revoke_member_token failed: {error}");
+    }
+    assert!(matches!(
+        store
+            .revoke_member_token(root_id, "alice", alice_tokens[2].id)
+            .await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    assert!(
+        authenticate(store, alice_second.token.expose_secret())
+            .await
+            .is_none()
+    );
+    assert!(
+        authenticate(store, alice.token.expose_secret())
+            .await
+            .is_some()
+    );
+
+    let active_after = match store.list_member_tokens("alice", false).await {
+        Ok(tokens) => tokens,
+        Err(error) => panic!("list_member_tokens failed: {error}"),
+    };
+    assert_eq!(active_after.len(), 2);
+    let all_after = match store.list_member_tokens("alice", true).await {
+        Ok(tokens) => tokens,
+        Err(error) => panic!("list_member_tokens(all) failed: {error}"),
+    };
+    assert_eq!(all_after.len(), 3);
+    assert!(all_after[2].revoked_at_utc.is_some());
+
+    // Last active admin token guard.
+    let root_tokens = match store.list_member_tokens("root", false).await {
+        Ok(tokens) => tokens,
+        Err(error) => panic!("list_member_tokens(root) failed: {error}"),
+    };
+    assert_eq!(root_tokens.len(), 1);
+    assert!(matches!(
+        store
+            .revoke_member_token(root_id, "root", root_tokens[0].id)
+            .await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+
+    // A second admin allows revoking `root`'s token, but the second admin's own last token is guarded.
+    let admin2 = create_member_ok(store, member_request("admin2", true, &[])).await;
+    if let Err(error) = store
+        .revoke_member_token(Some(admin2.member.id), "root", root_tokens[0].id)
+        .await
+    {
+        panic!("revoking root token with second admin present failed: {error}");
+    }
+    let admin2_tokens = match store.list_member_tokens("admin2", false).await {
+        Ok(tokens) => tokens,
+        Err(error) => panic!("list_member_tokens(admin2) failed: {error}"),
+    };
+    assert!(matches!(
+        store
+            .revoke_member_token(Some(admin2.member.id), "admin2", admin2_tokens[0].id)
+            .await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+
+    let audit = match store
+        .list_audit_log(AuditLogQuery {
+            actor: None,
+            action: Some("token.revoke".to_owned()),
+            target_type: Some("member_token".to_owned()),
+            limit: 10,
+            before_id: None,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("list_audit_log failed: {error}"),
+    };
+    assert_eq!(audit.entries.len(), 2);
+    assert_eq!(audit.entries[0].target_name, "root");
+    assert_eq!(audit.entries[1].target_name, "alice");
+    assert_eq!(
+        audit.entries[1].details,
+        serde_json::json!({ "token_id": alice_tokens[2].id, "label": "laptop" })
+    );
+
+    isolated.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to PostgreSQL"]
+async fn deletes_unused_groups_and_rejects_referenced_groups() {
+    let isolated = IsolatedStore::new().await;
+    let store = &isolated.store;
+
+    let root = match store.bootstrap_admin("root", "bootstrap").await {
+        Ok(admin) => admin,
+        Err(error) => panic!("bootstrap failed: {error}"),
+    };
+    let root_id = Some(root.member.id);
+    if let Err(error) = store.register_repository(root_id, "team/app.git").await {
+        panic!("register_repository failed: {error}");
+    }
+    if let Err(error) = store.create_group(root_id, "temp").await {
+        panic!("create_group failed: {error}");
+    }
+    let _alice = create_member_ok(store, member_request("alice", false, &["temp"])).await;
+
+    assert!(matches!(
+        store.delete_group(root_id, "missing").await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+
+    // Branch rule conflict.
+    if let Err(error) = store
+        .set_branch_rule(
+            root_id,
+            "team/app.git",
+            "refs/heads/priv/*",
+            group_set(&["temp"]),
+        )
+        .await
+    {
+        panic!("set_branch_rule failed: {error}");
+    }
+    assert!(matches!(
+        store.delete_group(root_id, "temp").await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+    if let Err(error) = store
+        .remove_branch_rule(root_id, "team/app.git", "refs/heads/priv/*")
+        .await
+    {
+        panic!("remove_branch_rule failed: {error}");
+    }
+
+    // Path rule conflict.
+    if let Err(error) = store
+        .set_path_rule(root_id, "team/app.git", "secret/**", group_set(&["temp"]))
+        .await
+    {
+        panic!("set_path_rule failed: {error}");
+    }
+    assert!(matches!(
+        store.delete_group(root_id, "temp").await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+    if let Err(error) = store
+        .remove_path_rule(root_id, "team/app.git", "secret/**")
+        .await
+    {
+        panic!("remove_path_rule failed: {error}");
+    }
+
+    // Secret scope conflict.
+    if let Err(error) = store
+        .set_secret_scope(root_id, "team/app.git", "prod", group_set(&["temp"]))
+        .await
+    {
+        panic!("set_secret_scope failed: {error}");
+    }
+    assert!(matches!(
+        store.delete_group(root_id, "temp").await,
+        Err(PolicyStoreError::Conflict(_))
+    ));
+    if let Err(error) = store
+        .remove_secret_scope(root_id, "team/app.git", "prod")
+        .await
+    {
+        panic!("remove_secret_scope failed: {error}");
+    }
+
+    // Now deletion succeeds and records removed_member_count in audit_log.
+    if let Err(error) = store.delete_group(root_id, "temp").await {
+        panic!("delete_group failed: {error}");
+    }
+    assert!(matches!(
+        store.delete_group(root_id, "temp").await,
+        Err(PolicyStoreError::NotFound(_))
+    ));
+    let groups = match store.list_groups().await {
+        Ok(groups) => groups,
+        Err(error) => panic!("list_groups failed: {error}"),
+    };
+    assert!(groups.is_empty());
+
+    let audit = match store
+        .list_audit_log(AuditLogQuery {
+            actor: None,
+            action: Some("group.delete".to_owned()),
+            target_type: Some("group".to_owned()),
+            limit: 10,
+            before_id: None,
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => panic!("list_audit_log failed: {error}"),
+    };
+    assert_eq!(audit.entries.len(), 1);
+    assert_eq!(audit.entries[0].target_name, "temp");
+    assert_eq!(
+        audit.entries[0].details,
+        serde_json::json!({ "removed_member_count": 1 })
+    );
+
+    isolated.drop_schema().await;
+}

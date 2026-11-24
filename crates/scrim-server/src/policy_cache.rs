@@ -38,9 +38,9 @@ use crate::{
         AuditLogEntry, AuditLogPage, AuditLogQuery, AuthenticatedMember, BranchRuleRecord,
         CreateMemberRequest, CreatedMember, GroupMembershipChange, GroupRecipientsRecord,
         GroupRecord, GroupWithMembers, IssuedToken, MemberPublicKeyRecord, MemberRecord,
-        MemberRepoPolicy, MemberSshKeyRecord, PathRuleRecord, PolicyStore, PolicyStoreError,
-        PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord, RevokeMemberResult,
-        ScopeRecipientsRecord, SecretScopeRecord,
+        MemberRepoPolicy, MemberSshKeyRecord, MemberTokenRecord, PathRuleRecord, PolicyStore,
+        PolicyStoreError, PolicyStoreFuture, RegisterRepositoryResult, RepositoryRecord,
+        RevokeMemberResult, ScopeRecipientsRecord, SecretScopeRecord,
     },
     pre_receive::encode_hex,
 };
@@ -549,6 +549,17 @@ impl PolicyStore for CachedPolicyStore {
         self.inner.list_groups()
     }
 
+    fn delete_group<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        group_name: &'a str,
+    ) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async move {
+            let result = self.inner.delete_group(actor_member_id, group_name).await;
+            self.invalidate_after(result).await
+        })
+    }
+
     fn add_group_member<'a>(
         &'a self,
         actor_member_id: Option<i64>,
@@ -600,6 +611,29 @@ impl PolicyStore for CachedPolicyStore {
             let result = self
                 .inner
                 .issue_member_token(actor_member_id, member_name, label)
+                .await;
+            self.invalidate_after(result).await
+        })
+    }
+
+    fn list_member_tokens<'a>(
+        &'a self,
+        member_name: &'a str,
+        include_revoked: bool,
+    ) -> PolicyStoreFuture<'a, Vec<MemberTokenRecord>> {
+        self.inner.list_member_tokens(member_name, include_revoked)
+    }
+
+    fn revoke_member_token<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        token_id: i64,
+    ) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .revoke_member_token(actor_member_id, member_name, token_id)
                 .await;
             self.invalidate_after(result).await
         })
@@ -1097,6 +1131,22 @@ mod tests {
         .await;
         assert_mutation_invalidates(c, k, b, "token", c.issue_member_token(None, "bob", "ci"))
             .await;
+        let bob_tokens = match c.list_member_tokens("bob", false).await {
+            Ok(tokens) => tokens,
+            Err(error) => panic!("list_member_tokens should succeed: {error}"),
+        };
+        let bob_token_id = match bob_tokens.last() {
+            Some(token) => token.id,
+            None => panic!("expected issued token for bob"),
+        };
+        assert_mutation_invalidates(
+            c,
+            k,
+            b,
+            "token-revoke",
+            c.revoke_member_token(None, "bob", bob_token_id),
+        )
+        .await;
         assert_mutation_invalidates(
             c,
             k,
@@ -1170,11 +1220,14 @@ mod tests {
         )
         .await;
         assert_mutation_invalidates(c, k, b, "revoke", c.revoke_member(None, "bob")).await;
-        assert_eq!(epoch(k).await, 17);
+        assert_mutation_invalidates(c, k, b, "group-temp", c.create_group(None, "temp-del")).await;
+        assert_mutation_invalidates(c, k, b, "group-delete", c.delete_group(None, "temp-del"))
+            .await;
+        assert_eq!(epoch(k).await, 20);
 
         // A failed mutation commits nothing and leaves the epoch alone.
         assert!(c.create_group(None, "ops").await.is_err());
-        assert_eq!(epoch(k).await, 17);
+        assert_eq!(epoch(k).await, 20);
     }
 
     #[tokio::test]

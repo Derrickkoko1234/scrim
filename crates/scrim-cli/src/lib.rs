@@ -49,8 +49,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::{
     AccessCommand, BranchCommand, Cli, Command, ExportFormat, GrantArgs, GroupCommand, InitArgs,
-    KeygenArgs, LoginArgs, RunArgs, SecretsCommand, SecretsRecipientsCommand, SecretsScopeCommand,
-    SecretsSetArgs,
+    KeygenArgs, LoginArgs, RepoCommand, RunArgs, SecretsCommand, SecretsRecipientsCommand,
+    SecretsScopeCommand, SecretsSetArgs, TokenCommand,
 };
 use crate::client::{ScopeRecipientInfo, ScrimClient};
 use crate::config::{
@@ -310,6 +310,18 @@ where
             };
             handle_group(group_args.command, &client, env.stdout)
         }
+        Command::Repo(repo_args) => {
+            let client = match build_authenticated_client(
+                server_flag,
+                token_override,
+                config_path_result.as_deref().ok(),
+                &env.cwd,
+            ) {
+                Ok(client) => client,
+                Err(err) => return Err(err),
+            };
+            handle_repo(repo_args.command, &client, env.stdout)
+        }
         Command::Access(access_args) => {
             let config_path_opt = config_path_result.as_deref().ok();
             let client = match build_authenticated_client(
@@ -329,6 +341,13 @@ where
                 env,
             )
         }
+        Command::Token(token_args) => handle_token(
+            token_args.command,
+            server_flag,
+            token_override,
+            config_path_result.as_deref().ok(),
+            env,
+        ),
         Command::Branch(branch_args) => {
             let client = match build_authenticated_client(
                 server_flag,
@@ -423,7 +442,9 @@ fn required_git_version(command: &Command) -> Option<(GitVersion, &'static str)>
         | Command::Whoami
         | Command::Keygen(_)
         | Command::Group(_)
+        | Command::Repo(_)
         | Command::Access(_)
+        | Command::Token(_)
         | Command::Branch(_)
         | Command::Audit(_)
         | Command::SshKey(_)
@@ -1001,6 +1022,124 @@ fn handle_group(
                 }
             }
             Ok(())
+        }
+        GroupCommand::Rm { name } => {
+            if let Err(err) = client.delete_group(&name) {
+                return Err(err);
+            }
+            write_line(
+                stdout,
+                &format!("Deleted group {}", escape_control_chars(&name)),
+            )
+        }
+    }
+}
+
+fn handle_repo(
+    command: RepoCommand,
+    client: &ScrimClient,
+    stdout: &mut dyn Write,
+) -> anyhow::Result<()> {
+    match command {
+        RepoCommand::List => {
+            let res = match client.list_repositories() {
+                Ok(resp) => resp,
+                Err(err) => return Err(err),
+            };
+            if res.repositories.is_empty() {
+                return write_line(stdout, "(no repositories)");
+            }
+            for repo in &res.repositories {
+                if let Err(err) = write_line(stdout, &escape_control_chars(&repo.path)) {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_token(
+    command: TokenCommand,
+    server_flag: Option<String>,
+    token_override: Option<SecretString>,
+    config_path: Option<&Path>,
+    env: &mut CliEnv<'_>,
+) -> anyhow::Result<()> {
+    match command {
+        TokenCommand::List { member, all } => {
+            if let Some(name) = member.as_deref()
+                && name.trim().is_empty()
+            {
+                bail!("--member cannot be empty");
+            }
+            let client = match build_authenticated_client(
+                server_flag,
+                token_override,
+                config_path,
+                &env.cwd,
+            ) {
+                Ok(client) => client,
+                Err(err) => return Err(err),
+            };
+            let res = match client.list_tokens(member.as_deref(), all) {
+                Ok(resp) => resp,
+                Err(err) => return Err(err),
+            };
+            if res.tokens.is_empty() {
+                return write_line(env.stdout, "(no tokens)");
+            }
+            for token in &res.tokens {
+                let member_name = escape_control_chars(&token.member_name);
+                let label = escape_control_chars(&token.label);
+                let label_display = if label.is_empty() {
+                    "(no label)"
+                } else {
+                    label.as_str()
+                };
+                let created_at = escape_control_chars(&token.created_at_utc);
+                let status = match &token.revoked_at_utc {
+                    Some(ts) => format!("revoked {}", escape_control_chars(ts)),
+                    None => "active".to_owned(),
+                };
+                let line = format!(
+                    "#{}  {member_name}  {label_display}  created {created_at}  {status}",
+                    token.id
+                );
+                if let Err(err) = write_line(env.stdout, &line) {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+        TokenCommand::Rm { id, member } => {
+            if id <= 0 {
+                bail!("token ID must be a positive integer, got {id}");
+            }
+            if let Some(name) = member.as_deref()
+                && name.trim().is_empty()
+            {
+                bail!("--member cannot be empty");
+            }
+            let client = match build_authenticated_client(
+                server_flag,
+                token_override,
+                config_path,
+                &env.cwd,
+            ) {
+                Ok(client) => client,
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = client.revoke_token(member.as_deref(), id) {
+                return Err(err);
+            }
+            match member {
+                Some(name) => write_line(
+                    env.stdout,
+                    &format!("Revoked token #{id} for {}.", escape_control_chars(&name)),
+                ),
+                None => write_line(env.stdout, &format!("Revoked token #{id}.")),
+            }
         }
     }
 }

@@ -242,6 +242,7 @@ fn admin_routes() -> Vec<(Method, &'static str, Option<Value>)> {
             Some(json!({ "name": "core" })),
         ),
         (Method::GET, "/api/v1/groups", None),
+        (Method::DELETE, "/api/v1/groups/core", None),
         (
             Method::POST,
             "/api/v1/groups/core/members",
@@ -253,7 +254,9 @@ fn admin_routes() -> Vec<(Method, &'static str, Option<Value>)> {
             "/api/v1/members",
             Some(json!({ "name": "eve" })),
         ),
+        (Method::GET, "/api/v1/members/dev/tokens", None),
         (Method::POST, "/api/v1/members/dev/tokens", Some(json!({}))),
+        (Method::DELETE, "/api/v1/members/dev/tokens/1", None),
         (Method::DELETE, "/api/v1/members/root", None),
         (Method::GET, "/api/v1/members", None),
         (
@@ -389,6 +392,8 @@ async fn static_store_answers_administration_with_not_implemented() {
         Some(json!({ "public_key": TEST_SSH_KEY_1 })),
     ));
     routes.push((Method::DELETE, "/api/v1/me/ssh-keys/1", None));
+    routes.push((Method::GET, "/api/v1/me/tokens", None));
+    routes.push((Method::DELETE, "/api/v1/me/tokens/1", None));
     for (method, uri, body) in routes {
         let reply = send(&router, method.clone(), uri, Some(TEST_TOKEN), body).await;
         assert_eq!(
@@ -3086,4 +3091,448 @@ async fn healthz_is_unauthenticated_and_rejects_non_get() {
     let static_healthz = send(&static_router, Method::GET, "/healthz", None, None).await;
     assert_eq!(static_healthz.status, StatusCode::OK);
     assert_eq!(static_healthz.json, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn token_list_and_revoke_lifecycle() {
+    let api = Api::new();
+
+    let created = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members",
+            Some(json!({ "name": "alice", "token_label": "laptop" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let alice_tok_1 = string_field(&created, "token");
+    let issued = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members/alice/tokens",
+            Some(json!({ "label": "ci" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let alice_tok_2 = string_field(&issued, "token");
+
+    // Self-service list returns metadata without token hashes or plaintext.
+    let self_list = api
+        .call(Method::GET, "/api/v1/me/tokens", Some(&alice_tok_1), None)
+        .await;
+    assert_eq!(self_list.status, StatusCode::OK);
+    assert_no_store(&self_list);
+    let Some(self_tokens) = self_list.json.get("tokens").and_then(Value::as_array) else {
+        panic!("missing tokens array in {}", self_list.json);
+    };
+    assert_eq!(self_tokens.len(), 2);
+    let alice_id_1 = match self_tokens[0].get("id").and_then(Value::as_i64) {
+        Some(id) => id,
+        None => panic!("missing id in {}", self_tokens[0]),
+    };
+    let alice_id_2 = match self_tokens[1].get("id").and_then(Value::as_i64) {
+        Some(id) => id,
+        None => panic!("missing id in {}", self_tokens[1]),
+    };
+    assert!(alice_id_1 < alice_id_2);
+    assert_eq!(string_field(&self_tokens[0], "member_name"), "alice");
+    assert_eq!(string_field(&self_tokens[0], "label"), "laptop");
+    assert!(!string_field(&self_tokens[0], "created_at_utc").is_empty());
+    assert_eq!(self_tokens[0].get("revoked_at_utc"), Some(&Value::Null));
+    assert_eq!(string_field(&self_tokens[1], "label"), "ci");
+    assert!(!self_list.json.to_string().contains(&alice_tok_1));
+    assert!(!self_list.json.to_string().contains(&alice_tok_2));
+    assert!(self_tokens[0].get("token").is_none());
+    assert!(self_tokens[0].get("token_hash").is_none());
+
+    // Admin list for alice matches, and missing members return 404.
+    let admin_list = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/members/alice/tokens",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(admin_list, self_list.json);
+    api.admin_expect(
+        Method::GET,
+        "/api/v1/members/nobody/tokens",
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Cross-member isolation: `dev` cannot revoke alice's token via `/me/tokens`.
+    let dev_list = api
+        .call(Method::GET, "/api/v1/me/tokens", Some(DEV_TOKEN), None)
+        .await;
+    assert_eq!(dev_list.status, StatusCode::OK);
+    let cross = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{alice_id_1}"),
+            Some(DEV_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(cross.status, StatusCode::NOT_FOUND);
+
+    // Invalid token IDs are rejected with 400 Bad Request.
+    for bad_uri in [
+        "/api/v1/me/tokens/0",
+        "/api/v1/me/tokens/-5",
+        "/api/v1/me/tokens/not-a-number",
+    ] {
+        let bad = api
+            .call(Method::DELETE, bad_uri, Some(&alice_tok_1), None)
+            .await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{bad_uri}");
+    }
+
+    // Alice revokes her second token via self-service `/me/tokens/{id}`.
+    let revoke_self = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{alice_id_2}"),
+            Some(&alice_tok_1),
+            None,
+        )
+        .await;
+    assert_eq!(revoke_self.status, StatusCode::NO_CONTENT);
+    assert_no_store(&revoke_self);
+
+    // Revoked token stops working immediately, while first token still works.
+    let revoked_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(&alice_tok_2), None)
+        .await;
+    assert_eq!(revoked_whoami.status, StatusCode::UNAUTHORIZED);
+    let active_whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(&alice_tok_1), None)
+        .await;
+    assert_eq!(active_whoami.status, StatusCode::OK);
+
+    // Re-revoking the same token returns 404 Not Found.
+    let revoke_again = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{alice_id_2}"),
+            Some(&alice_tok_1),
+            None,
+        )
+        .await;
+    assert_eq!(revoke_again.status, StatusCode::NOT_FOUND);
+
+    // Without `?all=true`, only active tokens are listed; with `?all=true`, both appear.
+    let active_only = api
+        .call(Method::GET, "/api/v1/me/tokens", Some(&alice_tok_1), None)
+        .await;
+    assert_eq!(
+        active_only
+            .json
+            .get("tokens")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    let with_revoked = api
+        .admin_expect(
+            Method::GET,
+            "/api/v1/members/alice/tokens?all=true",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    let Some(all_tokens) = with_revoked.get("tokens").and_then(Value::as_array) else {
+        panic!("missing tokens in {with_revoked}");
+    };
+    assert_eq!(all_tokens.len(), 2);
+    assert_eq!(all_tokens[0].get("revoked_at_utc"), Some(&Value::Null));
+    assert!(
+        all_tokens[1]
+            .get("revoked_at_utc")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+
+    // Last active admin token guard: `root` currently has 1 active token.
+    let root_tokens_json = api
+        .admin_expect(Method::GET, "/api/v1/me/tokens", None, StatusCode::OK)
+        .await;
+    let Some(root_tokens) = root_tokens_json.get("tokens").and_then(Value::as_array) else {
+        panic!("missing root tokens in {root_tokens_json}");
+    };
+    assert_eq!(root_tokens.len(), 1);
+    let Some(root_tok_1_id) = root_tokens[0].get("id").and_then(Value::as_i64) else {
+        panic!("missing root token id");
+    };
+    let conflict_self = api
+        .admin(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{root_tok_1_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(conflict_self.status, StatusCode::CONFLICT);
+    assert!(conflict_self.error().contains("last active admin token"));
+    let conflict_admin = api
+        .admin(
+            Method::DELETE,
+            &format!("/api/v1/members/root/tokens/{root_tok_1_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(conflict_admin.status, StatusCode::CONFLICT);
+
+    // Issue a second token to `root`: now the first can be revoked, while the second cannot.
+    let root_issued = api
+        .admin_expect(
+            Method::POST,
+            "/api/v1/members/root/tokens",
+            Some(json!({ "label": "backup" })),
+            StatusCode::CREATED,
+        )
+        .await;
+    let root_tok_2 = string_field(&root_issued, "token");
+    let root_list_2 = api
+        .admin_expect(Method::GET, "/api/v1/me/tokens", None, StatusCode::OK)
+        .await;
+    let Some(root_tokens_2) = root_list_2.get("tokens").and_then(Value::as_array) else {
+        panic!("missing root tokens in {root_list_2}");
+    };
+    assert_eq!(root_tokens_2.len(), 2);
+    let Some(root_tok_2_id) = root_tokens_2[1].get("id").and_then(Value::as_i64) else {
+        panic!("missing root_tok_2_id");
+    };
+    let revoked_root_1 = api
+        .admin(
+            Method::DELETE,
+            &format!("/api/v1/members/root/tokens/{root_tok_1_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(revoked_root_1.status, StatusCode::NO_CONTENT);
+    let conflict_last_root = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{root_tok_2_id}"),
+            Some(&root_tok_2),
+            None,
+        )
+        .await;
+    assert_eq!(conflict_last_root.status, StatusCode::CONFLICT);
+
+    // Create a second admin (authenticating with `root_tok_2`, since `ADMIN_TOKEN` was revoked);
+    // now `root`'s last token CAN be revoked, and `admin2`'s last cannot.
+    let admin2_reply = api
+        .call(
+            Method::POST,
+            "/api/v1/members",
+            Some(&root_tok_2),
+            Some(json!({ "name": "admin2", "is_admin": true, "token_label": "primary" })),
+        )
+        .await;
+    assert_eq!(
+        admin2_reply.status,
+        StatusCode::CREATED,
+        "{}",
+        admin2_reply.json
+    );
+    let admin2_tok = string_field(&admin2_reply.json, "token");
+    let revoked_root_2 = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/members/root/tokens/{root_tok_2_id}"),
+            Some(&admin2_tok),
+            None,
+        )
+        .await;
+    assert_eq!(revoked_root_2.status, StatusCode::NO_CONTENT);
+
+    let admin2_list = api
+        .call(Method::GET, "/api/v1/me/tokens", Some(&admin2_tok), None)
+        .await;
+    let Some(admin2_tok_id) = admin2_list
+        .json
+        .pointer("/tokens/0/id")
+        .and_then(Value::as_i64)
+    else {
+        panic!("missing admin2 token id in {}", admin2_list.json);
+    };
+    let admin2_last_conflict = api
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/me/tokens/{admin2_tok_id}"),
+            Some(&admin2_tok),
+            None,
+        )
+        .await;
+    assert_eq!(admin2_last_conflict.status, StatusCode::CONFLICT);
+
+    // Verify audit log entries for `token.revoke`.
+    let revoke_audits: Vec<_> = api
+        .store
+        .audit_entries()
+        .into_iter()
+        .filter(|entry| entry.action == "token.revoke")
+        .collect();
+    assert_eq!(revoke_audits.len(), 3);
+    assert_eq!(revoke_audits[0].target_type, "member_token");
+    assert_eq!(revoke_audits[0].target_name, "alice");
+    assert_eq!(
+        revoke_audits[0].details,
+        json!({ "token_id": alice_id_2, "label": "ci" })
+    );
+    assert_eq!(revoke_audits[1].target_name, "root");
+    assert_eq!(
+        revoke_audits[1].details,
+        json!({ "token_id": root_tok_1_id, "label": "" })
+    );
+    assert_eq!(revoke_audits[2].target_name, "root");
+    assert_eq!(
+        revoke_audits[2].details,
+        json!({ "token_id": root_tok_2_id, "label": "backup" })
+    );
+}
+
+#[tokio::test]
+async fn group_deletion_and_rule_conflicts() {
+    let api = Api::new();
+    let sandbox = GitSandbox::new();
+    sandbox.init_bare_with_commit(&api.root.path().join("team/app.git"));
+    api.admin_expect(
+        Method::POST,
+        "/api/v1/repositories",
+        Some(json!({ "path": "team/app.git", "create_bare": false })),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // Deleting a non-existent group returns 404.
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/groups/missing",
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Deleting an unused group with memberships succeeds and audits removed count.
+    api.create_group("temp").await;
+    let alice_tok = api.create_member("alice", &["temp"]).await;
+    let deleted = api.admin(Method::DELETE, "/api/v1/groups/temp", None).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    assert_no_store(&deleted);
+
+    let groups_after = api
+        .admin_expect(Method::GET, "/api/v1/groups", None, StatusCode::OK)
+        .await;
+    assert!(names(&groups_after, "groups", "name").is_empty());
+    let whoami = api
+        .call(Method::GET, "/api/v1/whoami", Some(&alice_tok), None)
+        .await;
+    assert_eq!(whoami.json.get("groups"), Some(&json!([])));
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/groups/temp",
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    let delete_audits: Vec<_> = api
+        .store
+        .audit_entries()
+        .into_iter()
+        .filter(|entry| entry.action == "group.delete")
+        .collect();
+    assert_eq!(delete_audits.len(), 1);
+    assert_eq!(delete_audits[0].target_type, "group");
+    assert_eq!(delete_audits[0].target_name, "temp");
+    assert_eq!(
+        delete_audits[0].details,
+        json!({ "removed_member_count": 1 })
+    );
+
+    // Deleting a group referenced by a branch rule, path rule, or secret scope fails with 409
+    // until that reference is removed.
+    api.create_group("guarded").await;
+
+    // 1. Branch rule reference.
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/branch-rules",
+        Some(json!({
+            "repository": "team/app.git",
+            "pattern": "refs/heads/private/*",
+            "groups": ["guarded"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let branch_conflict = api
+        .admin(Method::DELETE, "/api/v1/groups/guarded", None)
+        .await;
+    assert_eq!(branch_conflict.status, StatusCode::CONFLICT);
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/branch-rules?repo=team%2Fapp.git&pattern=refs%2Fheads%2Fprivate%2F*",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // 2. Path rule reference.
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/path-rules",
+        Some(json!({
+            "repository": "team/app.git",
+            "pattern": "secrets/**",
+            "groups": ["guarded"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let path_conflict = api
+        .admin(Method::DELETE, "/api/v1/groups/guarded", None)
+        .await;
+    assert_eq!(path_conflict.status, StatusCode::CONFLICT);
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/path-rules?repo=team%2Fapp.git&pattern=secrets%2F**",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // 3. Secret scope reference.
+    api.admin_expect(
+        Method::PUT,
+        "/api/v1/secret-scopes",
+        Some(json!({
+            "repository": "team/app.git",
+            "scope": "prod",
+            "groups": ["guarded"],
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    let scope_conflict = api
+        .admin(Method::DELETE, "/api/v1/groups/guarded", None)
+        .await;
+    assert_eq!(scope_conflict.status, StatusCode::CONFLICT);
+    api.admin_expect(
+        Method::DELETE,
+        "/api/v1/secret-scopes?repo=team%2Fapp.git&scope=prod",
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // Once all references are gone, deleting `guarded` succeeds.
+    let deleted_guarded = api
+        .admin(Method::DELETE, "/api/v1/groups/guarded", None)
+        .await;
+    assert_eq!(deleted_guarded.status, StatusCode::NO_CONTENT);
 }

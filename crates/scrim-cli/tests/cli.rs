@@ -232,6 +232,7 @@ fn handle_connection(
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        204 => "No Content",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
@@ -3719,4 +3720,283 @@ fn ssh_key_add_list_rm_and_local_validation() {
 
     assert_eq!(requests[7].method, "DELETE");
     assert_eq!(requests[7].target, "/api/v1/members/alice/ssh-keys/3");
+}
+
+#[test]
+fn token_group_rm_and_repo_list_cli() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let repo_calls = AtomicUsize::new(0);
+    let server = MockServer::start(move |req| {
+        match (req.method.as_str(), req.target.as_str()) {
+        ("GET", "/api/v1/me/tokens") => (
+            200,
+            serde_json::json!({ "tokens": [] }).to_string(),
+        ),
+        ("GET", "/api/v1/me/tokens?all=true") => (
+            200,
+            serde_json::json!({
+                "tokens": [
+                    {
+                        "id": 1,
+                        "member_name": "bob",
+                        "label": "laptop",
+                        "created_at_utc": "2026-11-24T10:00:00Z",
+                        "revoked_at_utc": null
+                    },
+                    {
+                        "id": 2,
+                        "member_name": "bob",
+                        "label": "",
+                        "created_at_utc": "2026-11-24T10:05:00Z",
+                        "revoked_at_utc": "2026-11-24T10:10:00Z"
+                    }
+                ]
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/v1/members/alice%20smith/tokens") => (
+            200,
+            serde_json::json!({
+                "tokens": [
+                    {
+                        "id": 5,
+                        "member_name": "alice\u{001b}[2J",
+                        "label": "ci",
+                        "created_at_utc": "2026-11-24T11:00:00Z",
+                        "revoked_at_utc": null
+                    }
+                ]
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/v1/members/alice/tokens?all=true") => (
+            200,
+            serde_json::json!({ "tokens": [] }).to_string(),
+        ),
+        ("DELETE", "/api/v1/me/tokens/7") => (204, String::new()),
+        ("DELETE", "/api/v1/members/alice%20smith/tokens/9") => (204, String::new()),
+        ("DELETE", "/api/v1/groups/core%20team") => (204, String::new()),
+        ("DELETE", "/api/v1/groups/temp") => (204, String::new()),
+        ("DELETE", "/api/v1/groups/in-use") => (
+            409,
+            r#"{"error":"group is still referenced by active branch, path, or secret scope rules"}"#.to_owned(),
+        ),
+        ("GET", "/api/v1/repositories") => {
+            if repo_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                (200, serde_json::json!({ "repositories": [] }).to_string())
+            } else {
+                (
+                    200,
+                    serde_json::json!({
+                        "repositories": [
+                            { "id": 1, "path": "infra/deploy.git" },
+                            { "id": 2, "path": "team/app\u{001b}[31m.git" }
+                        ]
+                    })
+                    .to_string(),
+                )
+            }
+        }
+        _ => (404, r#"{"error":"unexpected route"}"#.to_owned()),
+    }
+    });
+
+    let tmp = must(tempfile::tempdir(), "create tempdir");
+    let config = tmp.path().join("config.toml");
+    must(
+        fs::write(
+            &config,
+            format!("server = \"{}\"\ntoken = \"scrim_tok\"\n", server.url()),
+        ),
+        "write config.toml",
+    );
+
+    // 1. Local validation rejects invalid token arguments before making any HTTP call.
+    for (args, expected_err) in [
+        (&["token", "rm", "0"][..], "positive integer"),
+        (&["token", "rm", "-1"][..], "positive integer"),
+        (
+            &["token", "list", "--member", ""][..],
+            "--member cannot be empty",
+        ),
+        (
+            &["token", "rm", "1", "--member", "  "][..],
+            "--member cannot be empty",
+        ),
+    ] {
+        let out = run_bin(scrim_bin(), args, tmp.path(), &config, None);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(
+            stderr_str(&out).contains(expected_err),
+            "{args:?}: stderr={}",
+            stderr_str(&out)
+        );
+    }
+    assert!(
+        server.take_requests().is_empty(),
+        "local validation must not make HTTP requests"
+    );
+
+    // 2. `scrim token list` variations.
+    let list_empty = run_bin(scrim_bin(), &["token", "list"], tmp.path(), &config, None);
+    assert_success(&list_empty, "token list");
+    assert_eq!(stdout_str(&list_empty), "(no tokens)\n");
+
+    let list_all = run_bin(
+        scrim_bin(),
+        &["token", "list", "--all"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&list_all, "token list --all");
+    assert_eq!(
+        stdout_str(&list_all),
+        "#1  bob  laptop  created 2026-11-24T10:00:00Z  active\n\
+         #2  bob  (no label)  created 2026-11-24T10:05:00Z  revoked 2026-11-24T10:10:00Z\n"
+    );
+
+    let list_member = run_bin(
+        scrim_bin(),
+        &["token", "list", "--member", "alice smith"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&list_member, "token list --member");
+    let list_member_out = stdout_str(&list_member);
+    assert!(!list_member_out.contains('\u{1b}'));
+    assert_eq!(
+        list_member_out,
+        "#5  alice\\u{1b}[2J  ci  created 2026-11-24T11:00:00Z  active\n"
+    );
+
+    let list_member_all = run_bin(
+        scrim_bin(),
+        &["token", "list", "--member", "alice", "--all"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&list_member_all, "token list --member --all");
+    assert_eq!(stdout_str(&list_member_all), "(no tokens)\n");
+
+    // 3. `scrim token rm` variations.
+    let rm_self = run_bin(
+        scrim_bin(),
+        &["token", "rm", "7"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&rm_self, "token rm self");
+    assert_eq!(stdout_str(&rm_self), "Revoked token #7.\n");
+
+    let rm_member = run_bin(
+        scrim_bin(),
+        &["token", "rm", "9", "--member", "alice smith"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&rm_member, "token rm --member");
+    assert_eq!(
+        stdout_str(&rm_member),
+        "Revoked token #9 for alice smith.\n"
+    );
+
+    // 4. `scrim group rm` and `scrim group delete`.
+    let group_rm = run_bin(
+        scrim_bin(),
+        &["group", "rm", "core team"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&group_rm, "group rm");
+    assert_eq!(stdout_str(&group_rm), "Deleted group core team\n");
+
+    let group_delete = run_bin(
+        scrim_bin(),
+        &["group", "delete", "temp"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert_success(&group_delete, "group delete");
+    assert_eq!(stdout_str(&group_delete), "Deleted group temp\n");
+
+    let group_conflict = run_bin(
+        scrim_bin(),
+        &["group", "rm", "in-use"],
+        tmp.path(),
+        &config,
+        None,
+    );
+    assert!(!group_conflict.status.success());
+    assert!(
+        stderr_str(&group_conflict)
+            .contains("referenced by active branch, path, or secret scope rules"),
+        "{}",
+        stderr_str(&group_conflict)
+    );
+
+    // 5. `scrim repo list`.
+    let repo_empty = run_bin(scrim_bin(), &["repo", "list"], tmp.path(), &config, None);
+    assert_success(&repo_empty, "repo list empty");
+    assert_eq!(stdout_str(&repo_empty), "(no repositories)\n");
+
+    let repo_list = run_bin(scrim_bin(), &["repo", "list"], tmp.path(), &config, None);
+    assert_success(&repo_list, "repo list");
+    let repo_list_out = stdout_str(&repo_list);
+    assert!(!repo_list_out.contains('\u{1b}'));
+    assert_eq!(repo_list_out, "infra/deploy.git\nteam/app\\u{1b}[31m.git\n");
+
+    let requests = server.take_requests();
+    assert_eq!(requests.len(), 11);
+    assert_eq!(
+        (requests[0].method.as_str(), requests[0].target.as_str()),
+        ("GET", "/api/v1/me/tokens")
+    );
+    assert_eq!(
+        (requests[1].method.as_str(), requests[1].target.as_str()),
+        ("GET", "/api/v1/me/tokens?all=true")
+    );
+    assert_eq!(
+        (requests[2].method.as_str(), requests[2].target.as_str()),
+        ("GET", "/api/v1/members/alice%20smith/tokens")
+    );
+    assert_eq!(
+        (requests[3].method.as_str(), requests[3].target.as_str()),
+        ("GET", "/api/v1/members/alice/tokens?all=true")
+    );
+    assert_eq!(
+        (requests[4].method.as_str(), requests[4].target.as_str()),
+        ("DELETE", "/api/v1/me/tokens/7")
+    );
+    assert_eq!(
+        (requests[5].method.as_str(), requests[5].target.as_str()),
+        ("DELETE", "/api/v1/members/alice%20smith/tokens/9")
+    );
+    assert_eq!(
+        (requests[6].method.as_str(), requests[6].target.as_str()),
+        ("DELETE", "/api/v1/groups/core%20team")
+    );
+    assert_eq!(
+        (requests[7].method.as_str(), requests[7].target.as_str()),
+        ("DELETE", "/api/v1/groups/temp")
+    );
+    assert_eq!(
+        (requests[8].method.as_str(), requests[8].target.as_str()),
+        ("DELETE", "/api/v1/groups/in-use")
+    );
+    assert_eq!(
+        (requests[9].method.as_str(), requests[9].target.as_str()),
+        ("GET", "/api/v1/repositories")
+    );
+    assert_eq!(
+        (requests[10].method.as_str(), requests[10].target.as_str()),
+        ("GET", "/api/v1/repositories")
+    );
 }

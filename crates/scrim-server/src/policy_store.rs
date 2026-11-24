@@ -308,6 +308,21 @@ pub struct IssuedToken {
     pub token: SecretString,
 }
 
+/// Metadata for a member's API token (never includes token material or hash).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberTokenRecord {
+    /// Database ID of the token, used to revoke it.
+    pub id: i64,
+    /// Name of the member owning the token.
+    pub member_name: String,
+    /// Human-readable label for the token.
+    pub label: String,
+    /// UTC timestamp when the token was created (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub created_at_utc: String,
+    /// UTC timestamp when the token was revoked, or `None` if active.
+    pub revoked_at_utc: Option<String>,
+}
+
 /// Outcome of [`PolicyStore::revoke_member`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevokeMemberResult {
@@ -552,6 +567,21 @@ pub trait PolicyStore: Send + Sync + 'static {
         unsupported()
     }
 
+    /// Deletes the group `group_name` (and its memberships) if it is not
+    /// referenced by any branch rule, path rule, or secret scope.
+    ///
+    /// [`PolicyStoreError::NotFound`] if the group does not exist;
+    /// [`PolicyStoreError::Conflict`] if any rule or secret scope still
+    /// references it.
+    fn delete_group<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        group_name: &'a str,
+    ) -> PolicyStoreFuture<'a, ()> {
+        let _ = (actor_member_id, group_name);
+        unsupported()
+    }
+
     /// Adds the active member `member_name` to `group_name`. Idempotent:
     /// `changed == false` (and no audit entry) if already a member.
     fn add_group_member<'a>(
@@ -598,6 +628,35 @@ pub trait PolicyStore: Send + Sync + 'static {
         label: &'a str,
     ) -> PolicyStoreFuture<'a, IssuedToken> {
         let _ = (actor_member_id, member_name, label);
+        unsupported()
+    }
+
+    /// Lists `member_name`'s API tokens ordered by ascending ID, skipping
+    /// revoked tokens unless `include_revoked` is `true`.
+    ///
+    /// [`PolicyStoreError::NotFound`] if the member does not exist.
+    fn list_member_tokens<'a>(
+        &'a self,
+        member_name: &'a str,
+        include_revoked: bool,
+    ) -> PolicyStoreFuture<'a, Vec<MemberTokenRecord>> {
+        let _ = (member_name, include_revoked);
+        unsupported()
+    }
+
+    /// Revokes `member_name`'s active API token `token_id`.
+    ///
+    /// [`PolicyStoreError::InvalidInput`] if `token_id <= 0`;
+    /// [`PolicyStoreError::NotFound`] if the member does not exist or has no
+    /// active token with that ID; [`PolicyStoreError::Conflict`] if revoking
+    /// it would leave active admins with no active tokens.
+    fn revoke_member_token<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        token_id: i64,
+    ) -> PolicyStoreFuture<'a, ()> {
+        let _ = (actor_member_id, member_name, token_id);
         unsupported()
     }
 
@@ -1133,6 +1192,17 @@ pub(crate) fn canonicalize_ssh_public_key(
     })
 }
 
+/// Validates a token ID taken from a request path.
+fn validate_token_id(token_id: i64) -> Result<(), PolicyStoreError> {
+    if token_id > 0 {
+        Ok(())
+    } else {
+        Err(PolicyStoreError::InvalidInput(
+            "invalid token ID: expected a positive integer".to_owned(),
+        ))
+    }
+}
+
 /// Validates an SSH key ID taken from a request path.
 fn validate_ssh_key_id(key_id: i64) -> Result<(), PolicyStoreError> {
     if key_id > 0 {
@@ -1467,9 +1537,28 @@ struct MemoryMember {
 /// One token of a [`MemoryPolicyStore`]; only its hash is kept.
 #[derive(Clone)]
 struct MemoryToken {
+    id: i64,
     member_id: i64,
     token_hash: Zeroizing<[u8; 32]>,
-    is_revoked: bool,
+    label: String,
+    created_at_utc: String,
+    revoked_at_utc: Option<String>,
+}
+
+impl MemoryToken {
+    fn is_revoked(&self) -> bool {
+        self.revoked_at_utc.is_some()
+    }
+
+    fn record(&self, member_name: &str) -> MemberTokenRecord {
+        MemberTokenRecord {
+            id: self.id,
+            member_name: member_name.to_owned(),
+            label: self.label.clone(),
+            created_at_utc: self.created_at_utc.clone(),
+            revoked_at_utc: self.revoked_at_utc.clone(),
+        }
+    }
 }
 
 /// One SSH key of a [`MemoryPolicyStore`].
@@ -1628,15 +1717,23 @@ impl MemoryState {
     }
 
     /// Generates and stores a token for `member_id`.
-    fn issue_token(&mut self, member_id: i64) -> Result<SecretString, PolicyStoreError> {
+    fn issue_token(
+        &mut self,
+        member_id: i64,
+        label: &str,
+    ) -> Result<SecretString, PolicyStoreError> {
         let generated = match generate_api_token() {
             Ok(generated) => generated,
             Err(error) => return Err(error),
         };
+        let id = self.next_id();
         self.tokens.push(MemoryToken {
+            id,
             member_id,
             token_hash: generated.hash,
-            is_revoked: false,
+            label: label.to_owned(),
+            created_at_utc: current_utc_timestamp(),
+            revoked_at_utc: None,
         });
         Ok(generated.token)
     }
@@ -1661,7 +1758,7 @@ impl MemoryState {
             public_key: request.public_key.clone(),
             is_revoked: false,
         };
-        let token = match self.issue_token(member.id) {
+        let token = match self.issue_token(member.id, &request.token_label) {
             Ok(token) => token,
             Err(error) => return Err(error),
         };
@@ -1735,10 +1832,14 @@ impl MemoryPolicyStore {
     pub fn insert_member(&mut self, member: AuthenticatedMember, token: &[u8]) {
         let mut state = self.setup_state();
         state.last_id = state.last_id.max(member.id);
+        let token_id = state.next_id();
         state.tokens.push(MemoryToken {
+            id: token_id,
             member_id: member.id,
             token_hash: sha256_zeroizing(token),
-            is_revoked: false,
+            label: String::new(),
+            created_at_utc: current_utc_timestamp(),
+            revoked_at_utc: None,
         });
         state.members.push(MemoryMember {
             id: member.id,
@@ -1845,7 +1946,7 @@ impl PolicyStore for MemoryPolicyStore {
             let mut matched_member_id = None;
             for token in &state.tokens {
                 let is_match = bool::from(token.token_hash.as_slice().ct_eq(token_hash.as_slice()));
-                if is_match && !token.is_revoked && matched_member_id.is_none() {
+                if is_match && !token.is_revoked() && matched_member_id.is_none() {
                     matched_member_id = Some(token.member_id);
                 }
             }
@@ -2004,6 +2105,52 @@ impl PolicyStore for MemoryPolicyStore {
         }))
     }
 
+    fn delete_group<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        group_name: &'a str,
+    ) -> PolicyStoreFuture<'a, ()> {
+        if let Err(error) = validate_group_name(group_name) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            if !state.group_ids.contains_key(group_name) {
+                return Err(group_not_found_error());
+            }
+            let referenced_by_branch_rule = state
+                .rules_by_repository
+                .values()
+                .flatten()
+                .any(|rule| rule.allowed_groups.contains(group_name));
+            let referenced_by_path_rule = state
+                .path_rules_by_repository
+                .values()
+                .flatten()
+                .any(|rule| rule.allowed_groups.contains(group_name));
+            let referenced_by_secret_scope = state
+                .secret_scopes_by_repository
+                .values()
+                .flat_map(|scopes| scopes.values())
+                .any(|groups| groups.contains(group_name));
+            if referenced_by_branch_rule || referenced_by_path_rule || referenced_by_secret_scope {
+                return Err(group_in_use_error());
+            }
+            state.group_ids.remove(group_name);
+            let mut removed_member_count: u64 = 0;
+            for groups in state.groups_by_member.values_mut() {
+                if groups.remove(group_name) {
+                    removed_member_count += 1;
+                }
+            }
+            state.push_audit(delete_group_audit(
+                actor_member_id,
+                group_name,
+                removed_member_count,
+            ));
+            Ok(())
+        }))
+    }
+
     fn add_group_member<'a>(
         &'a self,
         actor_member_id: Option<i64>,
@@ -2123,7 +2270,7 @@ impl PolicyStore for MemoryPolicyStore {
             else {
                 return Err(member_not_found_error());
             };
-            let token = match state.issue_token(member_id) {
+            let token = match state.issue_token(member_id, label) {
                 Ok(token) => token,
                 Err(error) => return Err(error),
             };
@@ -2133,6 +2280,88 @@ impl PolicyStore for MemoryPolicyStore {
                 label: label.to_owned(),
                 token,
             })
+        }))
+    }
+
+    fn list_member_tokens<'a>(
+        &'a self,
+        member_name: &'a str,
+        include_revoked: bool,
+    ) -> PolicyStoreFuture<'a, Vec<MemberTokenRecord>> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let Some(member_id) = state.member_by_name(member_name).map(|member| member.id) else {
+                return Err(member_not_found_error());
+            };
+            let mut tokens: Vec<MemberTokenRecord> = state
+                .tokens
+                .iter()
+                .filter(|token| {
+                    token.member_id == member_id && (include_revoked || !token.is_revoked())
+                })
+                .map(|token| token.record(member_name))
+                .collect();
+            tokens.sort_by_key(|token| token.id);
+            Ok(tokens)
+        }))
+    }
+
+    fn revoke_member_token<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        token_id: i64,
+    ) -> PolicyStoreFuture<'a, ()> {
+        if let Err(error) = validate_member_name(member_name) {
+            return ready(Err(error));
+        }
+        if let Err(error) = validate_token_id(token_id) {
+            return ready(Err(error));
+        }
+        ready(self.with_state(|state| {
+            let Some(member) = state.member_by_name(member_name).cloned() else {
+                return Err(member_not_found_error());
+            };
+            let has_active_target = state.tokens.iter().any(|token| {
+                token.id == token_id && token.member_id == member.id && !token.is_revoked()
+            });
+            if !has_active_target {
+                return Err(token_not_found_error());
+            }
+            if member.is_admin && !member.is_revoked {
+                let active_admin_token_count = state
+                    .tokens
+                    .iter()
+                    .filter(|token| {
+                        !token.is_revoked()
+                            && state
+                                .members
+                                .iter()
+                                .any(|m| m.id == token.member_id && m.is_admin && !m.is_revoked)
+                    })
+                    .count();
+                if active_admin_token_count <= 1 {
+                    return Err(last_admin_token_error());
+                }
+            }
+            let revoked_at = current_utc_timestamp();
+            let mut label = String::new();
+            for token in &mut state.tokens {
+                if token.id == token_id && token.member_id == member.id && !token.is_revoked() {
+                    token.revoked_at_utc = Some(revoked_at);
+                    label = token.label.clone();
+                    break;
+                }
+            }
+            state.push_audit(revoke_token_audit(
+                actor_member_id,
+                member_name,
+                token_id,
+                &label,
+            ));
+            Ok(())
         }))
     }
 
@@ -2167,10 +2396,11 @@ impl PolicyStore for MemoryPolicyStore {
                     candidate.is_revoked = true;
                 }
             }
+            let revoked_at = current_utc_timestamp();
             let mut revoked_token_count: u64 = 0;
             for token in &mut state.tokens {
-                if token.member_id == member.id && !token.is_revoked {
-                    token.is_revoked = true;
+                if token.member_id == member.id && !token.is_revoked() {
+                    token.revoked_at_utc = Some(revoked_at.clone());
                     revoked_token_count += 1;
                 }
             }
@@ -2892,6 +3122,10 @@ fn ssh_key_not_found_error() -> PolicyStoreError {
     PolicyStoreError::NotFound("SSH key not found".to_owned())
 }
 
+fn token_not_found_error() -> PolicyStoreError {
+    PolicyStoreError::NotFound("token not found".to_owned())
+}
+
 fn ssh_key_exists_error() -> PolicyStoreError {
     PolicyStoreError::Conflict("SSH key is already registered".to_owned())
 }
@@ -2904,12 +3138,22 @@ fn group_exists_error() -> PolicyStoreError {
     PolicyStoreError::Conflict("group already exists".to_owned())
 }
 
+fn group_in_use_error() -> PolicyStoreError {
+    PolicyStoreError::Conflict(
+        "group is still referenced by active branch, path, or secret scope rules".to_owned(),
+    )
+}
+
 fn admin_exists_error() -> PolicyStoreError {
     PolicyStoreError::Conflict("an active admin already exists".to_owned())
 }
 
 fn last_admin_error() -> PolicyStoreError {
     PolicyStoreError::Conflict("cannot revoke the last active admin".to_owned())
+}
+
+fn last_admin_token_error() -> PolicyStoreError {
+    PolicyStoreError::Conflict("cannot revoke the last active admin token".to_owned())
 }
 
 fn register_repository_audit(actor_member_id: Option<i64>, repo_path: &str) -> AuditLogEntry {
@@ -2929,6 +3173,20 @@ fn create_group_audit(actor_member_id: Option<i64>, name: &str) -> AuditLogEntry
         "group",
         name.to_owned(),
         serde_json::json!({}),
+    )
+}
+
+fn delete_group_audit(
+    actor_member_id: Option<i64>,
+    group_name: &str,
+    removed_member_count: u64,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "group.delete",
+        "group",
+        group_name.to_owned(),
+        serde_json::json!({ "removed_member_count": removed_member_count }),
     )
 }
 
@@ -3020,6 +3278,21 @@ fn issue_token_audit(
         "member",
         member_name.to_owned(),
         serde_json::json!({ "token_label": label }),
+    )
+}
+
+fn revoke_token_audit(
+    actor_member_id: Option<i64>,
+    member_name: &str,
+    token_id: i64,
+    label: &str,
+) -> AuditLogEntry {
+    AuditLogEntry::new(
+        actor_member_id,
+        "token.revoke",
+        "member_token",
+        member_name.to_owned(),
+        serde_json::json!({ "token_id": token_id, "label": label }),
     )
 }
 
@@ -3687,6 +3960,83 @@ impl PolicyStore for PgPolicyStore {
         })
     }
 
+    fn delete_group<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        group_name: &'a str,
+    ) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = validate_group_name(group_name) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            // Lock the group row `FOR UPDATE` so concurrent `set_*_rule` /
+            // `set_secret_scope` / `add_group_member` (`FOR SHARE`) cannot
+            // attach new references before we delete it.
+            let group_id =
+                sqlx::query_scalar::<_, i64>("SELECT id FROM groups WHERE name = $1 FOR UPDATE")
+                    .bind(group_name)
+                    .fetch_optional(&mut *transaction)
+                    .await;
+            let group_id = match group_id {
+                Ok(Some(group_id)) => group_id,
+                Ok(None) => return Err(group_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let is_referenced = sqlx::query_scalar::<_, bool>(
+                "SELECT ( \
+                     EXISTS (SELECT 1 FROM branch_rule_groups WHERE group_id = $1) \
+                     OR EXISTS (SELECT 1 FROM path_rule_groups WHERE group_id = $1) \
+                     OR EXISTS (SELECT 1 FROM secret_scope_groups WHERE group_id = $1) \
+                 )",
+            )
+            .bind(group_id)
+            .fetch_one(&mut *transaction)
+            .await;
+            match is_referenced {
+                Ok(true) => return Err(group_in_use_error()),
+                Ok(false) => {}
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            }
+            let member_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM group_memberships WHERE group_id = $1",
+            )
+            .bind(group_id)
+            .fetch_one(&mut *transaction)
+            .await;
+            let removed_member_count = match member_count {
+                Ok(count) => match u64::try_from(count) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return Err(PolicyStoreError::Internal(format!(
+                            "invalid group member count: {error}"
+                        )));
+                    }
+                },
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let deleted = sqlx::query("DELETE FROM groups WHERE id = $1")
+                .bind(group_id)
+                .execute(&mut *transaction)
+                .await;
+            if let Err(error) = deleted {
+                return Err(PolicyStoreError::Database(error));
+            }
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                delete_group_audit(actor_member_id, group_name, removed_member_count),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            commit(transaction).await
+        })
+    }
+
     fn add_group_member<'a>(
         &'a self,
         actor_member_id: Option<i64>,
@@ -3882,6 +4232,145 @@ impl PolicyStore for PgPolicyStore {
                 label: label.to_owned(),
                 token,
             })
+        })
+    }
+
+    fn list_member_tokens<'a>(
+        &'a self,
+        member_name: &'a str,
+        include_revoked: bool,
+    ) -> PolicyStoreFuture<'a, Vec<MemberTokenRecord>> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            let mut connection = match self.pool.acquire().await {
+                Ok(connection) => connection,
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let member_id = match find_member_id(&mut connection, member_name, false).await {
+                Ok(member_id) => member_id,
+                Err(error) => return Err(error),
+            };
+            let rows = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+                "SELECT \
+                     mt.id, \
+                     mt.label, \
+                     to_char(mt.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                     to_char(mt.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                 FROM member_tokens mt \
+                 WHERE mt.member_id = $1 \
+                   AND ($2 OR mt.revoked_at IS NULL) \
+                 ORDER BY mt.id ASC",
+            )
+            .bind(member_id)
+            .bind(include_revoked)
+            .fetch_all(&mut *connection)
+            .await;
+            match rows {
+                Ok(rows) => Ok(rows
+                    .into_iter()
+                    .map(
+                        |(id, label, created_at_utc, revoked_at_utc)| MemberTokenRecord {
+                            id,
+                            member_name: member_name.to_owned(),
+                            label,
+                            created_at_utc,
+                            revoked_at_utc,
+                        },
+                    )
+                    .collect()),
+                Err(error) => Err(PolicyStoreError::Database(error)),
+            }
+        })
+    }
+
+    fn revoke_member_token<'a>(
+        &'a self,
+        actor_member_id: Option<i64>,
+        member_name: &'a str,
+        token_id: i64,
+    ) -> PolicyStoreFuture<'a, ()> {
+        Box::pin(async move {
+            if let Err(error) = validate_member_name(member_name) {
+                return Err(error);
+            }
+            if let Err(error) = validate_token_id(token_id) {
+                return Err(error);
+            }
+            let mut transaction = match self.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => return Err(error),
+            };
+            // Lock every active admin first, always in ID order, so concurrent
+            // admin/token revocations serialize cleanly without deadlocking.
+            if let Err(error) = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM members WHERE is_admin AND revoked_at IS NULL \
+                 ORDER BY id FOR UPDATE",
+            )
+            .fetch_all(&mut *transaction)
+            .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            let target = sqlx::query_as::<_, (i64, bool, bool)>(
+                "SELECT id, is_admin, revoked_at IS NULL FROM members \
+                 WHERE name = $1 FOR UPDATE",
+            )
+            .bind(member_name)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let (member_id, is_admin, is_active) = match target {
+                Ok(Some(target)) => target,
+                Ok(None) => return Err(member_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            let token_row = sqlx::query_scalar::<_, String>(
+                "SELECT label FROM member_tokens \
+                 WHERE id = $1 AND member_id = $2 AND revoked_at IS NULL \
+                 FOR UPDATE",
+            )
+            .bind(token_id)
+            .bind(member_id)
+            .fetch_optional(&mut *transaction)
+            .await;
+            let label = match token_row {
+                Ok(Some(label)) => label,
+                Ok(None) => return Err(token_not_found_error()),
+                Err(error) => return Err(PolicyStoreError::Database(error)),
+            };
+            if is_admin && is_active {
+                let active_admin_token_count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) \
+                     FROM member_tokens mt \
+                     JOIN members m ON m.id = mt.member_id \
+                     WHERE m.is_admin AND m.revoked_at IS NULL AND mt.revoked_at IS NULL",
+                )
+                .fetch_one(&mut *transaction)
+                .await;
+                match active_admin_token_count {
+                    Ok(count) if count <= 1 => return Err(last_admin_token_error()),
+                    Ok(_) => {}
+                    Err(error) => return Err(PolicyStoreError::Database(error)),
+                }
+            }
+            if let Err(error) =
+                sqlx::query("UPDATE member_tokens SET revoked_at = NOW() WHERE id = $1")
+                    .bind(token_id)
+                    .execute(&mut *transaction)
+                    .await
+            {
+                return Err(PolicyStoreError::Database(error));
+            }
+            if let Err(error) = insert_audit_entry(
+                &mut transaction,
+                revoke_token_audit(actor_member_id, member_name, token_id, &label),
+            )
+            .await
+            {
+                return Err(error);
+            }
+            commit(transaction).await
         })
     }
 

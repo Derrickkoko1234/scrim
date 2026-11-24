@@ -205,6 +205,25 @@ pub struct ListMembersResponse {
     pub members: Vec<MemberInfo>,
 }
 
+/// One API token metadata record returned by `/api/v1/me/tokens` or
+/// `/api/v1/members/{name}/tokens` (never contains token material).
+#[derive(Debug, Deserialize)]
+pub struct TokenInfo {
+    pub id: i64,
+    pub member_name: String,
+    #[serde(default)]
+    pub label: String,
+    pub created_at_utc: String,
+    #[serde(default)]
+    pub revoked_at_utc: Option<String>,
+}
+
+/// Response from listing a member's API tokens.
+#[derive(Debug, Deserialize)]
+pub struct ListTokensResponse {
+    pub tokens: Vec<TokenInfo>,
+}
+
 #[derive(Serialize)]
 struct PutBranchRuleRequest<'a> {
     repository: &'a str,
@@ -499,6 +518,11 @@ impl ScrimClient {
         self.send_empty(Method::GET, "/api/v1/groups", &[])
     }
 
+    pub fn delete_group(&self, name: &str) -> anyhow::Result<()> {
+        let path = format!("/api/v1/groups/{}", encode_path_segment(name));
+        self.send_no_content(Method::DELETE, &path, &[])
+    }
+
     pub fn add_group_member(
         &self,
         group: &str,
@@ -599,6 +623,35 @@ impl ScrimClient {
         let path = format!("/api/v1/members/{}/tokens", encode_path_segment(member));
         let body = IssueTokenRequest { label };
         self.send_json(Method::POST, &path, &[], &body)
+    }
+
+    fn tokens_path(member: Option<&str>) -> String {
+        match member {
+            Some(name) => format!("/api/v1/members/{}/tokens", encode_path_segment(name)),
+            None => "/api/v1/me/tokens".to_owned(),
+        }
+    }
+
+    /// Lists API tokens for the authenticated member (when `member` is `None`)
+    /// or for `member` (admin only).
+    pub fn list_tokens(
+        &self,
+        member: Option<&str>,
+        include_revoked: bool,
+    ) -> anyhow::Result<ListTokensResponse> {
+        let path = Self::tokens_path(member);
+        if include_revoked {
+            self.send_empty(Method::GET, &path, &[("all", "true")])
+        } else {
+            self.send_empty(Method::GET, &path, &[])
+        }
+    }
+
+    /// Revokes an API token by `token_id` for the authenticated member (when
+    /// `member` is `None`) or for `member` (admin only).
+    pub fn revoke_token(&self, member: Option<&str>, token_id: i64) -> anyhow::Result<()> {
+        let path = format!("{}/{}", Self::tokens_path(member), token_id);
+        self.send_no_content(Method::DELETE, &path, &[])
     }
 
     pub fn revoke_member(&self, member: &str) -> anyhow::Result<RevokeMemberResponse> {
@@ -793,6 +846,23 @@ impl ScrimClient {
         execute_request(request, api_path)
     }
 
+    fn send_no_content(
+        &self,
+        method: Method,
+        api_path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<()> {
+        let url = format!("{}{api_path}", self.base_url);
+        let mut request = self
+            .http
+            .request(method, &url)
+            .bearer_auth(self.token.expose_secret());
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        execute_no_content_request(request, api_path)
+    }
+
     fn send_json<B: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
@@ -813,10 +883,10 @@ impl ScrimClient {
     }
 }
 
-fn execute_request<R: for<'de> Deserialize<'de>>(
+fn send_and_read_response(
     request: reqwest::blocking::RequestBuilder,
     api_path: &str,
-) -> anyhow::Result<R> {
+) -> anyhow::Result<Zeroizing<String>> {
     let response = match request.send() {
         Ok(resp) => resp,
         Err(err) => {
@@ -858,10 +928,31 @@ fn execute_request<R: for<'de> Deserialize<'de>>(
         bail!("server returned {status}: {reason}");
     }
 
+    Ok(text)
+}
+
+fn execute_request<R: for<'de> Deserialize<'de>>(
+    request: reqwest::blocking::RequestBuilder,
+    api_path: &str,
+) -> anyhow::Result<R> {
+    let text = match send_and_read_response(request, api_path) {
+        Ok(text) => text,
+        Err(err) => return Err(err),
+    };
     match serde_json::from_str::<R>(&text) {
         Ok(parsed) => Ok(parsed),
         Err(err) => Err(anyhow!(err))
             .with_context(|| format!("failed to decode JSON response from {api_path}")),
+    }
+}
+
+fn execute_no_content_request(
+    request: reqwest::blocking::RequestBuilder,
+    api_path: &str,
+) -> anyhow::Result<()> {
+    match send_and_read_response(request, api_path) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -902,6 +993,19 @@ mod tests {
         assert_eq!(
             ScrimClient::ssh_keys_path(Some("alice smith/dev")),
             "/api/v1/members/alice%20smith%2Fdev/ssh-keys"
+        );
+    }
+
+    #[test]
+    fn tokens_path_selects_self_or_encoded_member_route() {
+        assert_eq!(ScrimClient::tokens_path(None), "/api/v1/me/tokens");
+        assert_eq!(
+            ScrimClient::tokens_path(Some("alice")),
+            "/api/v1/members/alice/tokens"
+        );
+        assert_eq!(
+            ScrimClient::tokens_path(Some("alice smith/dev")),
+            "/api/v1/members/alice%20smith%2Fdev/tokens"
         );
     }
 }
