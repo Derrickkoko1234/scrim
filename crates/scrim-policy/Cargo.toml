@@ -1,6 +1,6 @@
 [package]
 name = "scrim-policy"
-version = "0.0.0"
+version = "0.1.0"
 description = "Branch and path visibility rule matching shared by the Scrim for Git server and CLI"
 license = "MIT OR Apache-2.0"
 readme = "../../README.md"

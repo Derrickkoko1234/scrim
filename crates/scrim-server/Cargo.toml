@@ -1,6 +1,6 @@
 [package]
 name = "scrim-server"
-version = "0.0.0"
+version = "0.1.0"
 description = "Self-hosted Git remote that enforces per-user visibility for Scrim for Git"
 license = "AGPL-3.0-only"
 readme = "../../README.md"
@@ -27,7 +27,7 @@ gix = { version = "0.90.0", default-features = false, features = ["sha1", "sha25
 hmac = "0.13.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 russh = { version = "0.65.4", default-features = false, features = ["ring", "flate2"] }
-scrim-policy = { version = "0.0.0", path = "../scrim-policy" }
+scrim-policy = { version = "0.1.0", path = "../scrim-policy" }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -49,8 +49,8 @@ libc = "0.2.191"
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 http-body-util = "0.1.5"
-scrim-cli = { version = "0.0.0", path = "../scrim-cli" }
-scrim-crypto = { version = "0.0.0", path = "../scrim-crypto" }
+scrim-cli = { version = "0.1.0", path = "../scrim-cli" }
+scrim-crypto = { version = "0.1.0", path = "../scrim-crypto" }
 sha1 = "0.11.0"
 tower = { version = "0.5.3", features = ["util"] }
 
